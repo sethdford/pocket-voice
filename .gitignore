@@ -1,0 +1,17 @@
+# Build artifacts
+build/
+pocket-voice
+*.o
+*.dylib
+
+# Rust
+src/stt/target/
+src/tts/target/
+
+# macOS
+.DS_Store
+__pycache__/
+
+# IDE
+.vscode/
+.idea/
