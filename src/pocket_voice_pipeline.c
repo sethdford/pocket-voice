@@ -20,6 +20,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
@@ -86,8 +87,6 @@ extern void  hw_resampler_destroy(HWResampler *ctx);
 /* --- vdsp_prosody.c (AMX-accelerated audio post-processing) --- */
 extern int   prosody_pitch_shift(const float *input, float *output, int n_samples,
                                   float pitch_factor, int fft_size);
-extern int   prosody_time_stretch(const float *input, int in_len, float *output,
-                                   float rate_factor, float window_ms, int sample_rate);
 typedef struct BiquadCascade BiquadCascade;
 extern BiquadCascade *prosody_create_formant_eq(float pitch_factor, int sample_rate);
 extern int   prosody_apply_biquad(BiquadCascade *bc, float *audio, int n_samples);
@@ -106,15 +105,6 @@ extern int   spatial_process(SpatialAudioEngine *engine, int source_idx,
                               const float *mono_input,
                               float *left_output, float *right_output, int n_samples);
 extern void  spatial_destroy(SpatialAudioEngine *engine);
-
-/* --- opus_codec.c (streaming audio compression) --- */
-typedef struct PocketOpus PocketOpus;
-extern PocketOpus *pocket_opus_create(int sample_rate, int channels, int bitrate,
-                                       float frame_ms, int application);
-extern int   pocket_opus_encode(PocketOpus *ctx, const float *pcm, int n_samples,
-                                 unsigned char *opus_out, int max_out);
-extern int   pocket_opus_flush(PocketOpus *ctx, unsigned char *opus_out, int max_out);
-extern void  pocket_opus_destroy(PocketOpus *ctx);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Pipeline State Machine

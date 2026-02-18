@@ -32,18 +32,16 @@ Everything runs in C and Rust — no Python, no GIL, no interpreter overhead. Us
 
 ### Native Libraries
 
-| Library                | Purpose                          | Hardware              |
-| ---------------------- | -------------------------------- | --------------------- |
-| `pocket_voice.c`       | CoreAudio I/O, ring buffers, VAD | CoreAudio RT thread   |
-| `vdsp_prosody.c`       | Pitch shift, volume, EQ, limiter | AMX via Accelerate    |
-| `audio_converter.c`    | HW sample rate conversion        | Apple AudioConverter  |
-| `spatial_audio.c`      | HRTF binaural 3D positioning     | vDSP convolution      |
-| `opus_codec.c`         | Real-time audio compression      | libopus               |
-| `simd_audio.c`         | PCM conversion                   | ARM NEON SIMD         |
-| `amx_flow_fused.c`     | Fused LSD decode on AMX          | Apple AMX coprocessor |
-| `bnns_mimi_decoder.c`  | Mimi codec on ANE (stub)         | Apple Neural Engine   |
-| `pocket_stt` (Rust)    | Kyutai STT 1B inference          | candle + Metal GPU    |
-| `pocket_tts_rs` (Rust) | Kyutai DSM TTS 1.6B inference    | candle + Metal GPU    |
+| Library                | Purpose                          | Hardware             |
+| ---------------------- | -------------------------------- | -------------------- |
+| `pocket_voice.c`       | CoreAudio I/O, ring buffers, VAD | CoreAudio RT thread  |
+| `vdsp_prosody.c`       | Pitch shift, volume, EQ, limiter | AMX via Accelerate   |
+| `audio_converter.c`    | HW sample rate conversion        | Apple AudioConverter |
+| `spatial_audio.c`      | HRTF binaural 3D positioning     | vDSP convolution     |
+| `opus_codec.c`         | Real-time audio compression      | libopus              |
+| `bnns_mimi_decoder.c`  | Mimi codec on ANE (stub)         | Apple Neural Engine  |
+| `pocket_stt` (Rust)    | Kyutai STT 1B inference          | candle + Metal GPU   |
+| `pocket_tts_rs` (Rust) | Kyutai DSM TTS 1.6B inference    | candle + Metal GPU   |
 
 ## Requirements
 

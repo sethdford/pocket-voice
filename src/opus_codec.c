@@ -232,13 +232,15 @@ int pocket_opus_encode(PocketOpus *ctx, const float *pcm, int n_samples,
  * Flush any remaining samples (pad with silence).
  */
 int pocket_opus_flush(PocketOpus *ctx, unsigned char *opus_out, int max_out) {
-    if (!ctx || ctx->pcm_pos == 0) return 0;
+    if (!ctx || !ctx->initialized || ctx->pcm_pos == 0) return 0;
 
     memset(ctx->pcm_buffer + ctx->pcm_pos, 0,
            (ctx->frame_size - ctx->pcm_pos) * sizeof(float));
-    ctx->pcm_pos = ctx->frame_size;
 
-    return pocket_opus_encode(ctx, NULL, 0, opus_out, max_out);
+    int nbytes = ctx->fn_enc_float(ctx->enc, ctx->pcm_buffer,
+                                   ctx->frame_size, opus_out, max_out);
+    ctx->pcm_pos = 0;
+    return nbytes < 0 ? nbytes : nbytes;
 }
 
 /**

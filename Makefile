@@ -60,13 +60,8 @@ $(BUILD)/libspatial_audio.dylib: src/spatial_audio.c | $(BUILD)
 	$(CC) $(CFLAGS) -shared -fPIC -framework AudioToolbox -framework Accelerate \
 	  -install_name @rpath/libspatial_audio.dylib -o $@ $<
 
-$(BUILD)/libsimd_audio.dylib: src/simd_audio.c | $(BUILD)
-	$(CC) $(CFLAGS) -shared -fPIC \
-	  -install_name @rpath/libsimd_audio.dylib -o $@ $<
-
 libs: $(BUILD)/libpocket_voice.dylib $(BUILD)/libvdsp_prosody.dylib \
-      $(BUILD)/libaudio_converter.dylib $(BUILD)/libspatial_audio.dylib \
-      $(BUILD)/libsimd_audio.dylib
+      $(BUILD)/libaudio_converter.dylib $(BUILD)/libspatial_audio.dylib
 
 # ─── Rust cdylibs ─────────────────────────────────────────────────────────
 

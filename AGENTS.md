@@ -20,10 +20,7 @@ pocket-voice/
 │   ├── audio_converter.c       # Apple AudioConverter: HW sample-rate conversion
 │   ├── spatial_audio.c         # HRTF binaural 3D audio positioning
 │   ├── opus_codec.c            # libopus: real-time audio compression
-│   ├── simd_audio.c            # ARM NEON SIMD: float32→int16 PCM conversion
-│   ├── amx_flow_fused.c        # Fused LSD decode loop on AMX coprocessor
 │   ├── bnns_mimi_decoder.c     # Mimi codec on ANE (stub — decode step not implemented)
-│   ├── metal4_ml.h             # Metal 4 ML Encoder interface (macOS 26+ forward-looking)
 │   ├── cJSON.c / cJSON.h       # Lightweight JSON parser (vendored, MIT)
 │   ├── stt/                    # Rust cdylib: Kyutai STT 1B via candle + Metal
 │   │   ├── Cargo.toml
