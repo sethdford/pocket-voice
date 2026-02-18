@@ -1,0 +1,1950 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>pocket-voice — Zero-Python Voice Pipeline for Apple Silicon</title>
+    <meta
+      name="description"
+      content="A fully native C and Rust real-time voice pipeline for Apple Silicon. No Python, no GIL, no compromises."
+    />
+    <meta name="theme-color" content="#000000" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎙</text></svg>"
+    />
+    <style>
+      /* ═══════════════════════════════════════════════════════════════
+   Apple Design System — pocket-voice
+   Inspired by apple.com: SF Pro, large type, cinematic sections,
+   deliberate whitespace, and the belief that technology should
+   be beautiful.
+   ═══════════════════════════════════════════════════════════════ */
+
+      :root {
+        /* Typography */
+        --font-display:
+          -apple-system, BlinkMacSystemFont, "SF Pro Display", "Helvetica Neue",
+          Arial, sans-serif;
+        --font-text:
+          -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue",
+          Arial, sans-serif;
+        --font-mono: "SF Mono", SFMono-Regular, ui-monospace, Menlo, monospace;
+
+        /* Apple Color Palette */
+        --black: #1d1d1f;
+        --gray-900: #1d1d1f;
+        --gray-800: #2d2d2f;
+        --gray-700: #424245;
+        --gray-600: #6e6e73;
+        --gray-500: #86868b;
+        --gray-400: #aeaeb2;
+        --gray-300: #d2d2d7;
+        --gray-200: #e8e8ed;
+        --gray-100: #f5f5f7;
+        --white: #fbfbfd;
+        --blue: #0071e3;
+        --blue-hover: #0077ed;
+        --blue-light: #2997ff;
+        --green: #30d158;
+        --orange: #ff9f0a;
+        --red: #ff453a;
+        --purple: #bf5af2;
+        --teal: #64d2ff;
+
+        /* Spacing Scale */
+        --space-xs: 4px;
+        --space-sm: 8px;
+        --space-md: 16px;
+        --space-lg: 24px;
+        --space-xl: 48px;
+        --space-2xl: 80px;
+        --space-3xl: 120px;
+
+        /* Transitions */
+        --ease-out: cubic-bezier(0.25, 0.46, 0.45, 0.94);
+        --ease-spring: cubic-bezier(0.23, 1, 0.32, 1);
+      }
+
+      /* ── Reset ──────────────────────────────────────────────── */
+
+      *,
+      *::before,
+      *::after {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+
+      html {
+        scroll-behavior: smooth;
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+        text-rendering: optimizeLegibility;
+      }
+
+      body {
+        font-family: var(--font-text);
+        color: var(--gray-900);
+        background: var(--white);
+        line-height: 1.47059;
+        font-size: 17px;
+        letter-spacing: -0.022em;
+        overflow-x: hidden;
+      }
+
+      a {
+        color: var(--blue);
+        text-decoration: none;
+        transition: color 0.2s var(--ease-out);
+      }
+
+      a:hover {
+        color: var(--blue-hover);
+        text-decoration: underline;
+      }
+
+      img,
+      svg {
+        display: block;
+        max-width: 100%;
+      }
+
+      /* ── Navigation ─────────────────────────────────────────── */
+
+      .nav {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        z-index: 1000;
+        background: rgba(251, 251, 253, 0.72);
+        backdrop-filter: saturate(180%) blur(20px);
+        -webkit-backdrop-filter: saturate(180%) blur(20px);
+        border-bottom: 0.5px solid rgba(0, 0, 0, 0.08);
+        height: 48px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: background 0.3s var(--ease-out);
+      }
+
+      .nav-inner {
+        max-width: 980px;
+        width: 100%;
+        padding: 0 22px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+      }
+
+      .nav-logo {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-family: var(--font-display);
+        font-size: 21px;
+        font-weight: 600;
+        color: var(--gray-900);
+        letter-spacing: -0.03em;
+      }
+
+      .nav-logo svg {
+        width: 20px;
+        height: 20px;
+      }
+
+      .nav-links {
+        display: flex;
+        gap: 28px;
+        list-style: none;
+      }
+
+      .nav-links a {
+        font-size: 12px;
+        color: var(--gray-600);
+        letter-spacing: 0;
+        transition: color 0.3s var(--ease-out);
+      }
+
+      .nav-links a:hover {
+        color: var(--gray-900);
+        text-decoration: none;
+      }
+
+      /* ── Hero ───────────────────────────────────────────────── */
+
+      .hero {
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+        padding: var(--space-3xl) 22px var(--space-2xl);
+        background: var(--black);
+        color: var(--white);
+        position: relative;
+        overflow: hidden;
+      }
+
+      .hero::before {
+        content: "";
+        position: absolute;
+        top: -40%;
+        left: 50%;
+        transform: translateX(-50%);
+        width: 800px;
+        height: 800px;
+        background: radial-gradient(
+          circle,
+          rgba(0, 113, 227, 0.15) 0%,
+          transparent 70%
+        );
+        pointer-events: none;
+      }
+
+      .hero-eyebrow {
+        font-family: var(--font-display);
+        font-size: 17px;
+        font-weight: 400;
+        color: var(--gray-500);
+        letter-spacing: -0.022em;
+        margin-bottom: var(--space-md);
+        opacity: 0;
+        animation: fadeUp 0.8s var(--ease-spring) 0.2s forwards;
+      }
+
+      .hero h1 {
+        font-family: var(--font-display);
+        font-size: clamp(48px, 8vw, 96px);
+        font-weight: 700;
+        letter-spacing: -0.05em;
+        line-height: 1.04;
+        max-width: 900px;
+        opacity: 0;
+        animation: fadeUp 0.8s var(--ease-spring) 0.4s forwards;
+      }
+
+      .hero h1 .gradient-text {
+        background: linear-gradient(
+          90deg,
+          var(--blue-light),
+          var(--teal),
+          var(--green)
+        );
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+      }
+
+      .hero-sub {
+        font-family: var(--font-display);
+        font-size: clamp(19px, 2.5vw, 28px);
+        font-weight: 400;
+        color: var(--gray-400);
+        max-width: 680px;
+        margin-top: var(--space-lg);
+        letter-spacing: -0.022em;
+        line-height: 1.35;
+        opacity: 0;
+        animation: fadeUp 0.8s var(--ease-spring) 0.6s forwards;
+      }
+
+      .hero-cta {
+        display: flex;
+        gap: 16px;
+        margin-top: var(--space-xl);
+        opacity: 0;
+        animation: fadeUp 0.8s var(--ease-spring) 0.8s forwards;
+      }
+
+      .btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-family: var(--font-text);
+        font-size: 17px;
+        font-weight: 400;
+        padding: 12px 24px;
+        border-radius: 980px;
+        border: none;
+        cursor: pointer;
+        transition: all 0.3s var(--ease-out);
+        letter-spacing: -0.022em;
+      }
+
+      .btn-primary {
+        background: var(--blue);
+        color: white;
+      }
+
+      .btn-primary:hover {
+        background: var(--blue-hover);
+        color: white;
+        text-decoration: none;
+        transform: scale(1.02);
+      }
+
+      .btn-secondary {
+        background: transparent;
+        color: var(--blue-light);
+        border: 1px solid rgba(255, 255, 255, 0.15);
+      }
+
+      .btn-secondary:hover {
+        background: rgba(255, 255, 255, 0.05);
+        color: var(--blue-light);
+        text-decoration: none;
+      }
+
+      .btn svg {
+        width: 16px;
+        height: 16px;
+      }
+
+      /* ── Pipeline Diagram ───────────────────────────────────── */
+
+      .pipeline-section {
+        padding: var(--space-3xl) 22px;
+        text-align: center;
+        background: var(--white);
+      }
+
+      .pipeline-visual {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0;
+        flex-wrap: wrap;
+        max-width: 900px;
+        margin: var(--space-xl) auto 0;
+      }
+
+      .pipeline-node {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 10px;
+        padding: 20px 16px;
+        min-width: 110px;
+      }
+
+      .pipeline-icon {
+        width: 56px;
+        height: 56px;
+        border-radius: 16px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: var(--gray-100);
+        transition:
+          transform 0.3s var(--ease-spring),
+          box-shadow 0.3s var(--ease-out);
+      }
+
+      .pipeline-icon:hover {
+        transform: scale(1.08) translateY(-2px);
+        box-shadow: 0 8px 30px rgba(0, 0, 0, 0.08);
+      }
+
+      .pipeline-icon svg {
+        width: 28px;
+        height: 28px;
+        color: var(--gray-700);
+      }
+
+      .pipeline-label {
+        font-family: var(--font-display);
+        font-size: 14px;
+        font-weight: 600;
+        color: var(--gray-900);
+        letter-spacing: -0.01em;
+      }
+
+      .pipeline-detail {
+        font-size: 11px;
+        color: var(--gray-500);
+        font-weight: 400;
+      }
+
+      .pipeline-arrow {
+        color: var(--gray-300);
+        font-size: 20px;
+        padding: 0 4px;
+        margin-top: -20px;
+      }
+
+      .pipeline-arrow svg {
+        width: 24px;
+        height: 24px;
+      }
+
+      /* ── Section Styles ─────────────────────────────────────── */
+
+      .section {
+        padding: var(--space-3xl) 22px;
+        max-width: 980px;
+        margin: 0 auto;
+      }
+
+      .section-dark {
+        background: var(--black);
+        color: var(--white);
+        max-width: 100%;
+        padding: var(--space-3xl) 22px;
+      }
+
+      .section-dark .section-inner {
+        max-width: 980px;
+        margin: 0 auto;
+      }
+
+      .section-gray {
+        background: var(--gray-100);
+        max-width: 100%;
+        padding: var(--space-3xl) 22px;
+      }
+
+      .section-gray .section-inner {
+        max-width: 980px;
+        margin: 0 auto;
+      }
+
+      .section-title {
+        font-family: var(--font-display);
+        font-size: clamp(32px, 5vw, 56px);
+        font-weight: 700;
+        letter-spacing: -0.04em;
+        line-height: 1.07;
+        text-align: center;
+        margin-bottom: var(--space-md);
+      }
+
+      .section-subtitle {
+        font-family: var(--font-display);
+        font-size: clamp(17px, 2vw, 21px);
+        font-weight: 400;
+        color: var(--gray-600);
+        text-align: center;
+        max-width: 600px;
+        margin: 0 auto var(--space-2xl);
+        line-height: 1.38;
+        letter-spacing: -0.022em;
+      }
+
+      .section-dark .section-subtitle {
+        color: var(--gray-400);
+      }
+
+      /* ── Feature Cards ──────────────────────────────────────── */
+
+      .features-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+        gap: 20px;
+        margin-top: var(--space-xl);
+      }
+
+      .feature-card {
+        background: var(--white);
+        border-radius: 20px;
+        padding: 36px 32px;
+        border: 0.5px solid var(--gray-200);
+        transition:
+          transform 0.4s var(--ease-spring),
+          box-shadow 0.4s var(--ease-out);
+      }
+
+      .feature-card:hover {
+        transform: translateY(-4px);
+        box-shadow: 0 12px 40px rgba(0, 0, 0, 0.06);
+      }
+
+      .section-dark .feature-card {
+        background: var(--gray-800);
+        border-color: rgba(255, 255, 255, 0.06);
+      }
+
+      .section-dark .feature-card:hover {
+        box-shadow: 0 12px 40px rgba(0, 0, 0, 0.3);
+      }
+
+      .feature-icon {
+        width: 48px;
+        height: 48px;
+        border-radius: 12px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        margin-bottom: 16px;
+      }
+
+      .feature-icon svg {
+        width: 24px;
+        height: 24px;
+      }
+
+      .feature-icon.blue {
+        background: rgba(0, 113, 227, 0.1);
+        color: var(--blue);
+      }
+      .feature-icon.green {
+        background: rgba(48, 209, 88, 0.1);
+        color: var(--green);
+      }
+      .feature-icon.orange {
+        background: rgba(255, 159, 10, 0.1);
+        color: var(--orange);
+      }
+      .feature-icon.purple {
+        background: rgba(191, 90, 242, 0.1);
+        color: var(--purple);
+      }
+      .feature-icon.teal {
+        background: rgba(100, 210, 255, 0.1);
+        color: var(--teal);
+      }
+      .feature-icon.red {
+        background: rgba(255, 69, 58, 0.1);
+        color: var(--red);
+      }
+
+      .section-dark .feature-icon.blue {
+        background: rgba(0, 113, 227, 0.2);
+      }
+      .section-dark .feature-icon.green {
+        background: rgba(48, 209, 88, 0.15);
+      }
+      .section-dark .feature-icon.orange {
+        background: rgba(255, 159, 10, 0.15);
+      }
+      .section-dark .feature-icon.purple {
+        background: rgba(191, 90, 242, 0.15);
+      }
+      .section-dark .feature-icon.teal {
+        background: rgba(100, 210, 255, 0.15);
+      }
+      .section-dark .feature-icon.red {
+        background: rgba(255, 69, 58, 0.15);
+      }
+
+      .feature-card h3 {
+        font-family: var(--font-display);
+        font-size: 21px;
+        font-weight: 600;
+        letter-spacing: -0.03em;
+        margin-bottom: 8px;
+      }
+
+      .section-dark .feature-card h3 {
+        color: var(--white);
+      }
+
+      .feature-card p {
+        font-size: 15px;
+        color: var(--gray-600);
+        line-height: 1.47;
+        letter-spacing: -0.016em;
+      }
+
+      .section-dark .feature-card p {
+        color: var(--gray-400);
+      }
+
+      /* ── Stats Bar ──────────────────────────────────────────── */
+
+      .stats {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+        gap: 1px;
+        background: var(--gray-200);
+        border-radius: 20px;
+        overflow: hidden;
+        margin: var(--space-2xl) auto 0;
+        max-width: 860px;
+      }
+
+      .stat {
+        background: var(--white);
+        padding: 32px 24px;
+        text-align: center;
+      }
+
+      .stat-value {
+        font-family: var(--font-display);
+        font-size: 40px;
+        font-weight: 700;
+        letter-spacing: -0.04em;
+        color: var(--gray-900);
+        line-height: 1.1;
+      }
+
+      .stat-label {
+        font-size: 13px;
+        color: var(--gray-500);
+        margin-top: 4px;
+        letter-spacing: -0.01em;
+      }
+
+      /* ── Hardware Section ───────────────────────────────────── */
+
+      .hw-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 20px;
+        margin-top: var(--space-xl);
+      }
+
+      .hw-card {
+        border-radius: 20px;
+        padding: 40px 32px;
+        text-align: center;
+        position: relative;
+        overflow: hidden;
+      }
+
+      .hw-card::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        border-radius: 20px;
+        padding: 1px;
+        background: linear-gradient(
+          135deg,
+          rgba(255, 255, 255, 0.12),
+          rgba(255, 255, 255, 0.02)
+        );
+        -webkit-mask:
+          linear-gradient(#fff 0 0) content-box,
+          linear-gradient(#fff 0 0);
+        -webkit-mask-composite: xor;
+        mask-composite: exclude;
+      }
+
+      .hw-card.gpu {
+        background: linear-gradient(
+          135deg,
+          rgba(0, 113, 227, 0.08),
+          rgba(0, 113, 227, 0.02)
+        );
+      }
+
+      .hw-card.amx {
+        background: linear-gradient(
+          135deg,
+          rgba(191, 90, 242, 0.08),
+          rgba(191, 90, 242, 0.02)
+        );
+      }
+
+      .hw-card.neon {
+        background: linear-gradient(
+          135deg,
+          rgba(48, 209, 88, 0.08),
+          rgba(48, 209, 88, 0.02)
+        );
+      }
+
+      .hw-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-family: var(--font-display);
+        font-size: 13px;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        text-transform: uppercase;
+        padding: 6px 14px;
+        border-radius: 980px;
+        margin-bottom: 16px;
+      }
+
+      .hw-card.gpu .hw-chip {
+        background: rgba(0, 113, 227, 0.15);
+        color: var(--blue-light);
+      }
+      .hw-card.amx .hw-chip {
+        background: rgba(191, 90, 242, 0.15);
+        color: var(--purple);
+      }
+      .hw-card.neon .hw-chip {
+        background: rgba(48, 209, 88, 0.15);
+        color: var(--green);
+      }
+
+      .hw-card h3 {
+        font-family: var(--font-display);
+        font-size: 24px;
+        font-weight: 600;
+        letter-spacing: -0.03em;
+        color: var(--white);
+        margin-bottom: 12px;
+      }
+
+      .hw-card p {
+        font-size: 14px;
+        color: var(--gray-400);
+        line-height: 1.5;
+      }
+
+      /* ── Module Grid ────────────────────────────────────────── */
+
+      .modules-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+        gap: 12px;
+        margin-top: var(--space-xl);
+      }
+
+      .module {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 14px 16px;
+        background: var(--white);
+        border-radius: 12px;
+        border: 0.5px solid var(--gray-200);
+        transition: all 0.2s var(--ease-out);
+      }
+
+      .module:hover {
+        border-color: var(--gray-300);
+        box-shadow: 0 2px 12px rgba(0, 0, 0, 0.04);
+      }
+
+      .module-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        flex-shrink: 0;
+      }
+
+      .module-dot.c {
+        background: var(--blue);
+      }
+      .module-dot.rust {
+        background: var(--orange);
+      }
+      .module-dot.header {
+        background: var(--green);
+      }
+
+      .module-name {
+        font-family: var(--font-mono);
+        font-size: 12px;
+        color: var(--gray-700);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .module-desc {
+        font-size: 11px;
+        color: var(--gray-500);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      /* ── Code Block ─────────────────────────────────────────── */
+
+      .code-section {
+        margin-top: var(--space-xl);
+        max-width: 680px;
+        margin-left: auto;
+        margin-right: auto;
+      }
+
+      .code-block {
+        background: var(--gray-800);
+        border-radius: 16px;
+        padding: 28px 32px;
+        overflow-x: auto;
+        position: relative;
+      }
+
+      .section-gray .code-block {
+        background: var(--black);
+      }
+
+      .code-block code {
+        font-family: var(--font-mono);
+        font-size: 14px;
+        line-height: 1.65;
+        color: var(--gray-300);
+        white-space: pre;
+      }
+
+      .code-block .comment {
+        color: var(--gray-500);
+      }
+      .code-block .keyword {
+        color: var(--purple);
+      }
+      .code-block .string {
+        color: var(--green);
+      }
+      .code-block .flag {
+        color: var(--orange);
+      }
+      .code-block .prompt {
+        color: var(--gray-500);
+      }
+
+      .code-header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 16px;
+        padding-bottom: 16px;
+        border-bottom: 0.5px solid rgba(255, 255, 255, 0.06);
+      }
+
+      .code-dot {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+      }
+
+      .code-dot.red {
+        background: #ff5f57;
+      }
+      .code-dot.yellow {
+        background: #febc2e;
+      }
+      .code-dot.green {
+        background: #28c840;
+      }
+
+      /* ── Test Results ───────────────────────────────────────── */
+
+      .test-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 12px;
+        margin-top: var(--space-xl);
+      }
+
+      .test-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 16px 20px;
+        background: rgba(255, 255, 255, 0.04);
+        border-radius: 12px;
+        border: 0.5px solid rgba(255, 255, 255, 0.06);
+      }
+
+      .test-name {
+        font-family: var(--font-mono);
+        font-size: 13px;
+        color: var(--gray-300);
+      }
+
+      .test-count {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .test-badge {
+        font-family: var(--font-display);
+        font-size: 14px;
+        font-weight: 600;
+        color: var(--green);
+      }
+
+      .test-check {
+        width: 18px;
+        height: 18px;
+        border-radius: 50%;
+        background: rgba(48, 209, 88, 0.15);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      .test-check svg {
+        width: 10px;
+        height: 10px;
+        color: var(--green);
+      }
+
+      /* ── Footer ─────────────────────────────────────────────── */
+
+      .footer {
+        padding: var(--space-xl) 22px var(--space-2xl);
+        text-align: center;
+        background: var(--gray-100);
+        border-top: 0.5px solid var(--gray-200);
+      }
+
+      .footer-quote {
+        font-family: var(--font-display);
+        font-size: clamp(21px, 3vw, 28px);
+        font-weight: 400;
+        font-style: italic;
+        color: var(--gray-600);
+        letter-spacing: -0.03em;
+        max-width: 600px;
+        margin: 0 auto var(--space-lg);
+        line-height: 1.35;
+      }
+
+      .footer-attr {
+        font-size: 15px;
+        color: var(--gray-500);
+        margin-bottom: var(--space-xl);
+      }
+
+      .footer-links {
+        display: flex;
+        justify-content: center;
+        gap: 28px;
+        flex-wrap: wrap;
+        margin-bottom: var(--space-lg);
+      }
+
+      .footer-links a {
+        font-size: 13px;
+        color: var(--gray-600);
+      }
+
+      .footer-links a:hover {
+        color: var(--gray-900);
+        text-decoration: none;
+      }
+
+      .footer-copy {
+        font-size: 12px;
+        color: var(--gray-400);
+      }
+
+      /* ── Animations ─────────────────────────────────────────── */
+
+      @keyframes fadeUp {
+        from {
+          opacity: 0;
+          transform: translateY(20px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+
+      .reveal {
+        opacity: 0;
+        transform: translateY(30px);
+        transition:
+          opacity 0.7s var(--ease-spring),
+          transform 0.7s var(--ease-spring);
+      }
+
+      .reveal.visible {
+        opacity: 1;
+        transform: translateY(0);
+      }
+
+      /* ── Responsive ─────────────────────────────────────────── */
+
+      @media (max-width: 734px) {
+        .nav-links {
+          display: none;
+        }
+
+        .hero {
+          min-height: 85vh;
+        }
+
+        .hero-cta {
+          flex-direction: column;
+          align-items: center;
+        }
+
+        .hw-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .pipeline-visual {
+          flex-direction: column;
+        }
+
+        .pipeline-arrow {
+          transform: rotate(90deg);
+          margin-top: 0;
+        }
+
+        .stats {
+          grid-template-columns: repeat(2, 1fr);
+        }
+
+        .modules-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      @media (max-width: 1068px) and (min-width: 735px) {
+        .hw-grid {
+          grid-template-columns: 1fr;
+          max-width: 400px;
+          margin-left: auto;
+          margin-right: auto;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <!-- ═══ Navigation ═══ -->
+    <nav class="nav">
+      <div class="nav-inner">
+        <a href="#" class="nav-logo">
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+            <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+            <line x1="12" y1="19" x2="12" y2="22" />
+          </svg>
+          pocket-voice
+        </a>
+        <ul class="nav-links">
+          <li><a href="#features">Features</a></li>
+          <li><a href="#hardware">Hardware</a></li>
+          <li><a href="#modules">Modules</a></li>
+          <li><a href="#tests">Tests</a></li>
+          <li>
+            <a href="https://github.com/sethdford/pocket-voice">GitHub</a>
+          </li>
+        </ul>
+      </div>
+    </nav>
+
+    <!-- ═══ Hero ═══ -->
+    <section class="hero">
+      <p class="hero-eyebrow">100% native C and Rust on Apple Silicon</p>
+      <h1>
+        Voice that<br />
+        <span class="gradient-text">thinks different.</span>
+      </h1>
+      <p class="hero-sub">
+        A real-time conversational AI pipeline. Mic to speaker in under 200ms.
+        No Python. No GIL. No compromises.
+      </p>
+      <div class="hero-cta">
+        <a
+          href="https://github.com/sethdford/pocket-voice"
+          class="btn btn-primary"
+        >
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path
+              d="M12 0C5.374 0 0 5.373 0 12c0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23A11.509 11.509 0 0 1 12 5.803c1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576C20.566 21.797 24 17.3 24 12c0-6.627-5.373-12-12-12z"
+            />
+          </svg>
+          View on GitHub
+        </a>
+        <a href="#features" class="btn btn-secondary">
+          Learn more
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <polyline points="6 9 12 15 18 9" />
+          </svg>
+        </a>
+      </div>
+    </section>
+
+    <!-- ═══ Pipeline ═══ -->
+    <section class="pipeline-section reveal">
+      <div class="section-title">The Pipeline</div>
+      <div class="section-subtitle">
+        Five stages. One seamless conversation. Every component native.
+      </div>
+
+      <div class="pipeline-visual">
+        <div class="pipeline-node">
+          <div
+            class="pipeline-icon"
+            style="background: rgba(0, 113, 227, 0.08)"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="var(--blue)"
+              stroke-width="1.8"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+            </svg>
+          </div>
+          <span class="pipeline-label">Microphone</span>
+          <span class="pipeline-detail">CoreAudio 48kHz</span>
+        </div>
+
+        <div class="pipeline-arrow">
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <polyline points="9 6 15 12 9 18" />
+          </svg>
+        </div>
+
+        <div class="pipeline-node">
+          <div
+            class="pipeline-icon"
+            style="background: rgba(255, 159, 10, 0.08)"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="var(--orange)"
+              stroke-width="1.8"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <path
+                d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"
+              />
+            </svg>
+          </div>
+          <span class="pipeline-label">STT</span>
+          <span class="pipeline-detail">Kyutai 1B (Rust)</span>
+        </div>
+
+        <div class="pipeline-arrow">
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <polyline points="9 6 15 12 9 18" />
+          </svg>
+        </div>
+
+        <div class="pipeline-node">
+          <div
+            class="pipeline-icon"
+            style="background: rgba(191, 90, 242, 0.08)"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="var(--purple)"
+              stroke-width="1.8"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <circle cx="12" cy="12" r="3" />
+              <path
+                d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"
+              />
+            </svg>
+          </div>
+          <span class="pipeline-label">Claude</span>
+          <span class="pipeline-detail">SSE Streaming</span>
+        </div>
+
+        <div class="pipeline-arrow">
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <polyline points="9 6 15 12 9 18" />
+          </svg>
+        </div>
+
+        <div class="pipeline-node">
+          <div
+            class="pipeline-icon"
+            style="background: rgba(48, 209, 88, 0.08)"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="var(--green)"
+              stroke-width="1.8"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+              <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+              <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+            </svg>
+          </div>
+          <span class="pipeline-label">TTS</span>
+          <span class="pipeline-detail">Kyutai 1.6B (Rust)</span>
+        </div>
+
+        <div class="pipeline-arrow">
+          <svg
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <polyline points="9 6 15 12 9 18" />
+          </svg>
+        </div>
+
+        <div class="pipeline-node">
+          <div
+            class="pipeline-icon"
+            style="background: rgba(100, 210, 255, 0.08)"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="var(--teal)"
+              stroke-width="1.8"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <rect x="4" y="2" width="16" height="20" rx="2" ry="2" />
+              <circle cx="12" cy="14" r="4" />
+              <line x1="12" y1="6" x2="12.01" y2="6" />
+            </svg>
+          </div>
+          <span class="pipeline-label">Speaker</span>
+          <span class="pipeline-detail">48kHz + AEC</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ Stats ═══ -->
+    <section class="section reveal">
+      <div class="stats">
+        <div class="stat">
+          <div class="stat-value">18</div>
+          <div class="stat-label">Native C Libraries</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value">2</div>
+          <div class="stat-label">Rust cdylibs</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value">157</div>
+          <div class="stat-label">Automated Tests</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value">0</div>
+          <div class="stat-label">Lines of Python</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value">&lt;200ms</div>
+          <div class="stat-label">End-to-End Latency</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ Features ═══ -->
+    <section id="features" class="section-dark">
+      <div class="section-inner reveal">
+        <div class="section-title">Engineered for<br />performance.</div>
+        <div class="section-subtitle">
+          Every feature built from first principles. No frameworks. No
+          abstractions. Just metal.
+        </div>
+
+        <div class="features-grid">
+          <div class="feature-card">
+            <div class="feature-icon blue">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <path
+                  d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"
+                />
+                <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                <line x1="12" y1="19" x2="12" y2="22" />
+              </svg>
+            </div>
+            <h3>Full-Duplex Audio</h3>
+            <p>
+              CoreAudio VoiceProcessingIO with hardware AEC. Lock-free SPSC ring
+              buffers on the real-time thread. Barge-in interrupts playback
+              instantly.
+            </p>
+          </div>
+
+          <div class="feature-card">
+            <div class="feature-icon green">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <circle cx="12" cy="12" r="10" />
+                <polyline points="12 6 12 12 16 14" />
+              </svg>
+            </div>
+            <h3>Fused EOU Detection</h3>
+            <p>
+              Three signals — energy VAD, LSTM endpointer, and ASR token —
+              weighted and fused for &lt;240ms turn detection. Speculative
+              prefill at 70% confidence.
+            </p>
+          </div>
+
+          <div class="feature-card">
+            <div class="feature-icon purple">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3" />
+                <circle cx="12" cy="12" r="10" />
+                <line x1="12" y1="17" x2="12.01" y2="17" />
+              </svg>
+            </div>
+            <h3>Speculative Prefill</h3>
+            <p>
+              Sends the Claude request before the user finishes speaking.
+              Cancels if they resume. Saves 100-300ms of perceived latency on
+              correct predictions.
+            </p>
+          </div>
+
+          <div class="feature-card">
+            <div class="feature-icon orange">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <path
+                  d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"
+                />
+                <polyline points="14 2 14 8 20 8" />
+                <line x1="16" y1="13" x2="8" y2="13" />
+                <line x1="16" y1="17" x2="8" y2="17" />
+              </svg>
+            </div>
+            <h3>SSML &amp; Text Processing</h3>
+            <p>
+              Full SSML parser with prosody, break, emphasis, and say-as. Smart
+              sentence buffering with predictive flush. Number and date
+              normalization.
+            </p>
+          </div>
+
+          <div class="feature-card">
+            <div class="feature-icon teal">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+                <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+              </svg>
+            </div>
+            <h3>Audio Post-Processing</h3>
+            <p>
+              Phase vocoder pitch shift, WSOLA time stretch, biquad formant EQ,
+              soft-knee limiter, LUFS normalization, breath synthesis — all on
+              AMX.
+            </p>
+          </div>
+
+          <div class="feature-card">
+            <div class="feature-icon red">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+                <polyline points="22 4 12 14.01 9 11.01" />
+              </svg>
+            </div>
+            <h3>Quality Framework</h3>
+            <p>
+              Native C quality metrics: WER, CER, MCD, STOI, SNR, F0 analysis,
+              speaker similarity. Round-trip testing proves end-to-end
+              intelligibility.
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ Hardware ═══ -->
+    <section id="hardware" class="section-dark" style="padding-top: 0">
+      <div class="section-inner reveal">
+        <div class="section-title" style="padding-top: var(--space-2xl)">
+          Three engines.<br />One chip.
+        </div>
+        <div class="section-subtitle">
+          Every Apple Silicon compute unit runs concurrently. GPU for inference.
+          AMX for audio DSP. NEON for PCM.
+        </div>
+
+        <div class="hw-grid">
+          <div class="hw-card gpu">
+            <div class="hw-chip">
+              <svg
+                width="14"
+                height="14"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+              >
+                <rect x="4" y="4" width="16" height="16" rx="2" />
+                <rect x="9" y="9" width="6" height="6" />
+              </svg>
+              Metal GPU
+            </div>
+            <h3>ML Inference</h3>
+            <p>
+              Kyutai STT 1B and TTS 1.6B via candle. Transformer attention,
+              feed-forward, and Mimi codec on Metal shaders.
+            </p>
+          </div>
+
+          <div class="hw-card amx">
+            <div class="hw-chip">
+              <svg
+                width="14"
+                height="14"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+              >
+                <circle cx="12" cy="12" r="3" />
+                <path
+                  d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2"
+                />
+              </svg>
+              AMX Coprocessor
+            </div>
+            <h3>Audio DSP</h3>
+            <p>
+              Apple Accelerate vDSP, vForce, BLAS. Prosody processing, FFT, LUFS
+              normalization, mel spectrogram, LSTM endpointer — all via
+              cblas_sgemv.
+            </p>
+          </div>
+
+          <div class="hw-card neon">
+            <div class="hw-chip">
+              <svg
+                width="14"
+                height="14"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+              >
+                <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
+              </svg>
+              ARM NEON
+            </div>
+            <h3>PCM &amp; SIMD</h3>
+            <p>
+              8-wide float32 SIMD. Vectorized PCM conversion, crossfade, ring
+              buffer copies, breath synthesis. Zero call overhead — all static
+              inline.
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ Modules ═══ -->
+    <section id="modules" class="section-gray">
+      <div class="section-inner reveal">
+        <div class="section-title">18 native libraries.</div>
+        <div class="section-subtitle">
+          Each one compiles independently. Zero dependencies between C modules.
+          Linked at build time.
+        </div>
+
+        <div class="modules-grid">
+          <div class="module">
+            <div class="module-dot c"></div>
+            <div>
+              <div class="module-name">pocket_voice.c</div>
+              <div class="module-desc">CoreAudio engine + VAD</div>
+            </div>
+          </div>
+          <div class="module">
+            <div class="module-dot c"></div>
+            <div>
+              <div class="module-name">conformer_stt.c</div>
+              <div class="module-desc">Pure C Conformer CTC</div>
+            </div>
+          </div>
+          <div class="module">
+            <div class="module-dot c"></div>
+            <div>
+              <div class="module-name">mel_spectrogram.c</div>
+              <div class="module-desc">vDSP log-mel extraction</div>
+            </div>
+          </div>
+          <div class="module">
+            <div class="module-dot c"></div>
+            <div>
+              <div class="module-name">mimi_endpointer.c</div>
+              <div class="module-desc">LSTM end-of-utterance</div>
+            </div>
+          </div>
+          <div class="module">
+            <div class="module-dot c"></div>
+            <div>
+              <div class="module-name">fused_eou.c</div>
+              <div class="module-desc">3-signal EOU fusion</div>
+            </div>
+          </div>
+          <div class="module">
+            <div class="module-dot c"></div>
+            <div>
+              <div class="module-name">vdsp_prosody.c</div>
+              <div class="module-desc">Pitch, volume, EQ, limiter</div>
+            </div>
+          </div>
+          <div class="module">
+            <div class="module-dot c"></div>
+            <div>
+              <div class="module-name">audio_converter.c</div>
+              <div class="module-desc">HW resampling (24↔48k)</div>
+            </div>
+          </div>
+          <div class="module">
+            <div class="module-dot c"></div>
+            <div>
+              <div class="module-name">spatial_audio.c</div>
+              <div class="module-desc">HRTF binaural 3D</div>
+            </div>
+          </div>
+          <div class="module">
+            <div class="module-dot c"></div>
+            <div>
+              <div class="module-name">breath_synthesis.c</div>
+              <div class="module-desc">Pink noise + ADSR</div>
+            </div>
+          </div>
+          <div class="module">
+            <div class="module-dot c"></div>
+            <div>
+              <div class="module-name">lufs.c</div>
+              <div class="module-desc">BS.1770 loudness</div>
+            </div>
+          </div>
+          <div class="module">
+            <div class="module-dot c"></div>
+            <div>
+              <div class="module-name">sentence_buffer.c</div>
+              <div class="module-desc">Streaming text buffer</div>
+            </div>
+          </div>
+          <div class="module">
+            <div class="module-dot c"></div>
+            <div>
+              <div class="module-name">ssml_parser.c</div>
+              <div class="module-desc">SSML prosody parsing</div>
+            </div>
+          </div>
+          <div class="module">
+            <div class="module-dot c"></div>
+            <div>
+              <div class="module-name">text_normalize.c</div>
+              <div class="module-desc">Number/date expansion</div>
+            </div>
+          </div>
+          <div class="module">
+            <div class="module-dot c"></div>
+            <div>
+              <div class="module-name">bnns_mimi_decoder.c</div>
+              <div class="module-desc">Mimi codec on ANE</div>
+            </div>
+          </div>
+          <div class="module">
+            <div class="module-dot c"></div>
+            <div>
+              <div class="module-name">vm_ring.c</div>
+              <div class="module-desc">VM-mirrored ring buffer</div>
+            </div>
+          </div>
+          <div class="module">
+            <div class="module-dot c"></div>
+            <div>
+              <div class="module-name">opus_codec.c</div>
+              <div class="module-desc">Opus encode/decode</div>
+            </div>
+          </div>
+          <div class="module">
+            <div class="module-dot rust"></div>
+            <div>
+              <div class="module-name">pocket_stt (Rust)</div>
+              <div class="module-desc">Kyutai STT 1B + Metal</div>
+            </div>
+          </div>
+          <div class="module">
+            <div class="module-dot rust"></div>
+            <div>
+              <div class="module-name">pocket_tts_rs (Rust)</div>
+              <div class="module-desc">Kyutai TTS 1.6B + Metal</div>
+            </div>
+          </div>
+          <div class="module">
+            <div class="module-dot header"></div>
+            <div>
+              <div class="module-name">neon_audio.h</div>
+              <div class="module-desc">ARM NEON SIMD</div>
+            </div>
+          </div>
+          <div class="module">
+            <div class="module-dot header"></div>
+            <div>
+              <div class="module-name">spmc_ring.h</div>
+              <div class="module-desc">Lock-free SPMC ring</div>
+            </div>
+          </div>
+          <div class="module">
+            <div class="module-dot header"></div>
+            <div>
+              <div class="module-name">kv_cache.h</div>
+              <div class="module-desc">Interleaved KV cache</div>
+            </div>
+          </div>
+          <div class="module">
+            <div class="module-dot header"></div>
+            <div>
+              <div class="module-name">arena.h</div>
+              <div class="module-desc">Bump-pointer arena</div>
+            </div>
+          </div>
+          <div class="module">
+            <div class="module-dot header"></div>
+            <div>
+              <div class="module-name">triple_buffer.h</div>
+              <div class="module-desc">Lock-free triple buffer</div>
+            </div>
+          </div>
+        </div>
+
+        <div
+          style="
+            display: flex;
+            gap: 20px;
+            justify-content: center;
+            margin-top: var(--space-lg);
+            font-size: 13px;
+            color: var(--gray-500);
+          "
+        >
+          <span style="display: flex; align-items: center; gap: 6px"
+            ><span class="module-dot c" style="position: relative"></span> C
+            library</span
+          >
+          <span style="display: flex; align-items: center; gap: 6px"
+            ><span class="module-dot rust" style="position: relative"></span>
+            Rust cdylib</span
+          >
+          <span style="display: flex; align-items: center; gap: 6px"
+            ><span class="module-dot header" style="position: relative"></span>
+            Header-only</span
+          >
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ Getting Started ═══ -->
+    <section class="section-gray" style="padding-top: 0">
+      <div class="section-inner reveal">
+        <div class="section-title" style="padding-top: var(--space-2xl)">
+          Get started.
+        </div>
+        <div class="section-subtitle">Three commands. That's it.</div>
+
+        <div class="code-section">
+          <div class="code-block">
+            <div class="code-header">
+              <span class="code-dot red"></span>
+              <span class="code-dot yellow"></span>
+              <span class="code-dot green"></span>
+            </div>
+            <code
+              ><span class="comment"
+                ># Build everything: 18 C libs + 2 Rust cdylibs + binary</span
+              >
+              <span class="prompt">$</span> <span class="keyword">make</span>
+
+              <span class="comment"># Run the voice assistant</span>
+              <span class="prompt">$</span>
+              <span class="keyword">ANTHROPIC_API_KEY</span>=sk-ant-...
+              <span class="keyword">./pocket-voice</span>
+
+              <span class="comment"># Custom voice with spatial audio</span>
+              <span class="prompt">$</span>
+              <span class="keyword">./pocket-voice</span>
+              <span class="flag">--voice</span>
+              <span class="string">voice.wav</span>
+              <span class="flag">--pitch</span> <span class="string">1.15</span>
+              <span class="flag">--spatial</span> <span class="string">30</span>
+
+              <span class="comment"># Run all 157 tests</span>
+              <span class="prompt">$</span>
+              <span class="keyword">make</span> test</code
+            >
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ Tests ═══ -->
+    <section id="tests" class="section-dark">
+      <div class="section-inner reveal">
+        <div class="section-title">157 tests.<br />Zero failures.</div>
+        <div class="section-subtitle">
+          Every module proven. Every optimization verified. Every edge case
+          covered.
+        </div>
+
+        <div class="test-grid">
+          <div class="test-row">
+            <span class="test-name">test-quality</span>
+            <div class="test-count">
+              <span class="test-badge">35</span>
+              <div class="test-check">
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="3"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                >
+                  <polyline points="20 6 9 17 4 12" />
+                </svg>
+              </div>
+            </div>
+          </div>
+          <div class="test-row">
+            <span class="test-name">test-eou</span>
+            <div class="test-count">
+              <span class="test-badge">33</span>
+              <div class="test-check">
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="3"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                >
+                  <polyline points="20 6 9 17 4 12" />
+                </svg>
+              </div>
+            </div>
+          </div>
+          <div class="test-row">
+            <span class="test-name">test-pipeline</span>
+            <div class="test-count">
+              <span class="test-badge">35</span>
+              <div class="test-check">
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="3"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                >
+                  <polyline points="20 6 9 17 4 12" />
+                </svg>
+              </div>
+            </div>
+          </div>
+          <div class="test-row">
+            <span class="test-name">test-new-modules</span>
+            <div class="test-count">
+              <span class="test-badge">22</span>
+              <div class="test-check">
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="3"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                >
+                  <polyline points="20 6 9 17 4 12" />
+                </svg>
+              </div>
+            </div>
+          </div>
+          <div class="test-row">
+            <span class="test-name">test-conformer</span>
+            <div class="test-count">
+              <span class="test-badge">8</span>
+              <div class="test-check">
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="3"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                >
+                  <polyline points="20 6 9 17 4 12" />
+                </svg>
+              </div>
+            </div>
+          </div>
+          <div class="test-row">
+            <span class="test-name">test-roundtrip</span>
+            <div class="test-count">
+              <span class="test-badge">7</span>
+              <div class="test-check">
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="3"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                >
+                  <polyline points="20 6 9 17 4 12" />
+                </svg>
+              </div>
+            </div>
+          </div>
+          <div class="test-row">
+            <span class="test-name">test-bugfixes</span>
+            <div class="test-count">
+              <span class="test-badge">6</span>
+              <div class="test-check">
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="3"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                >
+                  <polyline points="20 6 9 17 4 12" />
+                </svg>
+              </div>
+            </div>
+          </div>
+          <div class="test-row">
+            <span class="test-name">bench-quality</span>
+            <div class="test-count">
+              <span class="test-badge">11</span>
+              <div class="test-check">
+                <svg
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="3"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                >
+                  <polyline points="20 6 9 17 4 12" />
+                </svg>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ Footer ═══ -->
+    <footer class="footer">
+      <p class="footer-quote">
+        "The people who are crazy enough to think they can change the world are
+        the ones who do."
+      </p>
+      <p class="footer-attr">— Steve Jobs</p>
+
+      <div class="footer-links">
+        <a href="https://github.com/sethdford/pocket-voice">GitHub</a>
+        <a href="https://github.com/sethdford/pocket-voice/blob/main/README.md"
+          >Documentation</a
+        >
+        <a href="https://github.com/sethdford/pocket-tts">pocket-tts</a>
+        <a href="https://github.com/sethdford/pocket-voice/blob/main/LICENSE"
+          >MIT License</a
+        >
+      </div>
+
+      <p class="footer-copy">
+        Built with obsessive attention to detail on Apple Silicon.<br />
+        Copyright &copy; 2026 Seth Ford. MIT License.
+      </p>
+    </footer>
+
+    <!-- ═══ Scroll Reveal ═══ -->
+    <script>
+      document.addEventListener("DOMContentLoaded", () => {
+        const reveals = document.querySelectorAll(".reveal");
+        const observer = new IntersectionObserver(
+          (entries) => {
+            entries.forEach((entry) => {
+              if (entry.isIntersecting) {
+                entry.target.classList.add("visible");
+              }
+            });
+          },
+          {
+            threshold: 0.1,
+            rootMargin: "0px 0px -60px 0px",
+          },
+        );
+        reveals.forEach((el) => observer.observe(el));
+      });
+    </script>
+  </body>
+</html>

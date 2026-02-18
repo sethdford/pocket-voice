@@ -20,7 +20,9 @@
  * transformer runs on GPU — true 3-way parallelism (GPU + AMX + ANE).
  */
 
+#ifndef ACCELERATE_NEW_LAPACK
 #define ACCELERATE_NEW_LAPACK
+#endif
 #include <Accelerate/Accelerate.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -570,11 +572,62 @@ BNNSMimiDecoder *bnns_mimi_create(void) {
     return dec;
 }
 
+static void compute_weight_layout(WeightLayout *lay) {
+    size_t off = 0;
+    #define ADVANCE(name, n) do { lay->name = off; off += (n); } while(0)
+
+    ADVANCE(upsample_weight, SEANET_DIM * UPSAMPLE_KERNEL * 1);
+
+    for (int l = 0; l < XFMR_NUM_LAYERS; l++) {
+        ADVANCE(xfmr[l].ln1_weight, XFMR_D_MODEL);
+        ADVANCE(xfmr[l].ln1_bias, XFMR_D_MODEL);
+        ADVANCE(xfmr[l].in_proj_weight, 3 * XFMR_D_MODEL * XFMR_D_MODEL);
+        ADVANCE(xfmr[l].out_proj_weight, XFMR_D_MODEL * XFMR_D_MODEL);
+        ADVANCE(xfmr[l].layer_scale1, XFMR_D_MODEL);
+        ADVANCE(xfmr[l].ln2_weight, XFMR_D_MODEL);
+        ADVANCE(xfmr[l].ln2_bias, XFMR_D_MODEL);
+        ADVANCE(xfmr[l].ffn1_weight, XFMR_FFN_DIM * XFMR_D_MODEL);
+        ADVANCE(xfmr[l].ffn2_weight, XFMR_D_MODEL * XFMR_FFN_DIM);
+        ADVANCE(xfmr[l].layer_scale2, XFMR_D_MODEL);
+    }
+
+    int dim = SEANET_N_FILTERS;
+    for (int i = SEANET_RATIOS_N - 1; i >= 0; i--) dim *= 2;
+    ADVANCE(dec_conv0_weight, dim * SEANET_KERNEL * SEANET_DIM);
+    ADVANCE(dec_conv0_bias, dim);
+
+    int cur_dim = dim;
+    for (int i = 0; i < SEANET_RATIOS_N; i++) {
+        int next_dim = cur_dim / 2;
+        ADVANCE(dec_blocks[i].convtr_weight, next_dim * (SEANET_RATIOS[i] * 2) * cur_dim);
+        ADVANCE(dec_blocks[i].convtr_bias, next_dim);
+        int hidden = next_dim / SEANET_COMPRESS;
+        ADVANCE(dec_blocks[i].res_conv1_weight, hidden * SEANET_RES_KERNEL * next_dim);
+        ADVANCE(dec_blocks[i].res_conv1_bias, hidden);
+        ADVANCE(dec_blocks[i].res_conv2_weight, next_dim * 1 * hidden);
+        ADVANCE(dec_blocks[i].res_conv2_bias, next_dim);
+        cur_dim = next_dim;
+    }
+
+    ADVANCE(dec_final_weight, SEANET_CHANNELS * SEANET_LAST_KERNEL * SEANET_N_FILTERS);
+    ADVANCE(dec_final_bias, SEANET_CHANNELS);
+
+    lay->total_floats = off;
+    #undef ADVANCE
+}
+
 int bnns_mimi_load_weights(BNNSMimiDecoder *dec, const float *weight_data,
                            size_t n_floats) {
+    compute_weight_layout(&dec->layout);
+
+    if (n_floats < dec->layout.total_floats) {
+        fprintf(stderr, "[bnns_mimi] weight buffer too small: got %zu, need %zu\n",
+                n_floats, dec->layout.total_floats);
+        return -1;
+    }
+
     dec->weights = (float *)malloc(n_floats * sizeof(float));
     memcpy(dec->weights, weight_data, n_floats * sizeof(float));
-    dec->layout.total_floats = n_floats;
     dec->loaded = 1;
 
     /* Allocate streaming state */
@@ -585,6 +638,33 @@ int bnns_mimi_load_weights(BNNSMimiDecoder *dec, const float *weight_data,
         s->cache_len[l] = 0;
     }
     s->rope_offset = 0;
+
+    /* Allocate SEANet streaming conv buffers */
+    int conv_idx = 0;
+    /* Initial conv: K=7, needs 6 prev frames */
+    s->conv_prev[conv_idx] = (float *)calloc(6 * SEANET_DIM, sizeof(float));
+    conv_idx++;
+
+    int dim = SEANET_N_FILTERS;
+    for (int i = SEANET_RATIOS_N - 1; i >= 0; i--) dim *= 2;
+
+    int cur_dim = dim;
+    for (int i = 0; i < SEANET_RATIOS_N; i++) {
+        int next_dim = cur_dim / 2;
+        s->convtr_partial[i] = (float *)calloc(
+            (SEANET_RATIOS[i] * 2 - SEANET_RATIOS[i]) * next_dim, sizeof(float));
+        /* ResBlock conv1 K=3 needs 2 prev frames */
+        s->conv_prev[conv_idx] = (float *)calloc(2 * (next_dim / SEANET_COMPRESS), sizeof(float));
+        conv_idx++;
+        /* ResBlock conv2 K=1 needs 0 prev */
+        cur_dim = next_dim;
+    }
+
+    /* Final conv: K=3 needs 2 prev frames */
+    s->conv_prev[conv_idx] = (float *)calloc(2 * SEANET_N_FILTERS, sizeof(float));
+    conv_idx++;
+
+    s->n_conv_states = conv_idx;
     s->initialized = 1;
 
     return 0;
@@ -621,22 +701,151 @@ void bnns_mimi_destroy(BNNSMimiDecoder *dec) {
 /**
  * Decode a single frame of latent codes to audio.
  *
+ * Pipeline: latent → ConvTrUpsample(×16) → Transformer(2 layers) → SEANet Decoder → PCM
+ *
  * @param dec       Decoder context
- * @param latent    Input latent vector, shape (1, 1, 512) — single frame
- * @param output    Output audio samples (caller-allocated, max 1920 samples)
- * @return          Number of audio samples written
+ * @param latent    Input latent vector, shape (1, 1, 512) — single frame at 12.5 Hz
+ * @param output    Output audio samples (caller-allocated, at least 1920 floats)
+ * @return          Number of audio samples written, or -1 on error
  */
 int bnns_mimi_decode_step(BNNSMimiDecoder *dec, const float *latent,
                           float *output) {
-    if (!dec || !dec->loaded) return -1;
+    if (!dec || !dec->loaded || !latent || !output) return -1;
 
-    (void)latent;
-    (void)output;
-    /* Full implementation requires weight offset computation from the
-       packed buffer. The architecture above provides the complete
-       layer-by-layer algorithm; integration with the Python weight
-       extraction pipeline (similar to amx_flow_net.py) will map
-       MLX model weights to the packed buffer format. */
+    const float *W = dec->weights;
+    const WeightLayout *L = &dec->layout;
+    StreamingState *S = &dec->state;
 
-    return UPSAMPLE_STRIDE * SEANET_HOP;  /* 16 × 120 = 1920 samples per frame */
+    /* ── 1. ConvTranspose1d Upsample: (1,1,512) → (1,16,512) ───────────── */
+    float upsampled[UPSAMPLE_STRIDE * SEANET_DIM];
+    {
+        /* Depthwise ConvTranspose1d: stride=16, K=32, groups=512 */
+        int emit_len = streaming_conv_transpose1d(
+            latent, 1, SEANET_DIM,
+            W + L->upsample_weight, NULL,
+            upsampled, SEANET_DIM, UPSAMPLE_KERNEL, UPSAMPLE_STRIDE,
+            S->upsample_partial,
+            UPSAMPLE_KERNEL - UPSAMPLE_STRIDE,
+            SEANET_DIM /* groups = dim (depthwise) */
+        );
+        (void)emit_len; /* Should be UPSAMPLE_STRIDE = 16 */
+    }
+
+    /* ── 2. Transformer: 2 layers of LN → Attn → Res → LN → FFN → Res ── */
+    float xfmr_buf[UPSAMPLE_STRIDE * XFMR_D_MODEL];
+    memcpy(xfmr_buf, upsampled, UPSAMPLE_STRIDE * SEANET_DIM * sizeof(float));
+
+    for (int layer = 0; layer < XFMR_NUM_LAYERS; layer++) {
+        mimi_transformer_layer(
+            xfmr_buf, UPSAMPLE_STRIDE, XFMR_D_MODEL,
+            W + L->xfmr[layer].ln1_weight,
+            W + L->xfmr[layer].ln1_bias,
+            W + L->xfmr[layer].in_proj_weight,
+            W + L->xfmr[layer].out_proj_weight,
+            W + L->xfmr[layer].layer_scale1,
+            W + L->xfmr[layer].ln2_weight,
+            W + L->xfmr[layer].ln2_bias,
+            W + L->xfmr[layer].ffn1_weight,
+            W + L->xfmr[layer].ffn2_weight,
+            W + L->xfmr[layer].layer_scale2,
+            S->k_cache[layer], S->v_cache[layer],
+            &S->cache_len[layer],
+            XFMR_CONTEXT, XFMR_NUM_HEADS, XFMR_HEAD_DIM,
+            &S->rope_offset, 10000.0f
+        );
+        /* Note: rope_offset is incremented by mimi_transformer_layer.
+           After 2 layers, it will be incremented twice. We only want once.
+           Restore after first layer. */
+        if (layer == 0) {
+            S->rope_offset -= UPSAMPLE_STRIDE; /* Undo, let layer 1 increment */
+        }
+    }
+
+    /* ── 3. SEANet Decoder: initial Conv → [ConvTr + ResBlock]×3 → final Conv ── */
+
+    /* Compute dimensions for the decoder blocks */
+    int dim = SEANET_N_FILTERS;
+    for (int i = SEANET_RATIOS_N - 1; i >= 0; i--) dim *= 2;
+    /* dim is now the initial SEANet dimension (64 * 2^3 = 512) */
+
+    int cur_len = UPSAMPLE_STRIDE;
+    int cur_dim = dim;
+    int conv_state_idx = 0;
+
+    /* Initial Conv1d (K=7): 512 → 512 */
+    float *dec_buf = (float *)malloc(cur_len * cur_dim * sizeof(float));
+    int new_len = streaming_conv1d(
+        xfmr_buf, cur_len, SEANET_DIM,
+        W + L->dec_conv0_weight, W + L->dec_conv0_bias,
+        dec_buf, cur_dim, SEANET_KERNEL, 1, 1,
+        S->conv_prev[conv_state_idx],
+        SEANET_KERNEL - 1
+    );
+    conv_state_idx++;
+    cur_len = new_len;
+
+    /* Decoder blocks: ConvTr(ratio*2) → ELU → ResBlock */
+    for (int i = 0; i < SEANET_RATIOS_N; i++) {
+        int ratio = SEANET_RATIOS[i];
+        int next_dim = cur_dim / 2;
+        int convtr_kernel = ratio * 2;
+
+        /* ELU activation before ConvTranspose */
+        vec_elu_inplace(dec_buf, cur_len * cur_dim, 1.0f);
+
+        /* ConvTranspose1d: upsample by ratio */
+        int up_len = cur_len * ratio;
+        float *up_buf = (float *)malloc(up_len * next_dim * sizeof(float));
+        streaming_conv_transpose1d(
+            dec_buf, cur_len, cur_dim,
+            W + L->dec_blocks[i].convtr_weight,
+            W + L->dec_blocks[i].convtr_bias,
+            up_buf, next_dim, convtr_kernel, ratio,
+            S->convtr_partial[i],
+            convtr_kernel - ratio,
+            1 /* groups=1 */
+        );
+
+        free(dec_buf);
+        dec_buf = up_buf;
+        cur_len = up_len;
+        cur_dim = next_dim;
+
+        /* ResBlock */
+        int hidden = cur_dim / SEANET_COMPRESS;
+        seanet_resblock(
+            dec_buf, cur_len, cur_dim,
+            W + L->dec_blocks[i].res_conv1_weight,
+            W + L->dec_blocks[i].res_conv1_bias,
+            W + L->dec_blocks[i].res_conv2_weight,
+            W + L->dec_blocks[i].res_conv2_bias,
+            hidden
+        );
+        /* ResBlock with K=3 valid conv shrinks length by 2 */
+        cur_len -= 2;
+    }
+
+    /* Final: ELU → Conv1d (K=3, channels=64 → 1) */
+    vec_elu_inplace(dec_buf, cur_len * cur_dim, 1.0f);
+
+    float *final_buf = (float *)malloc(cur_len * SEANET_CHANNELS * sizeof(float));
+    int final_len = streaming_conv1d(
+        dec_buf, cur_len, cur_dim,
+        W + L->dec_final_weight, W + L->dec_final_bias,
+        final_buf, SEANET_CHANNELS, SEANET_LAST_KERNEL, 1, 1,
+        S->conv_prev[conv_state_idx],
+        SEANET_LAST_KERNEL - 1
+    );
+
+    /* Copy to output (single-channel audio) */
+    int out_samples = final_len;
+    if (out_samples > 1920) out_samples = 1920;
+    for (int i = 0; i < out_samples; i++) {
+        output[i] = final_buf[i * SEANET_CHANNELS];
+    }
+
+    free(dec_buf);
+    free(final_buf);
+
+    return out_samples;
 }

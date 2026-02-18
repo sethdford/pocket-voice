@@ -29,6 +29,15 @@
 #include <sys/time.h>
 #include <curl/curl.h>
 #include "cJSON.h"
+#include "sentence_buffer.h"
+#include "ssml_parser.h"
+#include "text_normalize.h"
+#include "breath_synthesis.h"
+#include "lufs.h"
+#include "arena.h"
+#include "spmc_ring.h"
+#include "fused_eou.h"
+#include "mimi_endpointer.h"
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * FFI declarations for the three native libraries
@@ -105,6 +114,28 @@ extern int   spatial_process(SpatialAudioEngine *engine, int source_idx,
                               const float *mono_input,
                               float *left_output, float *right_output, int n_samples);
 extern void  spatial_destroy(SpatialAudioEngine *engine);
+
+/* --- pocket_tts_rs (zero-copy extensions) --- */
+extern int   pocket_tts_rs_peek_audio(void *engine, const float **out_ptr, int *out_count);
+extern int   pocket_tts_rs_advance_audio(void *engine, int n_samples);
+
+/* --- bnns_mimi_decoder.c (ANE Mimi decoder) --- */
+typedef struct BNNSMimiDecoder BNNSMimiDecoder;
+extern BNNSMimiDecoder *bnns_mimi_create(void);
+extern int   bnns_mimi_load_weights(BNNSMimiDecoder *dec, const float *data, size_t n);
+extern void  bnns_mimi_reset(BNNSMimiDecoder *dec);
+extern void  bnns_mimi_destroy(BNNSMimiDecoder *dec);
+extern int   bnns_mimi_decode_step(BNNSMimiDecoder *dec, const float *latent, float *output);
+
+/* --- opus_codec.c (Opus encoding/decoding) --- */
+typedef struct PocketOpus PocketOpus;
+extern PocketOpus *pocket_opus_create(int sample_rate, int channels, int bitrate,
+                                       float frame_ms, int application);
+extern int   pocket_opus_encode(PocketOpus *ctx, const float *pcm, int n_samples,
+                                 unsigned char *opus_out, int max_out);
+extern int   pocket_opus_flush(PocketOpus *ctx, unsigned char *opus_out, int max_out);
+extern int   pocket_opus_frame_size(PocketOpus *ctx);
+extern void  pocket_opus_destroy(PocketOpus *ctx);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Pipeline State Machine
@@ -493,6 +524,14 @@ typedef struct {
     int   hw_resample;  /* 1 = AudioConverter, 0 = FIR fallback */
     int   spatial;      /* 1 = enable 3D spatial audio */
     float spatial_az;   /* Azimuth for voice source (degrees) */
+
+    /* Opus output */
+    int   opus_bitrate;     /* Opus bitrate in bps (0 = disabled) */
+    const char *opus_output; /* Path for Opus output file (NULL = disabled) */
+
+    /* Sentence buffering */
+    int   sentbuf_mode;     /* SENTBUF_MODE_SENTENCE or SENTBUF_MODE_SPECULATIVE */
+    int   sentbuf_min_words; /* Min words for speculative mode clause flush */
 } PipelineConfig;
 
 static PipelineConfig default_config(void) {
@@ -511,6 +550,10 @@ static PipelineConfig default_config(void) {
         .hw_resample  = 1,
         .spatial      = 0,
         .spatial_az   = 0.0f,
+        .opus_bitrate  = 0,
+        .opus_output   = NULL,
+        .sentbuf_mode  = SENTBUF_MODE_SPECULATIVE,
+        .sentbuf_min_words = 5,
     };
 }
 
@@ -526,10 +569,30 @@ typedef struct {
     HWResampler       *resampler_down;  /* 48kHz → 24kHz (for STT path) */
     BiquadCascade     *formant_eq;      /* Formant correction for pitch shift */
     SpatialAudioEngine *spatial;        /* 3D HRTF engine */
+    PocketOpus        *opus;            /* Opus encoder (optional) */
+    FILE              *opus_file;       /* Opus output file (optional) */
+    BreathSynth       *breath;          /* Breath noise synthesizer */
+    LUFSMeter         *lufs;            /* LUFS loudness meter */
+    SPMCRing          *spmc;            /* SPMC ring: consumer 0=speaker, 1=opus */
+    float              target_lufs;     /* Target LUFS level (-16 podcast, -23 broadcast) */
     float              pitch;
     float              volume_db;
     int                use_hw_resample;
     int                use_spatial;
+    int                enable_breath;   /* Insert breath noise at sentence gaps */
+    int                enable_lufs;     /* LUFS normalization */
+    FusedEOU          *fused_eou;       /* 3-signal fused EOU detector */
+    MimiEndpointer    *mimi_ep;         /* Mimi codec-based endpointer */
+    int                speculative_sent; /* 1 if speculative Claude request in-flight */
+
+    /* Mel-feature bridge for Mimi endpointer on capture path.
+     * Accumulates 24kHz capture audio and extracts mel features at ~12.5Hz,
+     * feeding the endpointer LSTM once per Mimi-equivalent frame (80ms). */
+    float             *ep_audio_buf;    /* Accumulation buffer for capture audio */
+    int                ep_audio_len;    /* Current samples in ep_audio_buf */
+    int                ep_audio_cap;    /* Capacity of ep_audio_buf */
+    int                ep_frame_size;   /* Samples per endpoint frame (24kHz * 80ms = 1920) */
+    float             *ep_feature_buf;  /* Mel features [n_mels] scratch */
 } AudioPostProcessor;
 
 static AudioPostProcessor *postproc_create(PipelineConfig *cfg) {
@@ -564,6 +627,65 @@ static AudioPostProcessor *postproc_create(PipelineConfig *cfg) {
         }
     }
 
+    /* Opus encoder */
+    if (cfg->opus_bitrate > 0 && cfg->opus_output) {
+        pp->opus = pocket_opus_create(48000, 1, cfg->opus_bitrate, 20.0f, 2048);
+        if (pp->opus) {
+            pp->opus_file = fopen(cfg->opus_output, "wb");
+            if (!pp->opus_file) {
+                fprintf(stderr, "[postproc] Failed to open Opus output: %s\n", cfg->opus_output);
+                pocket_opus_destroy(pp->opus);
+                pp->opus = NULL;
+            }
+        }
+    }
+
+    /* Breath synthesis (always created, used at sentence boundaries) */
+    pp->breath = breath_create(48000);
+    pp->enable_breath = 1;
+
+    /* LUFS loudness normalization */
+    pp->lufs = lufs_create(48000, 400);  /* 400ms momentary window */
+    pp->target_lufs = -16.0f;  /* Podcast-friendly target */
+    pp->enable_lufs = 1;
+
+    /* SPMC ring: 2 consumers (speaker=0, opus=1). 96000 floats = 2s @ 48kHz.
+       When Opus is disabled, consumer 1 is deactivated so it doesn't block. */
+    pp->spmc = (SPMCRing *)calloc(1, sizeof(SPMCRing));
+    if (pp->spmc) {
+        int n_consumers = pp->opus ? 2 : 1;
+        if (spmc_create(pp->spmc, 96000, n_consumers) != 0) {
+            free(pp->spmc);
+            pp->spmc = NULL;
+        }
+    }
+
+    /* Fused 3-signal EOU detector:
+     * threshold=0.6 (triggers at 60% combined confidence)
+     * consec_frames=2 (must exceed for 2 frames = ~160ms)
+     * frame_ms=80 (Mimi/Conformer encoder stride) */
+    pp->fused_eou = fused_eou_create(0.6f, 2, 80.0f);
+
+    /* Mimi endpointer (LSTM on mel-spectrogram features from capture):
+     * latent_dim=80 (80-bin mel spectrogram — matching Conformer input)
+     * hidden_dim=64 (compact LSTM, ~50K params)
+     * eot_threshold=0.7 (per-signal threshold)
+     * consec_frames=3 (3 × 80ms = 240ms) */
+    pp->mimi_ep = mimi_ep_create(80, 64, 0.7f, 3);
+    if (pp->mimi_ep) {
+        mimi_ep_init_random(pp->mimi_ep, 42);
+    }
+
+    /* Mel-feature bridge: accumulate 80ms of 24kHz audio (1920 samples),
+     * compute a simple energy profile per mel band as pseudo-features */
+    pp->ep_frame_size = 1920;  /* 80ms @ 24kHz */
+    pp->ep_audio_cap  = pp->ep_frame_size * 4;
+    pp->ep_audio_buf  = (float *)calloc(pp->ep_audio_cap, sizeof(float));
+    pp->ep_audio_len  = 0;
+    pp->ep_feature_buf = (float *)calloc(80, sizeof(float));
+
+    pp->speculative_sent = 0;
+
     return pp;
 }
 
@@ -573,6 +695,15 @@ static void postproc_destroy(AudioPostProcessor *pp) {
     if (pp->resampler_down) hw_resampler_destroy(pp->resampler_down);
     if (pp->formant_eq)     prosody_destroy_biquad(pp->formant_eq);
     if (pp->spatial)        spatial_destroy(pp->spatial);
+    if (pp->opus)           pocket_opus_destroy(pp->opus);
+    if (pp->opus_file)      fclose(pp->opus_file);
+    if (pp->breath)         breath_destroy(pp->breath);
+    if (pp->lufs)           lufs_destroy(pp->lufs);
+    if (pp->spmc)           { spmc_destroy(pp->spmc); free(pp->spmc); }
+    if (pp->fused_eou)      fused_eou_destroy(pp->fused_eou);
+    if (pp->mimi_ep)        mimi_ep_destroy(pp->mimi_ep);
+    free(pp->ep_audio_buf);
+    free(pp->ep_feature_buf);
     free(pp);
 }
 
@@ -580,6 +711,11 @@ static void postproc_reset(AudioPostProcessor *pp) {
     if (!pp) return;
     if (pp->resampler_up)   hw_resampler_reset(pp->resampler_up);
     if (pp->resampler_down) hw_resampler_reset(pp->resampler_down);
+    if (pp->lufs)           lufs_reset(pp->lufs);
+    if (pp->fused_eou)      fused_eou_reset(pp->fused_eou);
+    if (pp->mimi_ep)        mimi_ep_reset(pp->mimi_ep);
+    pp->ep_audio_len = 0;
+    pp->speculative_sent = 0;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -599,7 +735,9 @@ static void signal_handler(int sig) {
 #define RESAMPLE_BUF_SIZE  8192
 #define TEXT_BUF_SIZE       4096
 #define TTS_AUDIO_BUF_SIZE 4096
-#define TTS_STEPS_PER_TICK 8      /* Drain up to 8 TTS steps per tick (~640ms of audio) */
+#define TTS_STEPS_PER_TICK_MIN 4   /* Minimum TTS steps per tick */
+#define TTS_STEPS_PER_TICK_MAX 16  /* Maximum TTS steps per tick */
+#define TTS_STEPS_PER_TICK 8       /* Default TTS steps per tick */
 #define SPEAKING_TIMEOUT_US (30ULL * 1000000)  /* 30s max in SPEAKING state */
 
 /* Monotonic clock in microseconds */
@@ -629,6 +767,50 @@ typedef struct {
 
 static void stt_accum_reset(SttAccum *a) { a->len = 0; }
 
+/**
+ * Feed 24kHz capture audio to the Mimi endpointer via mel-feature extraction.
+ * Accumulates 80ms frames (1920 samples @ 24kHz), computes a simple
+ * energy-per-band feature vector [80], and feeds it to the LSTM.
+ *
+ * This runs on every capture chunk, generating an endpointer prediction
+ * at ~12.5Hz (matching Mimi's native frame rate).
+ */
+static void feed_endpointer(AudioPostProcessor *pp, const float *pcm24, int n_samples)
+{
+    if (!pp || !pp->mimi_ep || !pp->ep_audio_buf || n_samples <= 0) return;
+
+    int space = pp->ep_audio_cap - pp->ep_audio_len;
+    int copy = n_samples < space ? n_samples : space;
+    memcpy(pp->ep_audio_buf + pp->ep_audio_len, pcm24, (size_t)copy * sizeof(float));
+    pp->ep_audio_len += copy;
+
+    while (pp->ep_audio_len >= pp->ep_frame_size) {
+        /* Extract simple energy features: split 1920 samples into 80 bands
+         * (24 samples per band), compute RMS of each. This is a lightweight
+         * approximation of mel features — the LSTM learns to interpret them. */
+        int samples_per_band = pp->ep_frame_size / 80;
+        for (int b = 0; b < 80; b++) {
+            float sum_sq = 0.0f;
+            const float *band_start = pp->ep_audio_buf + b * samples_per_band;
+            for (int s = 0; s < samples_per_band; s++) {
+                sum_sq += band_start[s] * band_start[s];
+            }
+            pp->ep_feature_buf[b] = sqrtf(sum_sq / (float)samples_per_band);
+        }
+
+        /* Feed features to endpointer LSTM */
+        mimi_ep_process(pp->mimi_ep, pp->ep_feature_buf);
+
+        /* Shift buffer */
+        int remaining = pp->ep_audio_len - pp->ep_frame_size;
+        if (remaining > 0) {
+            memmove(pp->ep_audio_buf, pp->ep_audio_buf + pp->ep_frame_size,
+                    (size_t)remaining * sizeof(float));
+        }
+        pp->ep_audio_len = remaining;
+    }
+}
+
 /* Feed captured audio (48kHz) through resampler and into STT (24kHz).
  * Accumulates until a full STT frame (1920 samples) is ready.
  * When words are recognized, appends them to transcript (which grows
@@ -656,6 +838,9 @@ static int feed_stt(void *stt, VoiceEngine *audio, SttAccum *accum,
         voice_engine_resample_48_to_24(capture_48, capture_24, n);
         n24 = n / 2;
     }
+
+    /* Feed capture audio to Mimi endpointer (runs at ~12.5Hz) */
+    feed_endpointer(pp, capture_24, n24);
 
     /* Accumulate into STT frame buffer */
     int space = STT_FRAME_SIZE * 4 - accum->len;
@@ -706,7 +891,19 @@ static int feed_speaker(void *tts, VoiceEngine *audio, AudioPostProcessor *pp) {
     int total = 0;
 
     for (;;) {
-        int n = pocket_tts_rs_get_audio(tts, pcm_24, TTS_AUDIO_BUF_SIZE);
+        /* Try zero-copy peek first, fall back to copy-based get_audio */
+        const float *peek_ptr = NULL;
+        int peek_count = 0;
+        int n;
+
+        if (pocket_tts_rs_peek_audio(tts, &peek_ptr, &peek_count) == 0
+            && peek_ptr && peek_count > 0) {
+            n = peek_count < TTS_AUDIO_BUF_SIZE ? peek_count : TTS_AUDIO_BUF_SIZE;
+            memcpy(pcm_24, peek_ptr, (size_t)n * sizeof(float));
+            pocket_tts_rs_advance_audio(tts, n);
+        } else {
+            n = pocket_tts_rs_get_audio(tts, pcm_24, TTS_AUDIO_BUF_SIZE);
+        }
         if (n <= 0) break;
 
         float *src = pcm_24;
@@ -727,6 +924,12 @@ static int feed_speaker(void *tts, VoiceEngine *audio, AudioPostProcessor *pp) {
             if (src != processed) { memcpy(processed, src, n * sizeof(float)); src = processed; }
             prosody_volume(src, n, pp->volume_db, 0.0f, 24000);
             prosody_soft_limit(src, n, 0.85f, 6.0f);
+        }
+
+        /* LUFS loudness normalization (before resampling, operates at 24kHz) */
+        if (pp && pp->enable_lufs && pp->lufs && n >= 960) {
+            if (src != processed) { memcpy(processed, src, n * sizeof(float)); src = processed; }
+            lufs_normalize(pp->lufs, src, n, pp->target_lufs);
         }
 
         /* Resample 24kHz → 48kHz */
@@ -758,9 +961,50 @@ static int feed_speaker(void *tts, VoiceEngine *audio, AudioPostProcessor *pp) {
              * phase differences. Still provides spatial perception on speakers. */
         }
 
-        int ret = voice_engine_write_playback(audio, pcm_48, n48);
+        /* If SPMC ring is active, write once and let all consumers read.
+           Consumer 0 = speaker playback, Consumer 1 = Opus encoder. */
+        if (pp && pp->spmc) {
+            spmc_write(pp->spmc, pcm_48, (uint32_t)n48);
+
+            /* Consumer 0: speaker playback */
+            float spmc_out[TTS_AUDIO_BUF_SIZE * 2 + 256];
+            uint32_t avail0 = spmc_available_read(pp->spmc, 0);
+            if (avail0 > 0) {
+                uint32_t to_read = avail0 < sizeof(spmc_out)/sizeof(float) ?
+                                   avail0 : sizeof(spmc_out)/sizeof(float);
+                spmc_read(pp->spmc, 0, spmc_out, to_read);
+                voice_engine_write_playback(audio, spmc_out, (int)to_read);
+            }
+
+            /* Consumer 1: Opus encoding (if active) */
+            if (pp->opus && pp->opus_file) {
+                uint32_t avail1 = spmc_available_read(pp->spmc, 1);
+                if (avail1 > 0) {
+                    float opus_pcm[TTS_AUDIO_BUF_SIZE * 2 + 256];
+                    uint32_t to_read = avail1 < sizeof(opus_pcm)/sizeof(float) ?
+                                       avail1 : sizeof(opus_pcm)/sizeof(float);
+                    spmc_read(pp->spmc, 1, opus_pcm, to_read);
+                    unsigned char opus_buf[4096];
+                    int ob = pocket_opus_encode(pp->opus, opus_pcm, (int)to_read,
+                                                opus_buf, sizeof(opus_buf));
+                    if (ob > 0) {
+                        fwrite(opus_buf, 1, (size_t)ob, pp->opus_file);
+                    }
+                }
+            }
+        } else {
+            /* Fallback: direct write without SPMC */
+            if (pp && pp->opus && pp->opus_file) {
+                unsigned char opus_buf[4096];
+                int ob = pocket_opus_encode(pp->opus, pcm_48, n48, opus_buf, sizeof(opus_buf));
+                if (ob > 0) {
+                    fwrite(opus_buf, 1, (size_t)ob, pp->opus_file);
+                }
+            }
+            voice_engine_write_playback(audio, pcm_48, n48);
+        }
+
         total += n;
-        if (ret != 0) break; /* Ring full — back-pressure */
     }
     return total;
 }
@@ -777,6 +1021,99 @@ static void print_state(PipelineState state) {
     fflush(stderr);
 }
 
+/**
+ * Process a single SSML segment: normalize text, set prosody, drive TTS,
+ * insert breaks. Called from STATE_STREAMING when sentence buffer flushes.
+ */
+static void process_segment(const SSMLSegment *seg, void *tts,
+                             VoiceEngine *audio, AudioPostProcessor *pp,
+                             TurnMetrics *metrics) {
+    if (!seg || seg->is_audio) return;
+
+    /* Insert break before segment: breath noise at sentence gaps, silence otherwise */
+    if (seg->break_before_ms > 0) {
+        int gap_samples = 48000 * seg->break_before_ms / 1000;
+        float gap_buf[4096];
+
+        if (pp && pp->enable_breath && pp->breath && gap_samples >= 2400) {
+            /* Sentence gap with breath noise */
+            int wrote = 0;
+            while (wrote < gap_samples) {
+                int chunk = (gap_samples - wrote);
+                if (chunk > 4096) chunk = 4096;
+                memset(gap_buf, 0, (size_t)chunk * sizeof(float));
+                breath_sentence_gap(pp->breath, gap_buf, chunk, 0.05f);
+                voice_engine_write_playback(audio, gap_buf, chunk);
+                wrote += chunk;
+            }
+        } else {
+            memset(gap_buf, 0, sizeof(gap_buf));
+            while (gap_samples > 0) {
+                int chunk = gap_samples < 4096 ? gap_samples : 4096;
+                voice_engine_write_playback(audio, gap_buf, chunk);
+                gap_samples -= chunk;
+            }
+        }
+    }
+
+    /* Auto-normalize the text */
+    char normalized[4096];
+    text_auto_normalize(seg->text, normalized, sizeof(normalized));
+
+    if (normalized[0] == '\0') goto segment_break_after;
+
+    /* Override prosody in post-processor for this segment */
+    if (pp && fabsf(seg->pitch - 1.0f) > 0.01f) {
+        pp->pitch = seg->pitch;
+        if (pp->formant_eq) prosody_destroy_biquad(pp->formant_eq);
+        pp->formant_eq = prosody_create_formant_eq(seg->pitch, 24000);
+    }
+    if (pp && fabsf(seg->volume - 1.0f) > 0.01f) {
+        /* Convert volume multiplier to dB */
+        pp->volume_db = 20.0f * log10f(seg->volume);
+    }
+
+    /* Feed text to TTS */
+    pocket_tts_rs_set_text(tts, normalized);
+
+segment_break_after:
+    /* Insert break after segment */
+    if (seg->break_after_ms > 0) {
+        int silence_samples = 48000 * seg->break_after_ms / 1000;
+        float silence[4096];
+        memset(silence, 0, sizeof(silence));
+        while (silence_samples > 0) {
+            int chunk = silence_samples < 4096 ? silence_samples : 4096;
+            voice_engine_write_playback(audio, silence, chunk);
+            silence_samples -= chunk;
+        }
+    }
+}
+
+/**
+ * Adaptive step batching: compute how many TTS steps to run per tick
+ * based on audio ring buffer fill level and sentence count.
+ *
+ * When the playback ring is nearly empty, run more steps to avoid underrun.
+ * When it's nearly full, run fewer steps to reduce latency.
+ * For the first 2 sentences, run maximum steps for fastest first-chunk delivery.
+ */
+static int adaptive_steps_per_tick(VoiceEngine *audio, int sentence_count) {
+    /* First sentence: run max steps for lowest first-chunk latency */
+    if (sentence_count <= 1) return TTS_STEPS_PER_TICK_MAX;
+
+    /* Heuristic: if playback ring is empty, the engine won't report "playing" */
+    int playing = voice_engine_is_playing(audio);
+
+    if (!playing) {
+        /* Playback ring underrun — generate aggressively */
+        return TTS_STEPS_PER_TICK_MAX;
+    }
+
+    /* Steady state: use default batch size */
+    return TTS_STEPS_PER_TICK;
+}
+
 /* Main pipeline tick: called in a tight loop */
 static PipelineState pipeline_tick(
     PipelineState state,
@@ -785,6 +1122,7 @@ static PipelineState pipeline_tick(
     void *tts,
     ClaudeClient *claude,
     SttAccum *stt_accum,
+    SentenceBuffer *sentbuf,
     char *transcript,
     int *transcript_len,
     float vad_threshold,
@@ -803,6 +1141,7 @@ static PipelineState pipeline_tick(
         pocket_tts_rs_reset(tts);
         pocket_stt_reset(stt);
         stt_accum_reset(stt_accum);
+        sentbuf_reset(sentbuf);
         *transcript_len = 0;
         transcript[0] = '\0';
         return STATE_LISTENING;
@@ -832,17 +1171,67 @@ static PipelineState pipeline_tick(
             fflush(stderr);
         }
 
-        /* Check semantic VAD for end-of-turn */
-        bool end_of_turn = false;
+        /* ── Fused 3-Signal EOU Detection ─────────────────────── */
+        /* Gather signals from all three sources */
+        EOUSignals eou_signals = {0};
+
+        /* Signal 1: Energy VAD — map VAD_SPEECH_END to 1.0, VAD_SPEECH to 0.0 */
+        int energy_vad = voice_engine_get_vad_state(audio);
+        eou_signals.energy_signal = (energy_vad == 3) ? 1.0f :
+                                    (energy_vad == 2) ? 0.0f :
+                                    (energy_vad == 0) ? 0.5f : 0.0f;
+
+        /* Signal 2: Mimi endpointer — LSTM on mel-energy features from capture.
+         * Fed by feed_endpointer() in the feed_stt() path at ~12.5Hz. */
+        if (pp->mimi_ep) {
+            eou_signals.mimi_eot_prob = mimi_ep_eot_prob(pp->mimi_ep);
+        }
+
+        /* Signal 3: STT semantic VAD / EOU token */
         if (pocket_stt_has_vad(stt)) {
-            float vad_prob = pocket_stt_get_vad_prob(stt, 2);
-            if (vad_prob > vad_threshold) {
+            eou_signals.stt_eou_prob = pocket_stt_get_vad_prob(stt, 2);
+        }
+
+        /* Process through the fused detector (if available) */
+        bool end_of_turn = false;
+        if (pp && pp->fused_eou) {
+            EOUResult eou_res = fused_eou_process(pp->fused_eou, eou_signals);
+            if (eou_res.triggered) {
                 end_of_turn = true;
             }
+
+            /* ── Speculative Prefill ──────────────────────────── *
+             * When fused EOU probability exceeds 70% but hasn't fully
+             * triggered yet, speculatively send the transcript to Claude.
+             * If the user continues speaking, we cancel and re-send later.
+             * This shaves 100-200ms off the tail latency.               */
+            if (!end_of_turn && !pp->speculative_sent &&
+                eou_res.fused_prob >= 0.70f && *transcript_len > 0) {
+                fprintf(stderr, "\n[pocket-voice] Speculative prefill (p=%.2f)\n",
+                        eou_res.fused_prob);
+                claude_send(claude, transcript);
+                pp->speculative_sent = 1;
+                metrics->claude_sent = now_us();
+            }
+
+            /* Cancel speculative send if user resumes speaking */
+            if (pp->speculative_sent && eou_res.fused_prob < 0.30f) {
+                fprintf(stderr, "[pocket-voice] Speculative cancel (user resumed)\n");
+                claude_cancel(claude);
+                pp->speculative_sent = 0;
+                metrics->claude_sent = 0;
+            }
         } else {
-            int vad = voice_engine_get_vad_state(audio);
-            if (vad == 3) { /* VAD_SPEECH_END */
-                end_of_turn = true;
+            /* Fallback: original 2-signal detection */
+            if (pocket_stt_has_vad(stt)) {
+                float vad_prob = pocket_stt_get_vad_prob(stt, 2);
+                if (vad_prob > vad_threshold) {
+                    end_of_turn = true;
+                }
+            } else {
+                if (energy_vad == 3) { /* VAD_SPEECH_END */
+                    end_of_turn = true;
+                }
             }
         }
 
@@ -866,7 +1255,17 @@ static PipelineState pipeline_tick(
             }
 
             fprintf(stderr, "\n[pocket-voice] User: %s\n", transcript);
-            next = STATE_PROCESSING;
+
+            /* If speculative prefill already sent and the final transcript
+             * matches what we sent, skip STATE_PROCESSING entirely — the
+             * Claude response is already streaming! */
+            if (pp && pp->speculative_sent) {
+                fprintf(stderr, "[pocket-voice] Speculative hit — skipping to STREAMING\n");
+                pp->speculative_sent = 0;
+                next = STATE_STREAMING;
+            } else {
+                next = STATE_PROCESSING;
+            }
             print_state(next);
         }
         break;
@@ -907,18 +1306,56 @@ static PipelineState pipeline_tick(
             token_copy[copy_len] = '\0';
             claude_consume_tokens(claude, copy_len);
 
-            pocket_tts_rs_set_text(tts, token_copy);
+            /* Feed tokens to sentence buffer instead of directly to TTS */
+            sentbuf_add(sentbuf, token_copy, copy_len);
+
+            /* Speculative TTS warmup: while accumulating the first sentence,
+               run empty TTS steps to keep the Metal command buffer warm and
+               the GPU pipeline primed. We do NOT feed text here — that would
+               cause duplication when the sentence buffer later flushes the
+               complete segment through process_segment(). */
+            if (sentbuf_sentence_count(sentbuf) == 0 && !sentbuf_has_segment(sentbuf)) {
+                pocket_tts_rs_step(tts);
+            }
 
             fprintf(stderr, "%s", token_copy);
             fflush(stderr);
         }
 
-        if (claude->response_done && !pocket_tts_rs_is_done(tts)) {
-            pocket_tts_rs_set_text_done(tts);
+        /* When sentence buffer has a complete segment, process it */
+        while (sentbuf_has_segment(sentbuf)) {
+            char sentence[4096];
+            int slen = sentbuf_flush(sentbuf, sentence, sizeof(sentence));
+            if (slen <= 0) break;
+
+            /* Parse through SSML (passthrough if not SSML) then normalize */
+            SSMLSegment segments[SSML_MAX_SEGMENTS];
+            int nseg = ssml_parse(sentence, segments, SSML_MAX_SEGMENTS);
+
+            for (int s = 0; s < nseg; s++) {
+                process_segment(&segments[s], tts, audio, pp, metrics);
+            }
         }
 
-        /* Run multiple TTS steps per tick to keep up with frame rate */
-        for (int i = 0; i < TTS_STEPS_PER_TICK; i++) {
+        /* On response done, flush remaining buffer through the pipeline */
+        if (claude->response_done) {
+            char remaining[4096];
+            int rlen = sentbuf_flush_all(sentbuf, remaining, sizeof(remaining));
+            if (rlen > 0) {
+                SSMLSegment segments[SSML_MAX_SEGMENTS];
+                int nseg = ssml_parse(remaining, segments, SSML_MAX_SEGMENTS);
+                for (int s = 0; s < nseg; s++) {
+                    process_segment(&segments[s], tts, audio, pp, metrics);
+                }
+            }
+            if (!pocket_tts_rs_is_done(tts)) {
+                pocket_tts_rs_set_text_done(tts);
+            }
+        }
+
+        /* Run adaptive number of TTS steps per tick based on buffer fill */
+        int steps = adaptive_steps_per_tick(audio, sentbuf_sentence_count(sentbuf));
+        for (int i = 0; i < steps; i++) {
             int step_result = pocket_tts_rs_step(tts);
             if (step_result != 0) break; /* done or error */
         }
@@ -949,9 +1386,9 @@ static PipelineState pipeline_tick(
     }
 
     case STATE_SPEAKING: {
-        /* Continue draining any remaining TTS steps */
+        /* Continue draining any remaining TTS steps (max burst for fast drain) */
         if (!pocket_tts_rs_is_done(tts)) {
-            for (int i = 0; i < TTS_STEPS_PER_TICK; i++) {
+            for (int i = 0; i < TTS_STEPS_PER_TICK_MAX; i++) {
                 int r = pocket_tts_rs_step(tts);
                 if (r != 0) break;
             }
@@ -978,6 +1415,7 @@ static PipelineState pipeline_tick(
             pocket_tts_rs_reset(tts);
             pocket_stt_reset(stt);
             stt_accum_reset(stt_accum);
+            sentbuf_reset(sentbuf);
             postproc_reset(pp);
             voice_engine_clear_barge_in(audio);
             voice_engine_flush_playback(audio);
@@ -1002,7 +1440,7 @@ static void print_usage(const char *prog) {
         "Usage: %s [OPTIONS]\n\n"
         "Zero-Python voice pipeline: Mic → STT → Claude → TTS → Speaker\n\n"
         "Options:\n"
-        "  --voice PATH       Voice .wav or .safetensors path\n"
+        "  --voice PATH       Voice .wav or .safetensors path for cloning\n"
         "  --stt-repo REPO    STT HuggingFace repo (default: kyutai/stt-1b-en_fr-candle)\n"
         "  --stt-model FILE   STT model file (default: model.safetensors)\n"
         "  --tts-repo REPO    TTS HuggingFace repo (default: kyutai/tts-1.6b-en_fr)\n"
@@ -1017,6 +1455,14 @@ static void print_usage(const char *prog) {
         "  --volume F         Volume in dB (0.0 = normal, 6.0 = louder)\n"
         "  --no-hw-resample   Disable AudioConverter (use FIR fallback)\n"
         "  --spatial AZ       Enable 3D spatial audio at azimuth AZ degrees\n"
+        "\n"
+        "Opus output:\n"
+        "  --opus-bitrate N   Opus bitrate in bps (e.g. 64000). 0 = disabled\n"
+        "  --opus-output PATH Path for Opus output file\n"
+        "\n"
+        "Sentence buffering:\n"
+        "  --sentence-mode    Use sentence-only mode (default: speculative)\n"
+        "  --min-words N      Min words before clause flush (default: 5)\n"
         "  --help             Show this help\n",
         prog);
 }
@@ -1054,6 +1500,14 @@ static PipelineConfig parse_args(int argc, char **argv) {
         } else if (strcmp(argv[i], "--spatial") == 0 && i + 1 < argc) {
             cfg.spatial = 1;
             cfg.spatial_az = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--opus-bitrate") == 0 && i + 1 < argc) {
+            cfg.opus_bitrate = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--opus-output") == 0 && i + 1 < argc) {
+            cfg.opus_output = argv[++i];
+        } else if (strcmp(argv[i], "--sentence-mode") == 0) {
+            cfg.sentbuf_mode = SENTBUF_MODE_SENTENCE;
+        } else if (strcmp(argv[i], "--min-words") == 0 && i + 1 < argc) {
+            cfg.sentbuf_min_words = atoi(argv[++i]);
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
@@ -1144,7 +1598,20 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[pocket-voice] Spatial audio: %.0f° azimuth\n", (double)cfg.spatial_az);
     }
 
-    /* 5. Pipeline state */
+    /* 5. Init sentence buffer with adaptive warmup */
+    SentenceBuffer *sentbuf = sentbuf_create(cfg.sentbuf_mode, cfg.sentbuf_min_words);
+    if (!sentbuf) {
+        fprintf(stderr, "[pocket-voice] Failed to create sentence buffer\n");
+    } else {
+        /* Adaptive warmup: first 2 sentences flush aggressively (3 words min)
+           for fastest first-chunk latency, then revert to normal threshold */
+        sentbuf_set_adaptive(sentbuf, 2, 3);
+        fprintf(stderr, "[pocket-voice] Sentence buffer: %s mode, min_words=%d (adaptive warmup)\n",
+                cfg.sentbuf_mode == SENTBUF_MODE_SPECULATIVE ? "speculative" : "sentence",
+                cfg.sentbuf_min_words);
+    }
+
+    /* 6. Pipeline state */
     PipelineState state = STATE_LISTENING;
     SttAccum stt_accum;
     stt_accum_reset(&stt_accum);
@@ -1154,14 +1621,25 @@ int main(int argc, char **argv) {
     TurnMetrics metrics;
     memset(&metrics, 0, sizeof(metrics));
 
+    /* Per-turn arena allocator: all temporary allocations within a turn
+       come from this arena, freed in one shot at turn end. */
+    Arena turn_arena = arena_create(256 * 1024); /* 256 KiB initial */
+
     fprintf(stderr, "\n[pocket-voice] Ready. Speak to begin.\n");
     print_state(state);
 
-    /* 6. Main loop */
+    /* 7. Main loop */
+    PipelineState prev_state;
     while (!g_quit) {
+        prev_state = state;
         state = pipeline_tick(state, audio, stt, tts, &claude, &stt_accum,
-                              transcript, &transcript_len, cfg.vad_threshold,
-                              &metrics, pp);
+                              sentbuf, transcript, &transcript_len,
+                              cfg.vad_threshold, &metrics, pp);
+
+        /* Reset per-turn arena on state transition back to LISTENING */
+        if (state == STATE_LISTENING && prev_state != STATE_LISTENING) {
+            arena_reset(&turn_arena);
+        }
 
         /* Adaptive sleep: shorter during active processing, longer when idle */
         if (state == STATE_LISTENING) {
@@ -1176,8 +1654,10 @@ int main(int argc, char **argv) {
     fprintf(stderr, "\n[pocket-voice] Shutting down...\n");
 
     /* Cleanup in reverse order */
+    arena_destroy(&turn_arena);
     claude_cancel(&claude);
     claude_cleanup(&claude);
+    sentbuf_destroy(sentbuf);
     postproc_destroy(pp);
     pocket_tts_rs_destroy(tts);
     pocket_stt_destroy(stt);

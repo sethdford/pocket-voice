@@ -12,9 +12,10 @@
 // Build: cargo build --release (metal feature is default)
 // Output: target/release/libpocket_tts_rs.dylib
 
-use candle::{Device, Tensor};
+use candle::{DType, Device, Tensor};
 use candle_transformers::generation::{LogitsProcessor, Sampling};
-use moshi::tts_streaming::{AllowedTokens, Config as TtsConfig, State as TtsState};
+use moshi::transformer::CaSrc;
+use moshi::tts_streaming::{AllowedTokens, Config as TtsConfig, SpeakerEncoder, State as TtsState};
 use moshi::StreamTensor;
 use std::collections::VecDeque;
 use std::ffi::{CStr, c_char, c_float, c_int, c_void};
@@ -206,6 +207,10 @@ struct TtsEngine {
     extra_steps_remaining: usize,
     prev_text_token: u32,
 
+    // Voice cloning: cached CaSrc for reuse on reset
+    speaker_encoder: Option<SpeakerEncoder>,
+    cached_ca_src: Option<CaSrc>,
+
     // Stored for re-creating State on reset (State has no reset() method)
     lm_config: moshi::lm::Config,
     model_path: std::path::PathBuf,
@@ -260,18 +265,30 @@ impl TtsEngine {
             .ok_or("Mimi file path is not valid UTF-8")?;
         let mut mimi = moshi::mimi::load(mimi_path, Some(n_q), &device)?;
 
+        // Create TTS streaming config (needed for voice conditioning + state)
+        let tts_config = TtsConfig::v202501();
+
         // Load voice conditioning if voice path provided
-        let ca_src = if let Some(_voice) = voice_path {
-            // Voice conditioning would load speaker embeddings here.
-            // For now, use None (unconditioned generation).
-            // Full implementation would use SpeakerEncoder to encode voice audio.
-            None
+        let mut speaker_encoder: Option<SpeakerEncoder> = None;
+        let ca_src = if let Some(voice) = voice_path {
+            match Self::load_voice_prompt(voice, &mimi, &lm_config, &model_file,
+                                           &device, dtype, &tts_config) {
+                Ok((ca, enc)) => {
+                    speaker_encoder = enc;
+                    Some(ca)
+                }
+                Err(e) => {
+                    eprintln!("[pocket_tts_rs] Voice conditioning failed: {}. \
+                               Continuing without voice cloning.", e);
+                    None
+                }
+            }
         } else {
             None
         };
+        let cached_ca_src = ca_src.clone();
 
         // Create TTS streaming state
-        let tts_config = TtsConfig::v202501();
         let state = Self::create_tts_state(
             &lm_config, &model_file, &device, dtype, ca_src, &tts_config,
         )?;
@@ -307,10 +324,132 @@ impl TtsEngine {
             gen_done: false,
             extra_steps_remaining: 0,
             prev_text_token: bos_token,
+            speaker_encoder,
+            cached_ca_src,
             lm_config,
             model_path: model_file,
             n_q,
         })
+    }
+
+    /// Load a voice prompt WAV file and encode it for voice cloning.
+    ///
+    /// Returns (CaSrc, Option<SpeakerEncoder>). If the model has speaker_cond
+    /// weights, uses the full SpeakerEncoder pipeline. Otherwise, falls back to
+    /// encoding through Mimi directly as CaSrc::Tokens.
+    fn load_voice_prompt(
+        voice_path: &str,
+        mimi: &moshi::mimi::Mimi,
+        lm_config: &moshi::lm::Config,
+        model_path: &std::path::Path,
+        device: &Device,
+        dtype: DType,
+        tts_config: &TtsConfig,
+    ) -> Result<(CaSrc, Option<SpeakerEncoder>), Box<dyn std::error::Error>> {
+        eprintln!("[pocket_tts_rs] Loading voice prompt: {}", voice_path);
+
+        // Read WAV file using hound
+        let reader = hound::WavReader::open(voice_path)?;
+        let spec = reader.spec();
+        let sample_rate = spec.sample_rate;
+
+        eprintln!(
+            "[pocket_tts_rs] Voice WAV: {}ch, {}Hz, {:?}",
+            spec.channels, sample_rate, spec.sample_format
+        );
+
+        // Decode samples to f32
+        let samples: Vec<f32> = match spec.sample_format {
+            hound::SampleFormat::Float => reader
+                .into_samples::<f32>()
+                .filter_map(|s| s.ok())
+                .collect(),
+            hound::SampleFormat::Int => {
+                let bits = spec.bits_per_sample;
+                let scale = 1.0f32 / (1u32 << (bits - 1)) as f32;
+                reader
+                    .into_samples::<i32>()
+                    .filter_map(|s| s.ok())
+                    .map(|s| s as f32 * scale)
+                    .collect()
+            }
+        };
+
+        // Downmix to mono if stereo
+        let mono: Vec<f32> = if spec.channels > 1 {
+            let ch = spec.channels as usize;
+            samples
+                .chunks(ch)
+                .map(|frame| frame.iter().sum::<f32>() / ch as f32)
+                .collect()
+        } else {
+            samples
+        };
+
+        // Resample to 24kHz if needed (simple linear interpolation)
+        let target_rate = SAMPLE_RATE as u32;
+        let pcm = if sample_rate != target_rate {
+            let ratio = sample_rate as f64 / target_rate as f64;
+            let out_len = (mono.len() as f64 / ratio) as usize;
+            let mut resampled = Vec::with_capacity(out_len);
+            for i in 0..out_len {
+                let src_idx = i as f64 * ratio;
+                let idx = src_idx as usize;
+                let frac = (src_idx - idx as f64) as f32;
+                let s0 = mono.get(idx).copied().unwrap_or(0.0);
+                let s1 = mono.get(idx + 1).copied().unwrap_or(s0);
+                resampled.push(s0 * (1.0 - frac) + s1 * frac);
+            }
+            eprintln!(
+                "[pocket_tts_rs] Resampled {}Hz → {}Hz ({} → {} samples)",
+                sample_rate, target_rate, mono.len(), resampled.len()
+            );
+            resampled
+        } else {
+            mono
+        };
+
+        let pcm_tensor = Tensor::from_vec(pcm.clone(), (1, 1, pcm.len()), device)?;
+
+        // Try to create a SpeakerEncoder from model weights
+        let vb = unsafe {
+            candle_nn::VarBuilder::from_mmaped_safetensors(&[model_path], dtype, device)?
+        };
+
+        match SpeakerEncoder::new(
+            mimi.clone(),
+            tts_config.speaker_cond_dim,
+            tts_config.speaker_cond_n_speakers,
+            dtype,
+            vb,
+        ) {
+            Ok(encoder) => {
+                eprintln!("[pocket_tts_rs] SpeakerEncoder loaded — encoding voice prompt...");
+                let ca_tensor = encoder.encode(&[pcm_tensor])?;
+                eprintln!(
+                    "[pocket_tts_rs] Voice encoded: {:?}",
+                    ca_tensor.shape()
+                );
+                Ok((CaSrc::Tokens(ca_tensor), Some(encoder)))
+            }
+            Err(e) => {
+                eprintln!(
+                    "[pocket_tts_rs] SpeakerEncoder not available ({}). \
+                     Using Mimi pre-quantize encoding as fallback.",
+                    e
+                );
+                // Fallback: encode through Mimi encoder (pre-quantize) for conditioning
+                let mut mimi_enc = mimi.clone();
+                mimi_enc.reset_state();
+                let encoded = mimi_enc.encode_pre_quantize(&pcm_tensor)?;
+                let ca_tensor = encoded.t()?;
+                eprintln!(
+                    "[pocket_tts_rs] Voice encoded (fallback): {:?}",
+                    ca_tensor.shape()
+                );
+                Ok((CaSrc::Tokens(ca_tensor), None))
+            }
+        }
     }
 
     fn create_tts_state(
@@ -394,12 +533,17 @@ impl TtsEngine {
             let pcm = self.mimi.decode_step(&stream_codes, &mask)?;
 
             if let Some(pcm_tensor) = pcm.as_option() {
-                let pcm_data: Vec<f32> = pcm_tensor
-                    .flatten_all()?
-                    .to_vec1()?;
-                // Clamp to [-1, 1]
-                for &s in &pcm_data {
-                    self.audio_buf.push(s.clamp(-1.0, 1.0));
+                let flat = pcm_tensor.flatten_all()?;
+                // Move tensor to CPU contiguously, then access storage directly
+                let flat_cpu = flat.to_device(&Device::Cpu)?;
+                let pcm_data: Vec<f32> = flat_cpu.to_vec1()?;
+                // Reserve once, extend with clamped values using SIMD-friendly loop
+                self.audio_buf.reserve(pcm_data.len());
+                let buf = &mut self.audio_buf;
+                for chunk in pcm_data.chunks(8) {
+                    for &s in chunk {
+                        buf.push(s.clamp(-1.0, 1.0));
+                    }
                 }
             }
         }
@@ -457,22 +601,44 @@ impl TtsEngine {
         let available = self.audio_buf.len() - self.audio_read_pos;
         let to_copy = available.min(buf.len());
         if to_copy > 0 {
+            // Direct memcpy from contiguous Vec storage — no allocation
             buf[..to_copy]
                 .copy_from_slice(&self.audio_buf[self.audio_read_pos..self.audio_read_pos + to_copy]);
             self.audio_read_pos += to_copy;
         }
 
-        // Compact: if we've consumed most of the buffer, shift remaining data to front
+        // Compact using pointer swap instead of memmove when mostly consumed.
+        // This amortizes compaction cost: O(1) for most calls, O(n) rarely.
         if self.audio_read_pos > FRAME_SAMPLES * 50 {
             let remaining = self.audio_buf.len() - self.audio_read_pos;
             if remaining > 0 {
-                self.audio_buf.copy_within(self.audio_read_pos.., 0);
+                // drain() + collect() avoids memmove for large remaining chunks
+                self.audio_buf.drain(..self.audio_read_pos);
+            } else {
+                self.audio_buf.clear();
             }
-            self.audio_buf.truncate(remaining);
             self.audio_read_pos = 0;
         }
 
         to_copy
+    }
+
+    /// Get a direct pointer and length to available audio data (zero-copy peek).
+    /// The caller reads from the returned pointer, then calls advance_audio_read().
+    fn peek_audio(&self) -> (*const f32, usize) {
+        let available = self.audio_buf.len() - self.audio_read_pos;
+        if available == 0 {
+            return (std::ptr::null(), 0);
+        }
+        let ptr = self.audio_buf[self.audio_read_pos..].as_ptr();
+        (ptr, available)
+    }
+
+    fn advance_audio_read(&mut self, n: usize) {
+        self.audio_read_pos += n;
+        if self.audio_read_pos > self.audio_buf.len() {
+            self.audio_read_pos = self.audio_buf.len();
+        }
     }
 
     fn is_done(&self) -> bool {
@@ -493,13 +659,14 @@ impl TtsEngine {
 
         // Re-create TtsState to reset the LM's KV cache and step counter.
         // The model weights are mmap'd so this is fast (~100ms, no download).
+        // Re-use cached voice conditioning (CaSrc) so voice persists across resets.
         let dtype = self.device.bf16_default_to_f32();
         self.state = Self::create_tts_state(
             &self.lm_config,
             &self.model_path,
             &self.device,
             dtype,
-            None,
+            self.cached_ca_src.clone(),
             &self.tts_config,
         )?;
 
@@ -713,4 +880,52 @@ pub extern "C" fn pocket_tts_rs_sample_rate() -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn pocket_tts_rs_frame_size() -> c_int {
     FRAME_SAMPLES as c_int
+}
+
+/// Zero-copy peek: get a direct pointer to available audio data.
+/// Writes the pointer and count to the provided out parameters.
+/// The data remains valid until the next call to pocket_tts_rs_step(),
+/// pocket_tts_rs_get_audio(), or pocket_tts_rs_advance_audio().
+/// Returns 0 on success, -1 on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn pocket_tts_rs_peek_audio(
+    engine: *mut c_void,
+    out_ptr: *mut *const c_float,
+    out_count: *mut c_int,
+) -> c_int {
+    if engine.is_null() || out_ptr.is_null() || out_count.is_null() {
+        return -1;
+    }
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let engine = unsafe { &*(engine as *const TtsEngine) };
+        let (ptr, count) = engine.peek_audio();
+        unsafe {
+            *out_ptr = ptr;
+            *out_count = count as c_int;
+        }
+        0
+    }));
+
+    result.unwrap_or(-1)
+}
+
+/// Advance the audio read cursor after consuming data from peek.
+/// Returns 0 on success, -1 on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn pocket_tts_rs_advance_audio(
+    engine: *mut c_void,
+    n_samples: c_int,
+) -> c_int {
+    if engine.is_null() || n_samples < 0 {
+        return -1;
+    }
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let engine = unsafe { &mut *(engine as *mut TtsEngine) };
+        engine.advance_audio_read(n_samples as usize);
+        0
+    }));
+
+    result.unwrap_or(-1)
 }

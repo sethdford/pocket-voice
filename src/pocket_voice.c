@@ -21,6 +21,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "neon_audio.h"
+
 /* -----------------------------------------------------------------------
  * Lock-Free SPSC Ring Buffer
  *
@@ -69,8 +71,13 @@ static uint32_t ring_available_write(const RingBuffer *rb) {
 static int ring_write(RingBuffer *rb, const float *data, uint32_t count) {
     if (ring_available_write(rb) < count) return -1;
     uint64_t h = atomic_load_explicit(&rb->head, memory_order_relaxed);
-    for (uint32_t i = 0; i < count; i++) {
-        rb->buffer[(h + i) & rb->mask] = data[i];
+    uint32_t offset = (uint32_t)(h & rb->mask);
+    uint32_t first = rb->size - offset;
+    if (first >= count) {
+        neon_copy_f32(rb->buffer + offset, data, (int)count);
+    } else {
+        neon_copy_f32(rb->buffer + offset, data, (int)first);
+        neon_copy_f32(rb->buffer, data + first, (int)(count - first));
     }
     atomic_store_explicit(&rb->head, h + count, memory_order_release);
     return 0;
@@ -79,8 +86,13 @@ static int ring_write(RingBuffer *rb, const float *data, uint32_t count) {
 static int ring_read(RingBuffer *rb, float *data, uint32_t count) {
     if (ring_available_read(rb) < count) return -1;
     uint64_t t = atomic_load_explicit(&rb->tail, memory_order_relaxed);
-    for (uint32_t i = 0; i < count; i++) {
-        data[i] = rb->buffer[(t + i) & rb->mask];
+    uint32_t offset = (uint32_t)(t & rb->mask);
+    uint32_t first = rb->size - offset;
+    if (first >= count) {
+        neon_copy_f32(data, rb->buffer + offset, (int)count);
+    } else {
+        neon_copy_f32(data, rb->buffer + offset, (int)first);
+        neon_copy_f32(data + first, rb->buffer, (int)(count - first));
     }
     atomic_store_explicit(&rb->tail, t + count, memory_order_release);
     return 0;
@@ -222,9 +234,7 @@ void voice_engine_resample_24_to_48(const float *input, float *output,
     int padded_len = stuffed_len + RESAMPLE_TAPS - 1;
 
     memset(g_upsample_scratch, 0, (size_t)padded_len * sizeof(float));
-    for (int i = 0; i < clamped; i++) {
-        g_upsample_scratch[i * 2] = input[i] * 2.0f;
-    }
+    neon_zero_stuff_2x(input, g_upsample_scratch, clamped);
     vDSP_conv(g_upsample_scratch, 1, g_antialias_fir + RESAMPLE_TAPS - 1, -1,
               output, 1, (vDSP_Length)stuffed_len, (vDSP_Length)RESAMPLE_TAPS);
 }

@@ -8,9 +8,16 @@ pocket-voice
 src/stt/target/
 src/tts/target/
 
+# Model files
+*.cstt
+*.vocab
+
+# Python
+.venv/
+__pycache__/
+
 # macOS
 .DS_Store
-__pycache__/
 
 # IDE
 .vscode/
