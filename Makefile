@@ -365,12 +365,12 @@ pocket-voice: src/pocket_voice_pipeline.c libs $(STT_DYLIB) $(LLM_DYLIB) $(SONAT
 	  -lbreath_synthesis -llufs -lvm_ring \
 	  -lmimi_endpointer -lfused_eou \
 	  -lmel_spectrogram -lconformer_stt -lctc_beam_decoder -ltdt_decoder \
-	  -lbnns_conformer -lvoice_quality -llatency_profiler -lmetal_loader \
+	  -lbnns_conformer -lbnns_convnext_decoder -lvoice_quality -llatency_profiler -lmetal_loader \
 	  -lspm_tokenizer -lnoise_gate \
 	  -lspeaker_encoder -lnative_vad -lspeech_detector -lphonemizer -lprosody_predict \
 	  -lprosody_log -lemphasis_predict -lvoice_onboard -lsonata_istft -lsonata_stt -lsonata_refiner -lweb_remote -lwebsocket -lhttp_api -lapple_perf \
 	  -lbackchannel -laudio_emotion -lconversation_memory -lspeaker_diarizer \
-	  $(OPUS_LDFLAGS) \
+	  $(OPUS_LDFLAGS) -Lsrc/llm/target/release -lpocket_llm \
 	  $(STT_DYLIB) $(LLM_DYLIB) $(SONATA_LM_DYLIB) $(SONATA_FLOW_DYLIB) $(SONATA_STORM_DYLIB) \
 	  -Wl,-rpath,@executable_path/$(BUILD) \
 	  -Wl,-rpath,@executable_path/src/stt/target/release \
@@ -741,6 +741,13 @@ test-pipeline-threading: tests/test_pipeline_threading.c $(BUILD)/libvm_ring.dyl
 	  -o $(BUILD)/test-pipeline-threading tests/test_pipeline_threading.c
 	./$(BUILD)/test-pipeline-threading
 
+test-phonemizer-v3: tests/test_phonemizer_v3.c $(BUILD)/libphonemizer.dylib | $(BUILD)
+	$(CC) $(CFLAGS) $(PIPER_CFLAGS) -Isrc \
+	  -L$(BUILD) -lphonemizer \
+	  -Wl,-rpath,$(CURDIR)/$(BUILD) -Wl,-rpath,$(HOMEBREW_PREFIX)/lib \
+	  -o $(BUILD)/test-phonemizer-v3 tests/test_phonemizer_v3.c
+	./$(BUILD)/test-phonemizer-v3
+
 test-phase2-regressions: tests/test_phase2_regressions.c \
                           $(BUILD)/libbreath_synthesis.dylib \
                           $(BUILD)/libmel_spectrogram.dylib \
@@ -755,11 +762,11 @@ test-phase2-regressions: tests/test_phase2_regressions.c \
 	  -o $(BUILD)/test-phase2-regressions tests/test_phase2_regressions.c
 	./$(BUILD)/test-phase2-regressions
 
-.PHONY: test test-eou test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-roundtrip test-llm-prosody test-websocket test-optimizations test-sonata test-sonata-quality test-sonata-stt test-sonata-v3 test-beam-search bench-sonata bench-quality bench-live bench-industry test-apple-perf test-quality-improvements test-real-models test-native-vad bench-vad test-speech-detector test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-sonata-storm test-audio-emotion test-sonata-flow-ffi test-sonata-lm-ffi test-pipeline-threading test-phase2-regressions bench
+.PHONY: test test-eou test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-roundtrip test-llm-prosody test-websocket test-optimizations test-sonata test-sonata-quality test-sonata-stt test-sonata-v3 test-beam-search bench-sonata bench-quality bench-live bench-industry test-apple-perf test-quality-improvements test-real-models test-native-vad bench-vad test-speech-detector test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-sonata-storm test-audio-emotion test-sonata-flow-ffi test-sonata-lm-ffi test-pipeline-threading test-phase2-regressions test-phonemizer-v3 bench
 
 bench: libs pocket-voice
 	@bash scripts/benchmark.sh --all
-test: bench-quality test-quality test-eou test-roundtrip test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-llm-prosody test-optimizations test-beam-search test-sonata test-sonata-v3 test-real-models test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-sonata-storm test-audio-emotion test-sonata-flow-ffi test-sonata-lm-ffi test-pipeline-threading test-phase2-regressions
+test: bench-quality test-quality test-eou test-roundtrip test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-llm-prosody test-optimizations test-beam-search test-sonata test-sonata-v3 test-sonata-quality test-sonata-stt test-real-models test-websocket test-native-vad test-speech-detector test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-quality-improvements test-sonata-storm test-audio-emotion test-sonata-flow-ffi test-sonata-lm-ffi test-pipeline-threading test-phase2-regressions test-phonemizer-v3
 	@echo ""
 	@echo "═══ Quality Benchmark Self-Tests ═══"
 	./$(BUILD)/bench-quality

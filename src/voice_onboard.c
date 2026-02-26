@@ -207,6 +207,8 @@ VoiceOnboardResult voice_onboard_finalize(VoiceOnboardSession *session) {
         } else {
             fprintf(stderr, "[onboard] Could not load speaker encoder: %s\n",
                     session->encoder_path);
+            result.success = 0;
+            return result;
         }
     }
 

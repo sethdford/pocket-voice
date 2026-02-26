@@ -467,8 +467,12 @@ SpeakerEncoder *speaker_encoder_create(const char *model_path) {
     }
 
     size_t elem_count = 0;
-    (void)enc->api->GetTensorShapeElementCount(shape_info, &elem_count);
-    enc->embedding_dim = (int)elem_count;
+    OrtStatus *count_status = enc->api->GetTensorShapeElementCount(shape_info, &elem_count);
+    enc->embedding_dim = count_status ? 0 : (int)elem_count;
+    if (count_status) {
+        fprintf(stderr, "[speaker_encoder] Failed to get embedding element count\n");
+        enc->api->ReleaseStatus(count_status);
+    }
 
     enc->api->ReleaseTensorTypeAndShapeInfo(shape_info);
     enc->api->ReleaseValue(output_tensor);

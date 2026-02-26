@@ -70,11 +70,13 @@ EOUResult fused_eou_process(FusedEOU *eou, EOUSignals sig) {
 
     /* Track speech activity based on energy VAD only — mimi_eot_prob starts at 0
      * and would falsely trigger speech_detected before any actual speech. */
-    if (sig.energy_signal < 0.3f) {
+    if (sig.energy_signal >= 0.3f) {
         eou->speech_detected = 1;
         eou->frames_since_speech = 0;
     } else {
         eou->frames_since_speech++;
+        if (eou->frames_since_speech > 100000)
+            eou->frames_since_speech = 100000;
     }
 
     /* ── Early Exit: single-signal high-confidence ────── */

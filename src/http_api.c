@@ -227,7 +227,10 @@ static int parse_request(int fd, HttpRequest *req) {
         if (strstr(buf, "\r\n\r\n")) break;
     }
 
-    sscanf(buf, "%7s %255s", req->method, req->path);
+    if (sscanf(buf, "%7s %255s", req->method, req->path) != 2)
+        return -1;
+    req->method[sizeof(req->method) - 1] = '\0';
+    req->path[sizeof(req->path) - 1] = '\0';
 
     char *cl = strcasestr(buf, "Content-Length:");
     if (cl) {

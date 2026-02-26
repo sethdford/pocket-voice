@@ -90,11 +90,18 @@ static int load_from_file(ConversationMemory *mem) {
     FILE *f = fopen(mem->path, "r");
     if (!f) return 0;  /* no file yet, ok */
 
-    char line[65536];
+    char line[16384];
     while (fgets(line, sizeof(line), f)) {
         /* trim newline */
         size_t len = strlen(line);
-        if (len > 0 && line[len - 1] == '\n') line[--len] = '\0';
+        if (len > 0 && line[len - 1] == '\n') {
+            line[--len] = '\0';
+        } else if (len >= sizeof(line) - 1) {
+            /* Line was truncated — skip remainder until newline */
+            int ch;
+            while ((ch = fgetc(f)) != EOF && ch != '\n') {}
+            continue;
+        }
         if (len == 0) continue;
 
         cJSON *obj = cJSON_Parse(line);

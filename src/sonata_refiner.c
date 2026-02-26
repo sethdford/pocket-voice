@@ -324,6 +324,8 @@ static void decoder_self_attn_step(float *out, const float *x,
     memcpy(kv_cache_v + cache_len * n_kv_heads * head_dim, v,
            (size_t)n_kv_heads * head_dim * sizeof(float));
 
+    if (cache_len >= MAX_TEXT_LEN) return;  /* bounds guard for scores[] */
+
     float scale = 1.0f / sqrtf((float)head_dim);
     memset(out, 0, D * sizeof(float));
 
@@ -354,6 +356,8 @@ static void decoder_cross_attn_step(float *out, const float *x,
                                     const DecLayerWeights *lw,
                                     float *buf_norm, float *buf_qkv,
                                     int D, int n_heads, int n_kv_heads, int head_dim) {
+    if (T_enc >= MAX_AUDIO_LEN) return;  /* bounds guard for scores[] */
+
     int n_rep = n_heads / n_kv_heads;
     int q_sz = n_heads * head_dim;
     int kv_sz = T_enc * n_kv_heads * head_dim;
@@ -432,7 +436,10 @@ SonataRefiner *sonata_refiner_create(const char *model_path) {
         return NULL;
     }
     struct stat st;
-    fstat(fd, &st);
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        return NULL;
+    }
     size_t file_size = st.st_size;
     void *mapped = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);

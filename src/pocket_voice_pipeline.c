@@ -1360,10 +1360,16 @@ static void flow_worker_submit(FlowWorker *fw, const int *tokens, int n) {
 
 static int flow_worker_collect(FlowWorker *fw, float *out_audio) {
     pthread_mutex_lock(&fw->mutex);
+    int iterations = 0;
     while (!fw->result_ready) {
         if (atomic_load(&fw->shutdown)) {
             pthread_mutex_unlock(&fw->mutex);
             return 0;
+        }
+        if (++iterations > 100) { /* 100 * 50ms = 5s max wait */
+            fprintf(stderr, "[flow_worker] collect timed out after 5s\n");
+            pthread_mutex_unlock(&fw->mutex);
+            return -1;
         }
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
@@ -1375,6 +1381,7 @@ static int flow_worker_collect(FlowWorker *fw, float *out_audio) {
         pthread_cond_timedwait(&fw->done_cond, &fw->mutex, &ts);
     }
     int len = fw->result_len;
+    if (len > SONATA_BUF_CAPACITY) len = SONATA_BUF_CAPACITY;
     if (len > 0) memcpy(out_audio, fw->result_audio, len * sizeof(float));
     fw->result_ready = 0;
     pthread_mutex_unlock(&fw->mutex);
@@ -1388,6 +1395,7 @@ static int flow_worker_try_collect(FlowWorker *fw, float *out_audio) {
         return -1;
     }
     int len = fw->result_len;
+    if (len > SONATA_BUF_CAPACITY) len = SONATA_BUF_CAPACITY;
     if (len > 0) memcpy(out_audio, fw->result_audio, len * sizeof(float));
     fw->result_ready = 0;
     pthread_mutex_unlock(&fw->mutex);
@@ -1570,10 +1578,13 @@ static int sonata_set_text(void *engine, const char *text) {
         int n = sonata_tokenize(e, text, uids, 512);
         if (n <= 0) return -1;
         int ret = sonata_lm_append_text(e->lm_engine, uids, n);
+        if (ret < 0) return ret;
 
         int tlen = (int)strlen(text);
         if (tlen > 0 && is_sentence_ender(text[tlen - 1])) {
-            sonata_lm_finish_text(e->lm_engine);
+            int fret = sonata_lm_finish_text(e->lm_engine);
+            if (fret < 0)
+                fprintf(stderr, "[sonata] Warning: sonata_lm_finish_text failed (%d)\n", fret);
             e->text_finalized = 1;
         }
         return ret;
@@ -1622,7 +1633,9 @@ static int sonata_set_text_ipa(void *engine, const char *ipa, const char *text) 
         int ret = sonata_lm_append_text(e->lm_engine, uids, n);
         int tlen = text ? (int)strlen(text) : 0;
         if (tlen > 0 && is_sentence_ender(text[tlen - 1])) {
-            sonata_lm_finish_text(e->lm_engine);
+            int fret = sonata_lm_finish_text(e->lm_engine);
+            if (fret < 0)
+                fprintf(stderr, "[sonata] Warning: sonata_lm_finish_text failed (%d)\n", fret);
             e->text_finalized = 1;
         }
         return ret;
@@ -1645,7 +1658,9 @@ static int sonata_set_text_ipa(void *engine, const char *ipa, const char *text) 
 static int sonata_set_text_done(void *engine) {
     SonataEngine *e = (SonataEngine *)engine;
     if (e && e->active_gen) {
-        sonata_lm_finish_text(e->lm_engine);
+        int fret = sonata_lm_finish_text(e->lm_engine);
+        if (fret < 0)
+            fprintf(stderr, "[sonata] Warning: sonata_lm_finish_text failed (%d)\n", fret);
         e->text_finalized = 1;
     }
     return 0;
@@ -2046,7 +2061,7 @@ static int tts_ring_free(TtsWorker *w) {
 }
 
 static void tts_ring_write(TtsWorker *w, const float *data, int count) {
-    int wp = w->audio_write_pos;
+    int wp = atomic_load_explicit(&w->audio_write_pos, memory_order_relaxed);
     int sz = w->audio_ring_size;
     for (int i = 0; i < count; i++) {
         w->audio_ring[wp] = data[i];
@@ -2059,7 +2074,7 @@ __attribute__((unused))
 static int tts_ring_read(TtsWorker *w, float *out, int max_samples) {
     int avail = tts_ring_available(w);
     int to_read = avail < max_samples ? avail : max_samples;
-    int rp = w->audio_read_pos;
+    int rp = atomic_load_explicit(&w->audio_read_pos, memory_order_relaxed);
     int sz = w->audio_ring_size;
     for (int i = 0; i < to_read; i++) {
         out[i] = w->audio_ring[rp];
@@ -2369,6 +2384,10 @@ static void claude_accum_response(ClaudeClient *c, const char *text, int len) {
         char *tmp = (char *)realloc(c->response_accum, (size_t)new_cap);
         if (!tmp) {
             fprintf(stderr, "[claude] Response accumulator realloc failed (%d bytes)\n", new_cap);
+            free(c->response_accum);
+            c->response_accum = NULL;
+            c->response_accum_len = 0;
+            c->response_accum_cap = 0;
             return;
         }
         c->response_accum = tmp;

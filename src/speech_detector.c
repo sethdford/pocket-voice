@@ -209,7 +209,7 @@ SpeechDetector *speech_detector_create(const SpeechDetectorConfig *cfg) {
     int fuse_consec = cfg->eot_consec_frames > 0 ? cfg->eot_consec_frames : 2;
     sd->fused_eou = fused_eou_create(fuse_thr, fuse_consec, 80.0f);
 
-    /* Disable mimi weight — endpointer uses random/uninitialized weights.
+    /* Mimi endpointer weight intentionally set to 0.0 — no trained weights available.
      * Redistribute weight to energy + STT only. */
     if (sd->fused_eou)
         fused_eou_set_weights(sd->fused_eou, 0.35f, 0.0f, 0.65f);

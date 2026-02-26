@@ -179,6 +179,9 @@ int ws_recv(WebSocket *ws, WsOpcode *type_out, uint8_t *buf, int buf_size) {
         int masked = (hdr[1] >> 7) & 1;
         uint64_t payload_len = hdr[1] & 0x7F;
 
+        /* RFC 6455 §5.1: client frames MUST be masked */
+        if (!masked) return -1;
+
         if (payload_len == 126) {
             uint8_t ext[2];
             if (ws_read_full(ws, ext, 2) != 2) return -1;

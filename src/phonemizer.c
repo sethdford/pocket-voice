@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 #define PHONEMIZER_MAX_SYMBOL_LEN  15
 #define PHONEMIZER_MAX_PHONEMES    512
@@ -38,6 +39,7 @@ struct Phonemizer {
 
 /* espeak-ng is process-global; shared across all Phonemizer instances. */
 static int g_espeak_initialized = 0;
+static pthread_mutex_t g_espeak_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Return the byte length of the next UTF-8 character at p, or 0 at end of string. */
 static int utf8_char_len(const unsigned char *p) {
@@ -61,15 +63,18 @@ static int compare_by_len_desc(const void *a, const void *b) {
 Phonemizer *phonemizer_create(const char *language) {
     if (!language) return NULL;
 
-    /* Initialize espeak-ng once per process. */
+    /* Initialize espeak-ng once per process (thread-safe). */
+    pthread_mutex_lock(&g_espeak_mutex);
     if (!g_espeak_initialized) {
         int sr = espeak_Initialize(AUDIO_OUTPUT_RETRIEVAL, 0, NULL, 0);
         if (sr < 0) {
             fprintf(stderr, "[phonemizer] espeak_Initialize failed\n");
+            pthread_mutex_unlock(&g_espeak_mutex);
             return NULL;
         }
         g_espeak_initialized = 1;
     }
+    pthread_mutex_unlock(&g_espeak_mutex);
 
     espeak_SetVoiceByName(language);
 

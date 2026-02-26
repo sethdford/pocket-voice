@@ -336,6 +336,7 @@ static void mhsa_forward(float *out, const float *x, const BlockWeights *bw,
 static void conv_module(float *out, const float *x, const BlockWeights *bw,
                          float *buf_norm, float *buf_conv, float *buf_pw1,
                          int T, int D, int kernel) {
+    if (T > 2048) return;  /* stack buffers below are sized for T <= 2048 */
     layer_norm(buf_norm, x, bw->conv_ln_w, bw->conv_ln_b, T, D);
 
     /* Use separate buf_pw1 for pw1 output to avoid SGEMM aliasing with buf_norm */

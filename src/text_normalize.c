@@ -277,6 +277,7 @@ static long long parse_int(const char *s, const char **endp) {
     if (*s == '-') { neg = 1; s++; }
     else if (*s == '+') { s++; }
     while (*s >= '0' && *s <= '9') {
+        if (val > 922337203685477580LL) break;  /* overflow guard: LLONG_MAX/10 */
         val = val * 10 + (*s - '0');
         s++;
     }
@@ -292,7 +293,10 @@ static long long parse_int_with_commas(const char *s, const char **endp) {
     if (*s == '-') { neg = 1; s++; }
     else if (*s == '+') { s++; }
     while ((*s >= '0' && *s <= '9') || *s == ',') {
-        if (*s != ',') val = val * 10 + (*s - '0');
+        if (*s != ',') {
+            if (val > 922337203685477580LL) break;  /* overflow guard */
+            val = val * 10 + (*s - '0');
+        }
         s++;
     }
     if (endp) *endp = s;

@@ -152,6 +152,7 @@ int prosody_pitch_shift(const float *input, float *output, int n_samples,
         vDSP_zvabs(&ctx.fft_buf, 1, magnitudes, 1, (vDSP_Length)half);
 
         float phases[MAX_FFT_SIZE / 2];
+        memset(phases, 0, sizeof(phases));
         int half_n = half;
         vvatan2f(phases, ctx.fft_buf.imagp, ctx.fft_buf.realp, &half_n);
 

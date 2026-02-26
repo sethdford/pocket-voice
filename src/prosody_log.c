@@ -39,6 +39,7 @@ ProsodyLog *prosody_log_open(const char *path) {
     strftime(tbuf, sizeof(tbuf), "%Y-%m-%dT%H:%M:%S", localtime(&now));
     cJSON_AddStringToObject(obj, "timestamp", tbuf);
     char *s = cJSON_PrintUnformatted(obj);
+    if (!s) { cJSON_Delete(obj); return NULL; }
     fprintf(fp, "%s\n", s);
     fflush(fp);
     free(s);
@@ -55,8 +56,7 @@ void prosody_log_close(ProsodyLog *log) {
         cJSON_AddStringToObject(obj, "type", "session_end");
         cJSON_AddNumberToObject(obj, "n_entries", log->n_entries);
         char *s = cJSON_PrintUnformatted(obj);
-        fprintf(log->fp, "%s\n", s);
-        free(s);
+        if (s) { fprintf(log->fp, "%s\n", s); free(s); }
         cJSON_Delete(obj);
         fclose(log->fp);
     }
@@ -84,6 +84,7 @@ void prosody_log_segment(ProsodyLog *log,
     cJSON_AddNumberToObject(obj, "duration_ms", duration_ms);
 
     char *s = cJSON_PrintUnformatted(obj);
+    if (!s) { cJSON_Delete(obj); return; }
     fprintf(log->fp, "%s\n", s);
     fflush(log->fp);
     free(s);
@@ -124,6 +125,7 @@ void prosody_log_turn(ProsodyLog *log,
     cJSON_AddNumberToObject(obj, "tts_rtf", tts_rtf);
 
     char *s = cJSON_PrintUnformatted(obj);
+    if (!s) { cJSON_Delete(obj); return; }
     fprintf(log->fp, "%s\n", s);
     fflush(log->fp);
     free(s);
@@ -157,6 +159,7 @@ void prosody_log_contour(ProsodyLog *log,
     cJSON_AddItemToObject(obj, "energy", energy_arr);
 
     char *s = cJSON_PrintUnformatted(obj);
+    if (!s) { cJSON_Delete(obj); return; }
     fprintf(log->fp, "%s\n", s);
     fflush(log->fp);
     free(s);

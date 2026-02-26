@@ -239,6 +239,9 @@ void noise_gate_process(NoiseGate *ng, float *pcm, int n) {
         if (new_q) {
             ng->output_queue = new_q;
             ng->output_cap = needed_cap;
+        } else {
+            fprintf(stderr, "[noise_gate] realloc failed for %d samples\n", needed_cap);
+            return;
         }
     }
 

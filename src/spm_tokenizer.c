@@ -146,6 +146,8 @@ static int parse_sentencepiece_model(const uint8_t *data, uint32_t size,
                         memcpy(piece, p, str_len);
                         piece[str_len] = '\0';
                         piece_len = (int)str_len;
+                    } else {
+                        piece_len = -1;  /* mark overlength — skip this piece */
                     }
                     p += str_len;
                 } else if (sfield == 2 && swire == 5) {
@@ -169,6 +171,8 @@ static int parse_sentencepiece_model(const uint8_t *data, uint32_t size,
                 }
             }
             p = sub_end;
+
+            if (piece_len < 0) continue;  /* skip overlength pieces */
 
             if (count >= capacity) {
                 int new_cap = capacity * 2;

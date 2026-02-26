@@ -177,11 +177,14 @@ BackchannelEvent backchannel_feed(BackchannelGen *bc, const float *audio,
     /* Compute pitch */
     float pitch = estimate_pitch(audio, n_samples, bc->sample_rate);
 
-    /* Update history */
+    /* Update history (wrap hist_pos to prevent overflow) */
     int idx = bc->hist_pos % BC_HIST_FRAMES;
+    if (idx < 0) idx += BC_HIST_FRAMES;
     bc->energy_hist[idx] = energy_db;
     bc->pitch_hist[idx] = pitch;
     bc->hist_pos++;
+    if (bc->hist_pos >= BC_HIST_FRAMES * 1000)
+        bc->hist_pos %= BC_HIST_FRAMES;
     if (bc->hist_count < BC_HIST_FRAMES) bc->hist_count++;
 
     /* Track speech activity */
