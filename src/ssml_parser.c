@@ -384,6 +384,8 @@ typedef struct {
     char pending_text[SSML_MAX_TEXT];
     int  pending_len;
     int  pending_break_before;
+    char pending_emotion[32];
+    char pending_phoneme_ipa[256];
 
     XmlScanner scanner;
 } Walker;
@@ -424,6 +426,8 @@ static void w_flush(Walker *w, int break_after_ms) {
     seg->text[copy] = '\0';
 
     snprintf(seg->voice, SSML_MAX_VOICE, "%s", w->current_voice);
+    snprintf(seg->emotion, sizeof(seg->emotion), "%s", w->pending_emotion);
+    snprintf(seg->phoneme_ipa, sizeof(seg->phoneme_ipa), "%s", w->pending_phoneme_ipa);
     seg->rate   = w_prosody(w)->rate;
     seg->pitch  = w_prosody(w)->pitch;
     seg->volume = w_prosody(w)->volume;
@@ -591,6 +595,119 @@ static void walk_element(Walker *w, XmlToken *open_tok) {
 
         if (w->pdepth > 0) w->pdepth--;
 
+    } else if (streqi(tag, "emotion") || streqi(tag, "amazon:emotion")) {
+        /* <emotion type="happy">text</emotion>
+         * Maps emotion labels to prosody parameters for expressive synthesis.
+         * Flush pending text FIRST so surrounding plain text keeps neutral prosody. */
+        w_flush(w, 0);
+
+        if (w->pdepth < MAX_NEST_DEPTH - 1) {
+            w->pdepth++;
+            w->pstack[w->pdepth] = w->pstack[w->pdepth - 1];
+        }
+        const char *etype = xml_get_attr(open_tok, "type");
+        if (!etype) etype = xml_get_attr(open_tok, "name");
+        if (!etype) etype = "neutral";
+
+        /* Emotion alias table: maps 40+ labels to prosody + canonical emotion name.
+         * Canonical name is stored in pending_emotion for Flow model conditioning. */
+        static const struct {
+            const char *alias;
+            const char *canonical;
+            float rate, pitch, volume;
+        } emo_map[] = {
+            /* ── Base 11 emotions ── */
+            {"happy",        "happy",     1.05f, 1.10f, 1.10f},
+            {"joy",          "happy",     1.05f, 1.10f, 1.10f},
+            {"excited",      "excited",   1.08f, 1.15f, 1.15f},
+            {"enthusiastic", "excited",   1.08f, 1.15f, 1.15f},
+            {"sad",          "sad",       0.85f, 0.90f, 0.85f},
+            {"melancholy",   "sad",       0.85f, 0.90f, 0.85f},
+            {"angry",        "angry",     0.95f, 0.95f, 1.30f},
+            {"frustrated",   "angry",     0.95f, 0.95f, 1.30f},
+            {"fearful",      "fearful",   1.10f, 1.15f, 0.90f},
+            {"anxious",      "fearful",   1.10f, 1.15f, 0.90f},
+            {"surprised",    "surprised", 0.90f, 1.20f, 1.15f},
+            {"warm",         "warm",      0.95f, 1.05f, 1.05f},
+            {"friendly",     "warm",      0.95f, 1.05f, 1.05f},
+            {"serious",      "serious",   0.90f, 0.90f, 0.95f},
+            {"thoughtful",   "serious",   0.90f, 0.90f, 0.95f},
+            {"calm",         "calm",      0.88f, 0.95f, 0.85f},
+            {"soothing",     "calm",      0.88f, 0.95f, 0.85f},
+            {"confident",    "confident", 0.97f, 0.92f, 1.20f},
+            {"authoritative","confident", 0.97f, 0.92f, 1.20f},
+            /* ── Expanded: blended prosody from base emotions ── */
+            {"nostalgic",    "sad",       0.88f, 0.94f, 0.88f},
+            {"wistful",      "sad",       0.87f, 0.93f, 0.87f},
+            {"grief",        "sad",       0.80f, 0.85f, 0.80f},
+            {"melancholic",  "sad",       0.83f, 0.88f, 0.83f},
+            {"sarcastic",    "confident", 0.92f, 1.08f, 1.10f},
+            {"ironic",       "confident", 0.93f, 1.06f, 1.08f},
+            {"amused",       "happy",     1.03f, 1.08f, 1.05f},
+            {"playful",      "happy",     1.06f, 1.12f, 1.08f},
+            {"cheerful",     "happy",     1.04f, 1.08f, 1.08f},
+            {"content",      "calm",      0.92f, 1.02f, 0.95f},
+            {"relaxed",      "calm",      0.85f, 0.97f, 0.88f},
+            {"peaceful",     "calm",      0.84f, 0.96f, 0.85f},
+            {"tender",       "warm",      0.90f, 1.03f, 0.95f},
+            {"loving",       "warm",      0.92f, 1.06f, 1.02f},
+            {"compassionate","warm",      0.90f, 1.02f, 0.98f},
+            {"empathetic",   "warm",      0.91f, 1.03f, 0.97f},
+            {"sympathetic",  "warm",      0.90f, 1.01f, 0.93f},
+            {"curious",      "surprised", 0.95f, 1.10f, 1.05f},
+            {"intrigued",    "surprised", 0.93f, 1.08f, 1.03f},
+            {"amazed",       "surprised", 0.88f, 1.22f, 1.18f},
+            {"astonished",   "surprised", 0.86f, 1.25f, 1.20f},
+            {"irritated",    "angry",     0.97f, 0.97f, 1.15f},
+            {"furious",      "angry",     0.92f, 0.92f, 1.40f},
+            {"outraged",     "angry",     0.90f, 0.90f, 1.35f},
+            {"disgusted",    "angry",     0.93f, 0.88f, 1.10f},
+            {"disappointed", "sad",       0.90f, 0.92f, 0.90f},
+            {"hopeful",      "warm",      0.98f, 1.08f, 1.05f},
+            {"proud",        "confident", 0.95f, 0.95f, 1.15f},
+            {"determined",   "confident", 0.95f, 0.90f, 1.20f},
+            {"nervous",      "fearful",   1.05f, 1.10f, 0.92f},
+            {"terrified",    "fearful",   1.15f, 1.20f, 0.85f},
+            {"panicked",     "fearful",   1.18f, 1.22f, 0.88f},
+            {"worried",      "fearful",   1.03f, 1.05f, 0.93f},
+            {"embarrassed",  "fearful",   0.95f, 1.08f, 0.85f},
+            {"grateful",     "warm",      0.95f, 1.06f, 1.05f},
+            {"bored",        "serious",   0.85f, 0.88f, 0.82f},
+            {"tired",        "calm",      0.82f, 0.90f, 0.80f},
+            {"energetic",    "excited",   1.10f, 1.18f, 1.18f},
+            {"passionate",   "excited",   1.05f, 1.12f, 1.25f},
+            {"dramatic",     "excited",   0.92f, 1.15f, 1.25f},
+            {"mysterious",   "serious",   0.88f, 0.92f, 0.88f},
+            {"suspenseful",  "serious",   0.85f, 0.95f, 0.90f},
+            {"whisper",      "calm",      0.85f, 0.90f, 0.60f},
+            {"emphatic",     "confident", 0.93f, 1.05f, 1.25f},
+            {NULL, NULL, 0, 0, 0}
+        };
+
+        int found = 0;
+        for (int i = 0; emo_map[i].alias; i++) {
+            if (streqi(etype, emo_map[i].alias)) {
+                w_prosody(w)->rate   *= emo_map[i].rate;
+                w_prosody(w)->pitch  *= emo_map[i].pitch;
+                w_prosody(w)->volume *= emo_map[i].volume;
+                snprintf(w->pending_emotion, sizeof(w->pending_emotion),
+                         "%s", emo_map[i].canonical);
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            snprintf(w->pending_emotion, sizeof(w->pending_emotion), "%s", etype);
+        }
+
+        if (open_tok->type == XML_OPEN_TAG) {
+            walk_children(w, tag);
+        }
+        w_flush(w, 0);
+
+        w->pending_emotion[0] = '\0';
+        if (w->pdepth > 0) w->pdepth--;
+
     } else if (streqi(tag, "voice")) {
         const char *name = xml_get_attr(open_tok, "name");
         char saved_voice[SSML_MAX_VOICE];
@@ -627,10 +744,40 @@ static void walk_element(Walker *w, XmlToken *open_tok) {
             walk_children(w, tag);
         }
 
+    } else if (streqi(tag, "spell")) {
+        /* <spell>ABC123</spell> — spell each character out loud via text_characters() */
+        char raw[SSML_MAX_TEXT] = {0};
+        int rlen = 0;
+        if (open_tok->type == XML_OPEN_TAG) {
+            XmlToken child;
+            while (xml_next(&w->scanner, &child)) {
+                if (child.type == XML_CLOSE_TAG && streqi(child.tag, "spell")) break;
+                if (child.type == XML_TEXT) {
+                    int tl = (int)strlen(child.text);
+                    int sp = SSML_MAX_TEXT - rlen - 1;
+                    int cp = tl < sp ? tl : sp;
+                    if (cp > 0) { memcpy(raw + rlen, child.text, (size_t)cp); rlen += cp; }
+                }
+                if (child.type == XML_EOF) break;
+            }
+        }
+        raw[rlen] = '\0';
+        char spelled[SSML_MAX_TEXT];
+        text_characters(raw, spelled, SSML_MAX_TEXT);
+        w_add_text(w, spelled);
+
     } else if (streqi(tag, "phoneme")) {
-        /* Use text content as best-effort */
+        const char *ph = xml_get_attr(open_tok, "ph");
+        if (ph && *ph) {
+            w_flush(w, 0);
+            snprintf(w->pending_phoneme_ipa, sizeof(w->pending_phoneme_ipa), "%s", ph);
+        }
         if (open_tok->type == XML_OPEN_TAG) {
             walk_children(w, "phoneme");
+        }
+        if (ph && *ph) {
+            w_flush(w, 0);
+            w->pending_phoneme_ipa[0] = '\0';
         }
 
     } else {

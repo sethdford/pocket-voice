@@ -15,17 +15,12 @@
  */
 
 #include "mimi_endpointer.h"
+#include "lstm_ops.h"
+
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
-
-#ifdef __APPLE__
-#ifndef ACCELERATE_NEW_LAPACK
-#define ACCELERATE_NEW_LAPACK
-#endif
-#include <Accelerate/Accelerate.h>
-#endif
 
 #define EP_N_CLASSES 4
 
@@ -70,11 +65,7 @@ struct MimiEndpointer {
 
 /* ── Utility ──────────────────────────────────────────── */
 
-static float sigmoid(float x) {
-    if (x > 10.0f) return 1.0f;
-    if (x < -10.0f) return 0.0f;
-    return 1.0f / (1.0f + expf(-x));
-}
+/* sigmoid provided by lstm_ops.h as lstm_sigmoid */
 
 static void layer_norm_1d(float *out, const float *in, const float *w,
                            const float *b, int D) {
@@ -120,6 +111,12 @@ MimiEndpointer *mimi_ep_create(int latent_dim, int hidden_dim,
     ep->c      = (float *)calloc(H, sizeof(float));
     ep->gates  = (float *)calloc((size_t)4 * H, sizeof(float));
     ep->normed = (float *)calloc(D, sizeof(float));
+
+    if (!ep->norm_w || !ep->norm_b || !ep->Wi || !ep->Wh || !ep->bias ||
+        !ep->out_w || !ep->out_b || !ep->h || !ep->c || !ep->gates || !ep->normed) {
+        mimi_ep_destroy(ep);
+        return NULL;
+    }
 
     /* Initialize LayerNorm to identity */
     for (int i = 0; i < D; i++) ep->norm_w[i] = 1.0f;
@@ -206,42 +203,11 @@ EndpointResult mimi_ep_process(MimiEndpointer *ep, const float *latents) {
     /* LayerNorm input */
     layer_norm_1d(ep->normed, latents, ep->norm_w, ep->norm_b, D);
 
-    /* LSTM: gates = Wi @ x + Wh @ h_prev + bias */
-#ifdef __APPLE__
-    cblas_sgemv(CblasRowMajor, CblasNoTrans,
-                4 * H, D, 1.0f,
-                ep->Wi, D, ep->normed, 1,
-                0.0f, ep->gates, 1);
-    cblas_sgemv(CblasRowMajor, CblasNoTrans,
-                4 * H, H, 1.0f,
-                ep->Wh, H, ep->h, 1,
-                1.0f, ep->gates, 1);
-    vDSP_vadd(ep->gates, 1, ep->bias, 1, ep->gates, 1, 4 * H);
-#else
-    /* Fallback: manual matmul */
-    for (int i = 0; i < 4 * H; i++) {
-        float sum = ep->bias[i];
-        for (int j = 0; j < D; j++) sum += ep->Wi[i * D + j] * ep->normed[j];
-        for (int j = 0; j < H; j++) sum += ep->Wh[i * H + j] * ep->h[j];
-        ep->gates[i] = sum;
-    }
-#endif
-
-    /* Split gates and apply activations */
-    float *gi = ep->gates;           /* input gate */
-    float *gf = ep->gates + H;      /* forget gate */
-    float *gg = ep->gates + 2 * H;  /* cell gate */
-    float *go = ep->gates + 3 * H;  /* output gate */
-
-    for (int i = 0; i < H; i++) {
-        float i_gate = sigmoid(gi[i]);
-        float f_gate = sigmoid(gf[i]);
-        float g_val  = tanhf(gg[i]);
-        float o_gate = sigmoid(go[i]);
-
-        ep->c[i] = f_gate * ep->c[i] + i_gate * g_val;
-        ep->h[i] = o_gate * tanhf(ep->c[i]);
-    }
+    /* LSTM forward step (shared implementation from lstm_ops.h) */
+    lstm_step(ep->Wi, ep->Wh, ep->bias,
+              ep->normed, 1,  /* contiguous input */
+              ep->h, ep->c, ep->gates,
+              D, H);
 
     /* Output projection: logits = out_w @ h + out_b */
     float logits[EP_N_CLASSES];

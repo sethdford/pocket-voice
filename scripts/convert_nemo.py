@@ -47,6 +47,7 @@ CSTT_SUB_DW_STRIDING = 2
 CSTT_FLAG_HAS_BIAS = 1 << 0
 CSTT_FLAG_SLANEY_NORM = 1 << 1
 CSTT_FLAG_REL_PE = 1 << 2
+CSTT_FLAG_XSCALING = 1 << 5
 
 
 def download_nemo(model_id: str, cache_dir: str = None) -> Path:
@@ -145,6 +146,7 @@ def parse_encoder_config(config: dict) -> dict:
         "subsampling": enc.get("subsampling", "dw_striding"),
         "subsampling_factor": enc.get("subsampling_factor", 8),
         "subsampling_conv_channels": enc.get("subsampling_conv_channels", -1),
+        "xscaling": enc.get("xscaling", True),
     }
     if result["subsampling_conv_channels"] <= 0:
         result["subsampling_conv_channels"] = result["d_model"]
@@ -242,9 +244,9 @@ def get_vocab_from_tokenizer(tok_path: Path, config: dict) -> list:
 
 def build_header(enc_config: dict, pre_config: dict, vocab_size: int,
                  sub_type: int, n_sub_convs: int, sub_feat_in: int,
-                 sub_conv_kernel: int) -> bytes:
+                 sub_conv_kernel: int, fp16: bool = False) -> bytes:
     """Build the CSTTHeader as raw bytes (24 x uint32 = 96 bytes)."""
-    flags = CSTT_FLAG_HAS_BIAS | CSTT_FLAG_SLANEY_NORM | CSTT_FLAG_REL_PE
+    flags = CSTT_FLAG_HAS_BIAS | CSTT_FLAG_SLANEY_NORM | CSTT_FLAG_REL_PE | CSTT_FLAG_XSCALING
 
     return struct.pack("<" + "I" * 24,
         CSTT_MAGIC,
@@ -261,7 +263,7 @@ def build_header(enc_config: dict, pre_config: dict, vocab_size: int,
         pre_config["win_length"],
         pre_config["n_fft"],
         enc_config["subsampling_factor"],
-        0,  # dtype: fp32
+        1 if fp16 else 0,  # dtype: 0=fp32, 1=fp16
         flags,
         sub_type,
         n_sub_convs,
@@ -271,9 +273,13 @@ def build_header(enc_config: dict, pre_config: dict, vocab_size: int,
     )
 
 
-def tensor_to_bytes(t) -> bytes:
-    """Convert a tensor to fp32 little-endian bytes."""
-    return t.detach().float().contiguous().cpu().numpy().tobytes()
+def tensor_to_bytes(t, fp16=False) -> bytes:
+    """Convert a tensor to fp32 or fp16 little-endian bytes."""
+    import numpy as np
+    arr = t.detach().float().contiguous().cpu().numpy()
+    if fp16:
+        return arr.astype(np.float16).tobytes()
+    return arr.tobytes()
 
 
 def write_cstt(output_path: str, header: bytes, weight_chunks: list):
@@ -316,7 +322,7 @@ def squeeze_conv1d(t):
     return t
 
 
-def convert_model(model_path: str, output_path: str):
+def convert_model(model_path: str, output_path: str, fp16: bool = False):
     """Main conversion pipeline."""
     import torch
 
@@ -401,6 +407,8 @@ def convert_model(model_path: str, output_path: str):
     # --- Build weight data ---
     chunks = []
 
+    bpv = 2 if fp16 else 4  # bytes per value
+
     # Subsampling: conv descriptors (5 uint32 each) then weights
     for sc in sub_convs:
         desc = struct.pack("<5I", sc["c_in"], sc["c_out"], sc["kernel"],
@@ -408,15 +416,15 @@ def convert_model(model_path: str, output_path: str):
         chunks.append(desc)
 
     for sc in sub_convs:
-        chunks.append(tensor_to_bytes(sc["w"]))
+        chunks.append(tensor_to_bytes(sc["w"], fp16=fp16))
         if sc["b"] is not None:
-            chunks.append(tensor_to_bytes(sc["b"]))
+            chunks.append(tensor_to_bytes(sc["b"], fp16=fp16))
         else:
-            chunks.append(b"\x00" * (sc["c_out"] * 4))
+            chunks.append(b"\x00" * (sc["c_out"] * bpv))
 
     # Projection
-    chunks.append(tensor_to_bytes(proj_w))
-    chunks.append(tensor_to_bytes(proj_b))
+    chunks.append(tensor_to_bytes(proj_w, fp16=fp16))
+    chunks.append(tensor_to_bytes(proj_b, fp16=fp16))
 
     # --- Conformer blocks ---
     # Detect naming convention from first block
@@ -430,28 +438,31 @@ def convert_model(model_path: str, output_path: str):
     print(f"  FFN naming: feed_forward1.{ff_up_suffix}/{ff_down_suffix}")
     print(f"  Conv naming: {conv_prefix}.*")
 
+    def wb(t):
+        return tensor_to_bytes(t, fp16=fp16)
+
     for i in range(n_layers):
         pre = f"encoder.layers.{i}"
 
         # FFN1
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.norm_feed_forward1.weight")))
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.norm_feed_forward1.bias")))
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.feed_forward1.{ff_up_suffix}.weight")))
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.feed_forward1.{ff_up_suffix}.bias")))
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.feed_forward1.{ff_down_suffix}.weight")))
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.feed_forward1.{ff_down_suffix}.bias")))
+        chunks.append(wb(get_weight(sd, f"{pre}.norm_feed_forward1.weight")))
+        chunks.append(wb(get_weight(sd, f"{pre}.norm_feed_forward1.bias")))
+        chunks.append(wb(get_weight(sd, f"{pre}.feed_forward1.{ff_up_suffix}.weight")))
+        chunks.append(wb(get_weight(sd, f"{pre}.feed_forward1.{ff_up_suffix}.bias")))
+        chunks.append(wb(get_weight(sd, f"{pre}.feed_forward1.{ff_down_suffix}.weight")))
+        chunks.append(wb(get_weight(sd, f"{pre}.feed_forward1.{ff_down_suffix}.bias")))
 
         # MHSA
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.norm_self_att.weight")))
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.norm_self_att.bias")))
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.self_attn.linear_q.weight")))
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.self_attn.linear_q.bias")))
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.self_attn.linear_k.weight")))
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.self_attn.linear_k.bias")))
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.self_attn.linear_v.weight")))
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.self_attn.linear_v.bias")))
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.self_attn.linear_out.weight")))
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.self_attn.linear_out.bias")))
+        chunks.append(wb(get_weight(sd, f"{pre}.norm_self_att.weight")))
+        chunks.append(wb(get_weight(sd, f"{pre}.norm_self_att.bias")))
+        chunks.append(wb(get_weight(sd, f"{pre}.self_attn.linear_q.weight")))
+        chunks.append(wb(get_weight(sd, f"{pre}.self_attn.linear_q.bias")))
+        chunks.append(wb(get_weight(sd, f"{pre}.self_attn.linear_k.weight")))
+        chunks.append(wb(get_weight(sd, f"{pre}.self_attn.linear_k.bias")))
+        chunks.append(wb(get_weight(sd, f"{pre}.self_attn.linear_v.weight")))
+        chunks.append(wb(get_weight(sd, f"{pre}.self_attn.linear_v.bias")))
+        chunks.append(wb(get_weight(sd, f"{pre}.self_attn.linear_out.weight")))
+        chunks.append(wb(get_weight(sd, f"{pre}.self_attn.linear_out.bias")))
 
         # Relative PE: linear_pos projection + biases
         pos_bias_u = get_weight(sd, f"{pre}.self_attn.pos_bias_u", required=False)
@@ -459,59 +470,62 @@ def convert_model(model_path: str, output_path: str):
         linear_pos_w = get_weight(sd, f"{pre}.self_attn.linear_pos.weight", required=False)
         if pos_bias_u is not None:
             if linear_pos_w is not None:
-                chunks.append(tensor_to_bytes(linear_pos_w))
+                chunks.append(wb(linear_pos_w))
             else:
-                chunks.append(b"\x00" * (D * D * 4))
-            chunks.append(tensor_to_bytes(pos_bias_u))
-            chunks.append(tensor_to_bytes(pos_bias_v))
+                chunks.append(b"\x00" * (D * D * bpv))
+            chunks.append(wb(pos_bias_u))
+            chunks.append(wb(pos_bias_v))
         else:
             d_head = D // n_heads
-            chunks.append(b"\x00" * (D * D * 4))
-            chunks.append(b"\x00" * (n_heads * d_head * 4))
-            chunks.append(b"\x00" * (n_heads * d_head * 4))
+            chunks.append(b"\x00" * (D * D * bpv))
+            chunks.append(b"\x00" * (n_heads * d_head * bpv))
+            chunks.append(b"\x00" * (n_heads * d_head * bpv))
 
         # Conv module
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.norm_conv.weight")))
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.norm_conv.bias")))
+        chunks.append(wb(get_weight(sd, f"{pre}.norm_conv.weight")))
+        chunks.append(wb(get_weight(sd, f"{pre}.norm_conv.bias")))
 
         pw1_w = squeeze_conv1d(get_weight(sd, f"{pre}.{conv_prefix}.pointwise_conv1.weight"))
-        chunks.append(tensor_to_bytes(pw1_w))
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.{conv_prefix}.pointwise_conv1.bias")))
+        chunks.append(wb(pw1_w))
+        chunks.append(wb(get_weight(sd, f"{pre}.{conv_prefix}.pointwise_conv1.bias")))
 
         dw_w = get_weight(sd, f"{pre}.{conv_prefix}.depthwise_conv.weight")
         if dw_w.ndim == 3:
             dw_w = dw_w.squeeze(1)  # [D, 1, K] → [D, K]
-        chunks.append(tensor_to_bytes(dw_w))
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.{conv_prefix}.depthwise_conv.bias")))
+        chunks.append(wb(dw_w))
+        chunks.append(wb(get_weight(sd, f"{pre}.{conv_prefix}.depthwise_conv.bias")))
 
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.{conv_prefix}.batch_norm.weight")))
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.{conv_prefix}.batch_norm.bias")))
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.{conv_prefix}.batch_norm.running_mean")))
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.{conv_prefix}.batch_norm.running_var")))
+        chunks.append(wb(get_weight(sd, f"{pre}.{conv_prefix}.batch_norm.weight")))
+        chunks.append(wb(get_weight(sd, f"{pre}.{conv_prefix}.batch_norm.bias")))
+        chunks.append(wb(get_weight(sd, f"{pre}.{conv_prefix}.batch_norm.running_mean")))
+        chunks.append(wb(get_weight(sd, f"{pre}.{conv_prefix}.batch_norm.running_var")))
 
         pw2_w = squeeze_conv1d(get_weight(sd, f"{pre}.{conv_prefix}.pointwise_conv2.weight"))
-        chunks.append(tensor_to_bytes(pw2_w))
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.{conv_prefix}.pointwise_conv2.bias")))
+        chunks.append(wb(pw2_w))
+        chunks.append(wb(get_weight(sd, f"{pre}.{conv_prefix}.pointwise_conv2.bias")))
 
         # FFN2
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.norm_feed_forward2.weight")))
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.norm_feed_forward2.bias")))
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.feed_forward2.{ff_up_suffix}.weight")))
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.feed_forward2.{ff_up_suffix}.bias")))
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.feed_forward2.{ff_down_suffix}.weight")))
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.feed_forward2.{ff_down_suffix}.bias")))
+        chunks.append(wb(get_weight(sd, f"{pre}.norm_feed_forward2.weight")))
+        chunks.append(wb(get_weight(sd, f"{pre}.norm_feed_forward2.bias")))
+        chunks.append(wb(get_weight(sd, f"{pre}.feed_forward2.{ff_up_suffix}.weight")))
+        chunks.append(wb(get_weight(sd, f"{pre}.feed_forward2.{ff_up_suffix}.bias")))
+        chunks.append(wb(get_weight(sd, f"{pre}.feed_forward2.{ff_down_suffix}.weight")))
+        chunks.append(wb(get_weight(sd, f"{pre}.feed_forward2.{ff_down_suffix}.bias")))
 
         # Final norm
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.norm_out.weight")))
-        chunks.append(tensor_to_bytes(get_weight(sd, f"{pre}.norm_out.bias")))
+        chunks.append(wb(get_weight(sd, f"{pre}.norm_out.weight")))
+        chunks.append(wb(get_weight(sd, f"{pre}.norm_out.bias")))
 
     # CTC head (squeeze Conv1d → Linear shape)
-    chunks.append(tensor_to_bytes(ctc_w))
-    chunks.append(tensor_to_bytes(ctc_b))
+    chunks.append(wb(ctc_w))
+    chunks.append(wb(ctc_b))
 
     # --- Write output files ---
+    if fp16:
+        print(f"Using fp16 weight storage (halving model size)")
     header = build_header(enc_config, pre_config, vocab_size,
-                          sub_type, len(sub_convs), sub_feat_in, sub_conv_kernel)
+                          sub_type, len(sub_convs), sub_feat_in, sub_conv_kernel,
+                          fp16=fp16)
     write_cstt(output_path, header, chunks)
 
     vocab = None
@@ -548,6 +562,8 @@ def main():
                         help="Output .cstt file path (default: model.cstt)")
     parser.add_argument("--cache-dir", default=None,
                         help="HuggingFace cache directory")
+    parser.add_argument("--fp16", action="store_true",
+                        help="Store weights as float16 (halves model size)")
     parser.add_argument("--list-keys", action="store_true",
                         help="List all state dict keys and exit")
 
@@ -565,7 +581,7 @@ def main():
             print(f"{k}: {list(sd[k].shape)} {sd[k].dtype}")
         return
 
-    convert_model(args.model, args.output)
+    convert_model(args.model, args.output, fp16=args.fp16)
 
 
 if __name__ == "__main__":

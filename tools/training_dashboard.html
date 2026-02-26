@@ -1,0 +1,685 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Sonata Training Loss Dashboard</title>
+    <style>
+      :root {
+        --bg: #0d1117;
+        --surface: #161b22;
+        --border: #30363d;
+        --text: #c9d1d9;
+        --accent: #58a6ff;
+        --green: #3fb950;
+        --yellow: #d29922;
+        --red: #f85149;
+        --purple: #bc8cff;
+        --cyan: #39c5cf;
+        --orange: #d18616;
+      }
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        padding: 20px;
+      }
+      h1 {
+        color: var(--accent);
+        margin-bottom: 20px;
+        font-size: 1.5rem;
+      }
+      .controls {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        margin-bottom: 20px;
+        flex-wrap: wrap;
+      }
+      .controls input[type="file"] {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        color: var(--text);
+        padding: 8px 12px;
+        border-radius: 6px;
+      }
+      .controls input[type="file"]::file-selector-button {
+        background: var(--accent);
+        color: #fff;
+        border: none;
+        padding: 6px 12px;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+      .file-list {
+        font-size: 0.85rem;
+        color: #8b949e;
+        margin-top: 8px;
+      }
+      .file-list span {
+        display: inline-block;
+        margin-right: 12px;
+        margin-bottom: 4px;
+      }
+      .file-list .remove {
+        cursor: pointer;
+        color: var(--red);
+        margin-left: 4px;
+      }
+      .stats {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+        gap: 12px;
+        margin-bottom: 24px;
+      }
+      .stat-card {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 16px;
+      }
+      .stat-card .label {
+        font-size: 0.75rem;
+        color: #8b949e;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+      }
+      .stat-card .value {
+        font-size: 1.25rem;
+        font-weight: 700;
+        margin-top: 4px;
+      }
+      .stat-card .value.green {
+        color: var(--green);
+      }
+      .stat-card .value.yellow {
+        color: var(--yellow);
+      }
+      .stat-card .value.accent {
+        color: var(--accent);
+      }
+      .stat-card .value.purple {
+        color: var(--purple);
+      }
+      .chart-container {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 16px;
+        margin-bottom: 24px;
+      }
+      .chart-container h3 {
+        font-size: 0.9rem;
+        color: var(--accent);
+        margin-bottom: 12px;
+      }
+      .chart-legend {
+        display: flex;
+        gap: 16px;
+        flex-wrap: wrap;
+        margin-bottom: 8px;
+      }
+      .chart-legend span {
+        font-size: 0.75rem;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .chart-legend .swatch {
+        width: 12px;
+        height: 12px;
+        border-radius: 2px;
+      }
+      canvas {
+        width: 100%;
+        height: 220px;
+      }
+      .section-title {
+        font-size: 1.1rem;
+        color: var(--accent);
+        margin: 24px 0 12px;
+        border-bottom: 1px solid var(--border);
+        padding-bottom: 8px;
+      }
+      #drop-zone {
+        border: 2px dashed var(--border);
+        border-radius: 12px;
+        padding: 40px;
+        text-align: center;
+        margin-bottom: 24px;
+        transition: all 0.2s;
+      }
+      #drop-zone.drag-over {
+        border-color: var(--accent);
+        background: rgba(88, 166, 255, 0.05);
+      }
+      #drop-zone p {
+        color: #8b949e;
+        margin-bottom: 12px;
+      }
+      .checkbox-group {
+        display: flex;
+        gap: 16px;
+        margin-bottom: 12px;
+      }
+      .checkbox-group label {
+        font-size: 0.85rem;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        cursor: pointer;
+      }
+      .checkbox-group input {
+        accent-color: var(--accent);
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Sonata Training Loss Dashboard</h1>
+
+    <div id="drop-zone">
+      <p>
+        Load <code>losses.jsonl</code> file(s) from Flow, Codec, Vocoder, or
+        Joint training:
+      </p>
+      <input type="file" id="file-input" accept=".jsonl,.json,.txt" multiple />
+      <div class="file-list" id="file-list"></div>
+    </div>
+
+    <div id="content" style="display: none">
+      <div class="stats" id="stats"></div>
+
+      <div class="checkbox-group" id="series-toggles"></div>
+
+      <div class="chart-container">
+        <h3>Main Loss</h3>
+        <div class="chart-legend" id="main-legend"></div>
+        <canvas id="main-canvas"></canvas>
+      </div>
+
+      <div
+        class="chart-container"
+        id="component-chart-container"
+        style="display: none"
+      >
+        <h3>Component Losses</h3>
+        <div class="chart-legend" id="component-legend"></div>
+        <canvas id="component-canvas"></canvas>
+      </div>
+
+      <div class="chart-container">
+        <h3>Learning Rate</h3>
+        <div class="chart-legend" id="lr-legend"></div>
+        <canvas id="lr-canvas"></canvas>
+      </div>
+    </div>
+
+    <script>
+      const COLORS = [
+        "#58a6ff",
+        "#3fb950",
+        "#d29922",
+        "#bc8cff",
+        "#f85149",
+        "#39c5cf",
+        "#d18616",
+      ];
+      const FILE_KEYS = new Set();
+
+      const dropZone = document.getElementById("drop-zone");
+      const fileInput = document.getElementById("file-input");
+
+      dropZone.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        dropZone.classList.add("drag-over");
+      });
+      dropZone.addEventListener("dragleave", () =>
+        dropZone.classList.remove("drag-over"),
+      );
+      dropZone.addEventListener("drop", (e) => {
+        e.preventDefault();
+        dropZone.classList.remove("drag-over");
+        if (e.dataTransfer.files.length)
+          addFiles(Array.from(e.dataTransfer.files));
+      });
+      fileInput.addEventListener("change", (e) => {
+        if (e.target.files.length) addFiles(Array.from(e.target.files));
+      });
+
+      function addFiles(files) {
+        for (const f of files) {
+          if (
+            !f.name.toLowerCase().endsWith(".jsonl") &&
+            !f.name.endsWith(".json") &&
+            !f.name.endsWith(".txt")
+          )
+            continue;
+          const key = f.name + "_" + (FILE_KEYS.size + 1);
+          FILE_KEYS.add(key);
+          const reader = new FileReader();
+          reader.key = key;
+          reader.name = f.name;
+          reader.onload = (ev) => {
+            parseAndMerge(ev.target.key, ev.target.name, ev.target.result);
+          };
+          reader.readAsText(f);
+        }
+      }
+
+      const datasets = {};
+
+      function parseAndMerge(key, fileName, text) {
+        const lines = text.trim().split("\n").filter(Boolean);
+        const entries = lines
+          .map((l) => {
+            try {
+              return JSON.parse(l);
+            } catch {
+              return null;
+            }
+          })
+          .filter(Boolean);
+
+        if (!datasets[key]) datasets[key] = { name: fileName, rows: [] };
+        datasets[key].rows = entries;
+        datasets[key].name = fileName;
+
+        document.getElementById("content").style.display = "block";
+        dropZone.style.display = "none";
+        render();
+      }
+
+      function getAllSteps() {
+        const steps = new Set();
+        for (const d of Object.values(datasets)) {
+          for (const r of d.rows) {
+            if (r.step != null) steps.add(r.step);
+          }
+        }
+        return [...steps].sort((a, b) => a - b);
+      }
+
+      const MAIN_LOSS_KEYS = [
+        "loss",
+        "g_loss",
+        "g_total",
+        "val_loss",
+        "flow_loss",
+      ];
+      const COMPONENT_KEYS = [
+        "mel_loss",
+        "adv_loss",
+        "fm_loss",
+        "d_loss",
+        "intlv",
+        "stft",
+        "wav",
+        "ent",
+        "codes",
+        "dur_loss",
+        "flow_fm",
+        "perceptual_loss",
+        "wavlm_loss",
+      ];
+
+      function getMainLossKey(rows) {
+        for (const k of MAIN_LOSS_KEYS) {
+          if (rows.some((r) => r[k] != null)) return k;
+        }
+        return null;
+      }
+
+      function getComponentKeys(rows) {
+        return COMPONENT_KEYS.filter((k) => rows.some((r) => r[k] != null));
+      }
+
+      function render() {
+        const keys = Object.keys(datasets);
+        if (keys.length === 0) return;
+
+        const steps = getAllSteps();
+        if (steps.length === 0) return;
+
+        const enabledKeys = new Set(
+          document.querySelectorAll("#series-toggles input:checked").length
+            ? [
+                ...document.querySelectorAll("#series-toggles input:checked"),
+              ].map((c) => c.value)
+            : keys,
+        );
+
+        const statsEl = document.getElementById("stats");
+        let bestLoss = Infinity;
+        let lastStep = 0;
+        let stepsPerSec = 0;
+
+        for (const k of keys) {
+          const d = datasets[k];
+          const mainKey = getMainLossKey(d.rows);
+          for (const r of d.rows) {
+            if (r.step != null) lastStep = Math.max(lastStep, r.step);
+            const v = r[mainKey] ?? r.val_loss;
+            if (v != null && v < bestLoss) bestLoss = v;
+            if (r.steps_per_sec != null) stepsPerSec = r.steps_per_sec;
+          }
+        }
+
+        statsEl.innerHTML = `
+          <div class="stat-card"><div class="label">Current Step</div><div class="value accent">${lastStep.toLocaleString()}</div></div>
+          <div class="stat-card"><div class="label">Best Loss</div><div class="value green">${bestLoss < Infinity ? bestLoss.toFixed(4) : "—"}</div></div>
+          <div class="stat-card"><div class="label">Speed</div><div class="value">${stepsPerSec > 0 ? stepsPerSec.toFixed(1) + " steps/s" : "—"}</div></div>
+          <div class="stat-card"><div class="label">Files</div><div class="value purple">${keys.length}</div></div>
+        `;
+
+        const seriesToggles = document.getElementById("series-toggles");
+        seriesToggles.innerHTML = keys
+          .map(
+            (k, i) =>
+              `<label><input type="checkbox" value="${k}" ${enabledKeys.has(k) ? "checked" : ""} /><span>${datasets[k].name}</span></label>`,
+          )
+          .join("");
+        seriesToggles.querySelectorAll("input").forEach((c) => {
+          c.onchange = () => render();
+        });
+
+        const mainKey = "loss";
+        const mainLegend = document.getElementById("main-legend");
+        mainLegend.innerHTML = keys
+          .filter((k) => enabledKeys.has(k))
+          .map(
+            (k, i) =>
+              `<span><span class="swatch" style="background:${COLORS[i % COLORS.length]}"></span>${datasets[k].name} (${getMainLossKey(datasets[k].rows) || "loss"})</span>`,
+          )
+          .join("");
+
+        const mainData = keys
+          .filter((k) => enabledKeys.has(k))
+          .map((k) => {
+            const d = datasets[k];
+            const mk = getMainLossKey(d.rows) || "loss";
+            const byStep = {};
+            for (const r of d.rows) {
+              if (r.step == null) continue;
+              const v = r[mk] ?? r.val_loss;
+              if (v != null && (byStep[r.step] == null || r.val_loss == null))
+                byStep[r.step] = v;
+            }
+            return { key: k, byStep, mk };
+          });
+
+        renderMultiLineChart(
+          "main-canvas",
+          steps,
+          mainData,
+          (d, s) => d.byStep[s],
+          COLORS,
+          "loss",
+        );
+
+        const compKeys = new Set();
+        for (const k of keys) {
+          for (const ck of getComponentKeys(datasets[k].rows)) compKeys.add(ck);
+        }
+        const hasComponents = [...compKeys].length > 0;
+
+        const compContainer = document.getElementById(
+          "component-chart-container",
+        );
+        compContainer.style.display = hasComponents ? "block" : "none";
+
+        if (hasComponents) {
+          const compLegend = document.getElementById("component-legend");
+          const compData = [];
+          let ci = 0;
+          for (const ck of COMPONENT_KEYS) {
+            const present = keys.some((k) =>
+              datasets[k].rows.some((r) => r[ck] != null),
+            );
+            if (present) {
+              const byKey = {};
+              for (const k of keys) {
+                if (!enabledKeys.has(k)) continue;
+                const byStep = {};
+                for (const r of datasets[k].rows) {
+                  if (r.step != null && r[ck] != null) byStep[r.step] = r[ck];
+                }
+                byKey[k] = byStep;
+              }
+              compData.push({
+                key: ck,
+                color: COLORS[ci++ % COLORS.length],
+                byKey,
+              });
+            }
+          }
+          compLegend.innerHTML = compData
+            .map(
+              (c) =>
+                `<span><span class="swatch" style="background:${c.color}"></span>${c.key}</span>`,
+            )
+            .join("");
+          renderComponentChart("component-canvas", steps, compData);
+        }
+
+        const lrLegend = document.getElementById("lr-legend");
+        lrLegend.innerHTML = keys
+          .filter((k) => enabledKeys.has(k))
+          .map(
+            (k, i) =>
+              `<span><span class="swatch" style="background:${COLORS[i % COLORS.length]}"></span>${datasets[k].name}</span>`,
+          )
+          .join("");
+
+        const lrData = keys
+          .filter((k) => enabledKeys.has(k))
+          .map((k) => {
+            const byStep = {};
+            for (const r of datasets[k].rows) {
+              if (r.step != null && r.lr != null) byStep[r.step] = r.lr;
+            }
+            return { key: k, byStep };
+          });
+
+        renderMultiLineChart(
+          "lr-canvas",
+          steps,
+          lrData,
+          (d, s) => d.byStep[s],
+          COLORS,
+          "lr",
+          true,
+        );
+      }
+
+      function renderMultiLineChart(
+        canvasId,
+        steps,
+        dataSeries,
+        getVal,
+        colors,
+        yLabel,
+        isLog = false,
+      ) {
+        const canvas = document.getElementById(canvasId);
+        const ctx = canvas.getContext("2d");
+        const dpr = window.devicePixelRatio || 1;
+        const rect = canvas.getBoundingClientRect();
+        canvas.width = rect.width * dpr;
+        canvas.height = rect.height * dpr;
+        ctx.scale(dpr, dpr);
+
+        const w = rect.width,
+          h = rect.height;
+        const pad = { top: 12, right: 20, bottom: 28, left: 48 };
+        const pw = w - pad.left - pad.right,
+          ph = h - pad.top - pad.bottom;
+
+        let minY = Infinity,
+          maxY = -Infinity;
+        for (const d of dataSeries) {
+          for (const s of steps) {
+            const v = getVal(d, s);
+            if (v != null && isFinite(v)) {
+              const yVal = isLog && v > 0 ? Math.log10(v) : v;
+              minY = Math.min(minY, yVal);
+              maxY = Math.max(maxY, yVal);
+            }
+          }
+        }
+        if (minY === Infinity) minY = 0;
+        if (maxY <= minY) maxY = minY + 1;
+        const rangeY = maxY - minY || 1;
+
+        ctx.clearRect(0, 0, w, h);
+
+        ctx.strokeStyle = "#30363d";
+        ctx.lineWidth = 0.5;
+        for (let i = 0; i <= 4; i++) {
+          const y = pad.top + ph - (ph * i) / 4;
+          ctx.beginPath();
+          ctx.moveTo(pad.left, y);
+          ctx.lineTo(w - pad.right, y);
+          ctx.stroke();
+          const rawVal = minY + (rangeY * i) / 4;
+          ctx.fillStyle = "#8b949e";
+          ctx.font = "10px sans-serif";
+          ctx.textAlign = "right";
+          ctx.fillText(
+            isLog ? "10^" + rawVal.toFixed(1) : rawVal.toFixed(3),
+            pad.left - 4,
+            y + 3,
+          );
+        }
+
+        for (let di = 0; di < dataSeries.length; di++) {
+          const d = dataSeries[di];
+          const pts = steps
+            .map((s) => ({ s, v: getVal(d, s) }))
+            .filter((p) => p.v != null && isFinite(p.v));
+          if (pts.length === 0) continue;
+
+          const yVal = (v) => (isLog && v > 0 ? Math.log10(v) : v);
+          const toY = (v) => pad.top + ph - (ph * (yVal(v) - minY)) / rangeY;
+
+          ctx.strokeStyle = colors[di % colors.length];
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          for (let i = 0; i < pts.length; i++) {
+            const x =
+              pad.left +
+              pw * (steps.indexOf(pts[i].s) / Math.max(1, steps.length - 1));
+            const y = toY(pts[i].v);
+            i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+          }
+          ctx.stroke();
+
+          ctx.fillStyle = colors[di % colors.length];
+          pts.forEach((p, i) => {
+            const x =
+              pad.left +
+              pw * (steps.indexOf(p.s) / Math.max(1, steps.length - 1));
+            const y = toY(p.v);
+            ctx.beginPath();
+            ctx.arc(x, y, 2.5, 0, Math.PI * 2);
+            ctx.fill();
+          });
+        }
+
+        ctx.fillStyle = "#8b949e";
+        ctx.font = "10px sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText("step", pad.left + pw / 2, h - 4);
+      }
+
+      function renderComponentChart(canvasId, steps, compData) {
+        const canvas = document.getElementById(canvasId);
+        const ctx = canvas.getContext("2d");
+        const dpr = window.devicePixelRatio || 1;
+        const rect = canvas.getBoundingClientRect();
+        canvas.width = rect.width * dpr;
+        canvas.height = rect.height * dpr;
+        ctx.scale(dpr, dpr);
+
+        const w = rect.width,
+          h = rect.height;
+        const pad = { top: 12, right: 20, bottom: 28, left: 48 };
+        const pw = w - pad.left - pad.right,
+          ph = h - pad.top - pad.bottom;
+
+        let minY = Infinity,
+          maxY = -Infinity;
+        for (const c of compData) {
+          for (const k of Object.keys(c.byKey || {})) {
+            for (const v of Object.values(c.byKey[k] || {})) {
+              if (v != null && isFinite(v)) {
+                minY = Math.min(minY, v);
+                maxY = Math.max(maxY, v);
+              }
+            }
+          }
+        }
+        if (minY === Infinity) minY = 0;
+        if (maxY <= minY) maxY = minY + 0.1;
+        const rangeY = maxY - minY || 1;
+
+        ctx.clearRect(0, 0, w, h);
+
+        ctx.strokeStyle = "#30363d";
+        ctx.lineWidth = 0.5;
+        for (let i = 0; i <= 4; i++) {
+          const y = pad.top + ph - (ph * i) / 4;
+          ctx.beginPath();
+          ctx.moveTo(pad.left, y);
+          ctx.lineTo(w - pad.right, y);
+          ctx.stroke();
+          ctx.fillStyle = "#8b949e";
+          ctx.font = "10px sans-serif";
+          ctx.textAlign = "right";
+          ctx.fillText(
+            (minY + (rangeY * i) / 4).toFixed(3),
+            pad.left - 4,
+            y + 3,
+          );
+        }
+
+        compData.forEach((c) => {
+          const merged = {};
+          for (const byStep of Object.values(c.byKey || {})) {
+            for (const [s, v] of Object.entries(byStep)) {
+              if (v != null && isFinite(v)) {
+                const step = parseInt(s, 10);
+                if (merged[step] == null) merged[step] = v;
+              }
+            }
+          }
+          const pts = steps
+            .map((s) => ({ s, v: merged[s] }))
+            .filter((p) => p.v != null);
+          if (pts.length === 0) return;
+
+          ctx.strokeStyle = c.color;
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          for (let i = 0; i < pts.length; i++) {
+            const x =
+              pad.left +
+              pw * (steps.indexOf(pts[i].s) / Math.max(1, steps.length - 1));
+            const y = pad.top + ph - (ph * (pts[i].v - minY)) / rangeY;
+            i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+          }
+          ctx.stroke();
+        });
+
+        ctx.fillStyle = "#8b949e";
+        ctx.font = "10px sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText("step", pad.left + pw / 2, h - 4);
+      }
+    </script>
+  </body>
+</html>

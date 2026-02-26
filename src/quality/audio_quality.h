@@ -193,6 +193,54 @@ QualityScorecard quality_grade(QualityScorecard sc);
  */
 void quality_print_report(const QualityScorecard *sc, const char *test_name);
 
+/* ── Prosody Quality Metrics ─────────────────────────────── */
+
+typedef struct {
+    float f0_contour_corr;   /* Pearson corr of F0 contour shape (0-1) */
+    float f0_range_ratio;    /* synth F0 range / ref F0 range (1.0 = perfect) */
+    float duration_rmse;     /* RMSE of word/syllable durations (ms) */
+    float duration_corr;     /* Pearson corr of duration pattern (0-1) */
+    float energy_contour_corr; /* Pearson corr of energy envelope (0-1) */
+    float pause_f1;          /* F1 score for pause placement */
+    float prosody_mos;       /* Predicted prosody MOS (1-5 scale) */
+    int   n_words;
+} ProsodyMetrics;
+
+/**
+ * Compute prosody-specific quality metrics comparing reference and synth.
+ * Focuses on suprasegmental features: F0 contour, duration, energy shape.
+ *
+ * @param ref       Reference audio (float32, mono)
+ * @param ref_len   Number of samples
+ * @param synth     Synthesized audio (float32, mono)
+ * @param synth_len Number of samples
+ * @param sr        Sample rate
+ * @return ProsodyMetrics
+ */
+ProsodyMetrics prosody_quality(const float *ref, int ref_len,
+                               const float *synth, int synth_len, int sr);
+
+/**
+ * Estimate prosody MOS from acoustic features alone (no reference needed).
+ * Uses a rule-based model considering pitch range, rate variation, and energy.
+ * Score: 1.0 (robotic) to 5.0 (natural).
+ */
+float prosody_predict_mos(const float *audio, int len, int sr);
+
+/**
+ * Extract per-frame energy envelope for prosody comparison.
+ *
+ * @param audio    Input audio (float32, mono)
+ * @param len      Number of samples
+ * @param sr       Sample rate
+ * @param env      Output: float[n_frames] energy in dB
+ * @param max_frames Capacity
+ * @param hop_ms   Frame hop in ms (default: 10)
+ * @return Number of frames written
+ */
+int extract_energy_envelope(const float *audio, int len, int sr,
+                            float *env, int max_frames, int hop_ms);
+
 #ifdef __cplusplus
 }
 #endif

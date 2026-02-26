@@ -20,6 +20,8 @@ extern "C" {
 typedef struct {
     char  text[SSML_MAX_TEXT];
     char  voice[SSML_MAX_VOICE];
+    char  emotion[32];       /* e.g. "happy", "sad", "excited" (empty = neutral) */
+    char  phoneme_ipa[256];  /* IPA override from <phoneme ph="..."> (empty = use G2P) */
     float rate;              /* 1.0 = normal */
     float pitch;             /* 1.0 = normal */
     float volume;            /* 1.0 = normal */

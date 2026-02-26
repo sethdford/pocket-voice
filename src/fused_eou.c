@@ -68,8 +68,9 @@ EOUResult fused_eou_process(FusedEOU *eou, EOUSignals sig) {
 
     eou->total_frames++;
 
-    /* Track speech activity (any signal indicates speech if eot probs are low) */
-    if (sig.energy_signal < 0.3f || sig.mimi_eot_prob < 0.2f) {
+    /* Track speech activity based on energy VAD only — mimi_eot_prob starts at 0
+     * and would falsely trigger speech_detected before any actual speech. */
+    if (sig.energy_signal < 0.3f) {
         eou->speech_detected = 1;
         eou->frames_since_speech = 0;
     } else {
@@ -105,6 +106,20 @@ EOUResult fused_eou_process(FusedEOU *eou, EOUSignals sig) {
     /* Solo trigger: any single signal above its threshold → immediate */
     if (src && eou->speech_detected) {
         should_trigger = 1;
+    }
+
+    /* Silence-duration fast path: if the user has been silent for 300ms+
+     * after producing speech AND we're already above the fused threshold,
+     * trigger immediately without waiting for consecutive-frame consensus.
+     * This mimics natural conversational turn-taking. The prob threshold
+     * must match the fused path (eou->threshold) to preserve the speculative
+     * prefill zone: prob in [0.55, threshold) where we send to LLM early
+     * but do not commit to EOU yet. */
+    float silence_ms = (float)eou->frames_since_speech * eou->frame_ms;
+    if (eou->speech_detected && silence_ms >= 300.0f &&
+        eou->smoothed_prob >= eou->threshold) {
+        should_trigger = 1;
+        src |= EOU_SRC_ENERGY | EOU_SRC_FUSED;
     }
 
     /* Fused trigger: combined probability above threshold for N frames */

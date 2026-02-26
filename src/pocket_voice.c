@@ -118,24 +118,26 @@ typedef enum {
 } VADStateEnum;
 
 typedef struct {
-    float energy_threshold;    /* RMS threshold to trigger speech onset */
-    float silence_threshold;   /* Lower threshold for speech offset (hysteresis) */
+    _Atomic float energy_threshold;    /* RMS threshold for speech onset (cross-thread safe) */
+    _Atomic float silence_threshold;   /* Lower threshold for speech offset (cross-thread safe) */
     int hangover_frames;       /* Frames to wait before declaring SPEECH_END */
     int hangover_counter;
     int speech_frame_count;
     int min_speech_frames;     /* Minimum speech frames to confirm (debounce) */
-    VADStateEnum state;
+    VADStateEnum state;        /* Internal state (RT thread only) */
+    _Atomic int published_state; /* Snapshot for main thread (atomic cross-thread read) */
 } VADState;
 
 static void vad_init(VADState *vad, float energy_thresh, float silence_thresh,
                      int hangover_frames, int min_speech_frames) {
-    vad->energy_threshold  = energy_thresh;
-    vad->silence_threshold = silence_thresh;
+    atomic_store_explicit(&vad->energy_threshold, energy_thresh, memory_order_relaxed);
+    atomic_store_explicit(&vad->silence_threshold, silence_thresh, memory_order_relaxed);
     vad->hangover_frames   = hangover_frames;
     vad->hangover_counter  = 0;
     vad->speech_frame_count = 0;
     vad->min_speech_frames = min_speech_frames;
     vad->state             = VAD_SILENCE;
+    atomic_store_explicit(&vad->published_state, VAD_SILENCE, memory_order_relaxed);
 }
 
 static VADStateEnum vad_process_frame(VADState *vad, const float *frame,
@@ -143,15 +145,18 @@ static VADStateEnum vad_process_frame(VADState *vad, const float *frame,
     float rms;
     vDSP_rmsqv(frame, 1, &rms, (vDSP_Length)frame_len);
 
+    float e_thresh = atomic_load_explicit(&vad->energy_threshold, memory_order_relaxed);
+    float s_thresh = atomic_load_explicit(&vad->silence_threshold, memory_order_relaxed);
+
     switch (vad->state) {
     case VAD_SILENCE:
-        if (rms >= vad->energy_threshold) {
+        if (rms >= e_thresh) {
             vad->speech_frame_count = 1;
             vad->state = VAD_SPEECH_START;
         }
         break;
     case VAD_SPEECH_START:
-        if (rms >= vad->silence_threshold) {
+        if (rms >= s_thresh) {
             vad->speech_frame_count++;
             if (vad->speech_frame_count >= vad->min_speech_frames) {
                 vad->state = VAD_SPEECH;
@@ -163,7 +168,7 @@ static VADStateEnum vad_process_frame(VADState *vad, const float *frame,
         }
         break;
     case VAD_SPEECH:
-        if (rms >= vad->silence_threshold) {
+        if (rms >= s_thresh) {
             vad->hangover_counter = vad->hangover_frames;
         } else {
             vad->hangover_counter--;
@@ -177,6 +182,9 @@ static VADStateEnum vad_process_frame(VADState *vad, const float *frame,
         vad->state = VAD_SILENCE;
         break;
     }
+
+    /* Publish for cross-thread reading (main thread uses published_state) */
+    atomic_store_explicit(&vad->published_state, (int)vad->state, memory_order_release);
 
     return vad->state;
 }
@@ -222,9 +230,10 @@ void voice_engine_resample_48_to_24(const float *input, float *output,
     }
 }
 
-/* Static scratch buffer for upsample — avoids malloc in the hot audio path.
+/* Thread-local scratch buffer for upsample — avoids malloc in the hot audio path
+ * while preventing data races between CoreAudio callback and pipeline threads.
  * MAX_RESAMPLE_INPUT * 2 + RESAMPLE_TAPS - 1 covers the worst case. */
-static float g_upsample_scratch[MAX_RESAMPLE_INPUT * 2 + RESAMPLE_TAPS];
+static _Thread_local float g_upsample_scratch[MAX_RESAMPLE_INPUT * 2 + RESAMPLE_TAPS];
 
 void voice_engine_resample_24_to_48(const float *input, float *output,
                                      int input_len) {
@@ -255,7 +264,10 @@ typedef struct {
     _Atomic int barge_in;
     _Atomic int playing;       /* Whether TTS audio is in the playback ring */
     _Atomic int running;
+    _Atomic uint64_t capture_drops;  /* Frames dropped when capture ring is full */
+    _Atomic uint64_t playback_drops; /* Frames dropped when playback ring is full */
     float *resample_buf;       /* Scratch for 48->24 resampling in callback */
+    int output_only;           /* 1 = no mic, output-only mode (for --remote) */
 } VoiceEngine;
 
 /* Input callback: CoreAudio delivers mic frames here (real-time thread) */
@@ -298,8 +310,10 @@ static OSStatus capture_callback(
         ring_flush(&engine->playback_ring);
     }
 
-    /* Write captured audio to ring buffer */
-    ring_write(&engine->capture_ring, samples, inNumberFrames);
+    /* Write captured audio to ring buffer (RT-safe: no log on drop) */
+    if (ring_write(&engine->capture_ring, samples, inNumberFrames) < 0) {
+        atomic_fetch_add_explicit(&engine->capture_drops, inNumberFrames, memory_order_relaxed);
+    }
 
     return noErr;
 }
@@ -359,12 +373,14 @@ VoiceEngine* voice_engine_create(uint32_t sample_rate, uint32_t buffer_frames) {
     vad_init(&engine->vad, 0.01f, 0.005f, hangover, min_speech);
 
     engine->resample_buf = (float *)calloc(MAX_RESAMPLE_INPUT, sizeof(float));
+    if (!engine->resample_buf) goto fail;
 
     return engine;
 
 fail:
     ring_destroy(&engine->capture_ring);
     ring_destroy(&engine->playback_ring);
+    free(engine->resample_buf);
     free(engine);
     return NULL;
 }
@@ -504,6 +520,99 @@ int voice_engine_start(VoiceEngine *engine) {
     return 0;
 }
 
+int voice_engine_start_output_only(VoiceEngine *engine) {
+    if (atomic_load(&engine->running)) return 0;
+    engine->output_only = 1;
+
+    AudioComponentDescription desc = {
+        .componentType         = kAudioUnitType_Output,
+        .componentSubType      = kAudioUnitSubType_DefaultOutput,
+        .componentManufacturer = kAudioUnitManufacturer_Apple,
+    };
+
+    AudioComponent comp = AudioComponentFindNext(NULL, &desc);
+    if (!comp) {
+        fprintf(stderr, "pocket_voice: DefaultOutput not found\n");
+        return -1;
+    }
+
+    OSStatus status = AudioComponentInstanceNew(comp, &engine->voice_unit);
+    if (status != noErr) {
+        fprintf(stderr, "pocket_voice: AudioComponentInstanceNew failed: %d\n",
+                (int)status);
+        return -1;
+    }
+
+#define FAIL_OUT() do { \
+    AudioComponentInstanceDispose(engine->voice_unit); \
+    engine->voice_unit = NULL; \
+    return -1; \
+} while(0)
+
+    AudioStreamBasicDescription fmt = {
+        .mSampleRate       = (Float64)engine->sample_rate,
+        .mFormatID         = kAudioFormatLinearPCM,
+        .mFormatFlags      = kAudioFormatFlagIsFloat |
+                             kAudioFormatFlagIsPacked |
+                             kAudioFormatFlagIsNonInterleaved,
+        .mBytesPerPacket   = sizeof(float),
+        .mFramesPerPacket  = 1,
+        .mBytesPerFrame    = sizeof(float),
+        .mChannelsPerFrame = 1,
+        .mBitsPerChannel   = 32,
+    };
+
+    status = AudioUnitSetProperty(engine->voice_unit,
+                                  kAudioUnitProperty_StreamFormat,
+                                  kAudioUnitScope_Input, 0,
+                                  &fmt, sizeof(fmt));
+    if (status != noErr) {
+        fprintf(stderr, "pocket_voice: set output format failed: %d\n",
+                (int)status);
+        FAIL_OUT();
+    }
+
+    UInt32 frames = engine->buffer_frames;
+    AudioUnitSetProperty(engine->voice_unit,
+                         kAudioDevicePropertyBufferFrameSize,
+                         kAudioUnitScope_Global, 0,
+                         &frames, sizeof(frames));
+
+    AURenderCallbackStruct output_cb = {
+        .inputProc       = render_callback,
+        .inputProcRefCon = engine,
+    };
+    status = AudioUnitSetProperty(engine->voice_unit,
+                                  kAudioUnitProperty_SetRenderCallback,
+                                  kAudioUnitScope_Input, 0,
+                                  &output_cb, sizeof(output_cb));
+    if (status != noErr) {
+        fprintf(stderr, "pocket_voice: set render callback failed: %d\n",
+                (int)status);
+        FAIL_OUT();
+    }
+
+    status = AudioUnitInitialize(engine->voice_unit);
+    if (status != noErr) {
+        fprintf(stderr, "pocket_voice: AudioUnitInitialize failed: %d\n",
+                (int)status);
+        FAIL_OUT();
+    }
+
+    status = AudioOutputUnitStart(engine->voice_unit);
+    if (status != noErr) {
+        fprintf(stderr, "pocket_voice: AudioOutputUnitStart failed: %d\n",
+                (int)status);
+        AudioUnitUninitialize(engine->voice_unit);
+        FAIL_OUT();
+    }
+#undef FAIL_OUT
+
+    atomic_store(&engine->running, 1);
+    fprintf(stderr, "pocket_voice: output-only mode (no mic, remote audio source)\n");
+    return 0;
+}
+
 void voice_engine_stop(VoiceEngine *engine) {
     if (!atomic_load(&engine->running)) return;
     AudioOutputUnitStop(engine->voice_unit);
@@ -532,11 +641,21 @@ int voice_engine_read_capture(VoiceEngine *engine, float *buffer,
     return (int)to_read;
 }
 
+/* Inject audio into capture ring (for remote mic / network audio sources) */
+int voice_engine_write_capture(VoiceEngine *engine, const float *buffer,
+                                int num_frames) {
+    return ring_write(&engine->capture_ring, buffer, (uint32_t)num_frames);
+}
+
 /* Write TTS audio for playback (called from C orchestrator or Python) */
 int voice_engine_write_playback(VoiceEngine *engine, const float *buffer,
                                  int num_frames) {
     atomic_store_explicit(&engine->playing, 1, memory_order_release);
-    return ring_write(&engine->playback_ring, buffer, (uint32_t)num_frames);
+    int rc = ring_write(&engine->playback_ring, buffer, (uint32_t)num_frames);
+    if (rc < 0) {
+        atomic_fetch_add_explicit(&engine->playback_drops, (uint64_t)num_frames, memory_order_relaxed);
+    }
+    return rc;
 }
 
 /* Flush playback buffer (instant silence on barge-in) */
@@ -550,9 +669,9 @@ int voice_engine_is_playing(VoiceEngine *engine) {
     return ring_available_read(&engine->playback_ring) > 0 ? 1 : 0;
 }
 
-/* VAD state query */
+/* VAD state query (safe to call from main thread) */
 int voice_engine_get_vad_state(VoiceEngine *engine) {
-    return (int)engine->vad.state;
+    return atomic_load_explicit(&engine->vad.published_state, memory_order_acquire);
 }
 
 /* Barge-in flag management */
@@ -564,12 +683,12 @@ void voice_engine_clear_barge_in(VoiceEngine *engine) {
     atomic_store_explicit(&engine->barge_in, 0, memory_order_release);
 }
 
-/* Configure VAD thresholds at runtime */
+/* Configure VAD thresholds at runtime (safe to call from main thread) */
 void voice_engine_set_vad_thresholds(VoiceEngine *engine,
                                       float energy_thresh,
                                       float silence_thresh) {
-    engine->vad.energy_threshold  = energy_thresh;
-    engine->vad.silence_threshold = silence_thresh;
+    atomic_store_explicit(&engine->vad.energy_threshold, energy_thresh, memory_order_release);
+    atomic_store_explicit(&engine->vad.silence_threshold, silence_thresh, memory_order_release);
 }
 
 /* Get capture ring fill level (for monitoring) */
@@ -580,4 +699,15 @@ int voice_engine_capture_available(VoiceEngine *engine) {
 /* Get playback ring fill level (for monitoring) */
 int voice_engine_playback_available(VoiceEngine *engine) {
     return (int)ring_available_read(&engine->playback_ring);
+}
+
+/* Diagnostic: cumulative dropped frames due to ring overflow.
+   Resets counters after read. Safe from any thread. */
+void voice_engine_get_drop_counts(VoiceEngine *engine,
+                                   uint64_t *capture_out,
+                                   uint64_t *playback_out) {
+    if (capture_out)
+        *capture_out = atomic_exchange_explicit(&engine->capture_drops, 0, memory_order_relaxed);
+    if (playback_out)
+        *playback_out = atomic_exchange_explicit(&engine->playback_drops, 0, memory_order_relaxed);
 }

@@ -307,13 +307,17 @@ impl SttEngine {
 // ─── C FFI ─────────────────────────────────────────────────────────────────────
 // All functions use catch_unwind to prevent panics from crossing the FFI boundary.
 
-/// Truncate byte slice to a valid UTF-8 boundary.
+/// Truncate byte slice to a valid UTF-8 boundary without unsafe code.
+/// Caller guarantees `bytes` is valid UTF-8 (e.g. from `str::as_bytes()`).
 fn utf8_safe_len(bytes: &[u8], max: usize) -> usize {
     let limit = std::cmp::min(bytes.len(), max);
-    // Walk backwards from limit to find a char boundary
-    let s = unsafe { std::str::from_utf8_unchecked(&bytes[..bytes.len()]) };
-    let truncated = &s[..s.floor_char_boundary(limit)];
-    truncated.len()
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s[..s.floor_char_boundary(limit)].len(),
+        Err(e) => {
+            let valid_up_to = e.valid_up_to();
+            std::cmp::min(valid_up_to, limit)
+        }
+    }
 }
 
 /// Copy a Rust string into a C buffer with null termination and UTF-8 safety.
@@ -541,17 +545,23 @@ pub extern "C" fn pocket_stt_has_vad(engine: *mut c_void) -> c_int {
 
 /// Reset streaming state for a new utterance.
 /// Processes the silence prefix internally.
+/// Returns 0 on success, -1 on error.
 #[unsafe(no_mangle)]
-pub extern "C" fn pocket_stt_reset(engine: *mut c_void) {
+pub extern "C" fn pocket_stt_reset(engine: *mut c_void) -> c_int {
     if engine.is_null() {
-        return;
+        return -1;
     }
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let engine = unsafe { &mut *(engine as *mut SttEngine) };
-        if let Err(e) = engine.reset_streaming() {
-            eprintln!("[pocket_stt] reset error: {}", e);
+        match engine.reset_streaming() {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("[pocket_stt] reset error: {}", e);
+                -1
+            }
         }
     }));
+    result.unwrap_or(-1)
 }
 
 /// Returns the expected frame size in samples (1920 = 80ms at 24kHz).

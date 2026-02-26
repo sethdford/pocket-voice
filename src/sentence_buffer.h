@@ -16,6 +16,18 @@ extern "C" {
 #define SENTBUF_MODE_SENTENCE    0
 #define SENTBUF_MODE_SPECULATIVE 1
 
+/* Prosody hints detected from text patterns during accumulation */
+typedef struct {
+    int   has_all_caps;    /* 1 if segment contains ALL CAPS words */
+    int   exclamation_count; /* number of ! in segment */
+    int   question_count;  /* number of ? in segment */
+    int   has_ellipsis;    /* 1 if segment contains "..." */
+    int   has_emphasis;    /* 1 if *asterisk* or _underscore_ emphasis */
+    float suggested_rate;  /* 1.0 = neutral, adjusted by detection */
+    float suggested_pitch; /* 1.0 = neutral */
+    float suggested_energy; /* 0.0 = neutral (dB offset) */
+} SentBufProsodyHint;
+
 typedef struct SentenceBuffer SentenceBuffer;
 
 /**
@@ -74,6 +86,24 @@ int sentbuf_sentence_count(const SentenceBuffer *sb);
  * @param warmup_min  Min words during warmup (default 3)
  */
 void sentbuf_set_adaptive(SentenceBuffer *sb, int warmup_n, int warmup_min);
+
+/**
+ * Enable eager word-count flushing for streaming TTS (e.g. Sonata).
+ * When the buffer accumulates >= eager_words without hitting a sentence
+ * or clause boundary, flush at the last word boundary anyway.
+ * This lets TTS start generating audio before a full sentence arrives.
+ *
+ * @param sb           Buffer handle
+ * @param eager_words  Word count threshold (0 = disabled, 4-5 recommended)
+ */
+void sentbuf_set_eager(SentenceBuffer *sb, int eager_words);
+
+/**
+ * Get prosody hints for the most recently flushed segment.
+ * Call immediately after sentbuf_flush() to get hints for that segment.
+ * Returns zeroed hints if no segment was recently flushed.
+ */
+SentBufProsodyHint sentbuf_get_prosody_hint(const SentenceBuffer *sb);
 
 #ifdef __cplusplus
 }

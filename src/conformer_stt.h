@@ -33,6 +33,8 @@ typedef struct ConformerSTT ConformerSTT;
 #define CSTT_FLAG_REL_PE      (1 << 2)  /* Relative positional encoding (Shaw-style) */
 #define CSTT_FLAG_HAS_EOU     (1 << 3)  /* Vocabulary includes <eou> token for end-of-utterance */
 #define CSTT_FLAG_CACHE_AWARE (1 << 4)  /* Activation caching for true streaming */
+#define CSTT_FLAG_XSCALING   (1 << 5)  /* Scale encoder input by sqrt(d_model) */
+#define CSTT_FLAG_TDT        (1 << 6)  /* TDT transducer decoder appended after encoder */
 
 typedef struct {
     uint32_t magic;
@@ -49,7 +51,7 @@ typedef struct {
     uint32_t win_length;        /* Mel window in samples (e.g. 400) */
     uint32_t n_fft;             /* FFT size (e.g. 512) */
     uint32_t subsample_factor;  /* Time reduction factor (4 or 8) */
-    uint32_t dtype;             /* 0 = fp32, 1 = fp16 */
+    uint32_t dtype;             /* 0 = fp32, 1 = fp16, 2 = int8 (per-channel symmetric) */
     uint32_t flags;             /* Bitfield (CSTT_FLAG_*) */
     uint32_t sub_type;          /* Subsampling type (CSTT_SUB_*) */
     uint32_t n_sub_convs;       /* Number of conv layers in subsampling */
@@ -151,11 +153,44 @@ int conformer_stt_eou_frame(const ConformerSTT *stt);
 void conformer_stt_set_cache_aware(ConformerSTT *stt, int enable);
 
 /**
+ * Set the chunk size for the encoder (mel frames per forward pass).
+ * Smaller chunks = lower latency but potentially lower accuracy.
+ * 0 = use default (8000 = full-sequence).
+ * For real-time streaming with cache_aware: 40-80 frames (400-800ms).
+ *
+ * @param frames  Number of mel frames per chunk
+ */
+void conformer_stt_set_chunk_frames(ConformerSTT *stt, int frames);
+
+/**
  * Get the per-chunk encoder stride in milliseconds.
  * For cache-aware mode this is the frame time (e.g. 80ms).
  * For batch mode this is the full chunk duration.
  */
 int conformer_stt_stride_ms(const ConformerSTT *stt);
+
+/* ─── Beam Search Decoding ─────────────────────────────────────────────── */
+
+/**
+ * Enable CTC beam search decoding with optional language model.
+ *
+ * @param stt        Engine instance
+ * @param lm_path    Path to KenLM .arpa or .bin language model (NULL = no LM)
+ * @param beam_size  Beam width (0 = default 16)
+ * @param lm_weight  LM score weight (negative = default 1.5)
+ * @param word_score Per-word insertion bonus (0.0 = neutral)
+ * @return           0 on success, -1 on failure
+ */
+int conformer_stt_enable_beam_search(ConformerSTT *stt,
+                                      const char *lm_path,
+                                      int beam_size,
+                                      float lm_weight,
+                                      float word_score);
+
+/**
+ * Disable beam search, reverting to greedy CTC decode.
+ */
+void conformer_stt_disable_beam_search(ConformerSTT *stt);
 
 /* ─── Info ─────────────────────────────────────────────────────────────── */
 
@@ -174,21 +209,43 @@ int conformer_stt_vocab_size(const ConformerSTT *stt);
 /** Returns 1 if the model has EOU token support. */
 int conformer_stt_has_eou_support(const ConformerSTT *stt);
 
-/**
- * Run forward pass on pre-normalized mel features (testing/validation).
- * Mel data should be [T, n_mels] float32, already per-feature normalized.
- * Returns number of new transcript characters, or -1 on error.
- * After calling, use conformer_stt_get_text() to get transcript.
- */
-int conformer_stt_forward_normalized_mel(ConformerSTT *stt,
-                                          const float *mel, int T);
+/** Returns 1 if the model uses TDT (transducer) decoding instead of CTC. */
+int conformer_stt_is_tdt(const ConformerSTT *stt);
+
+/* ─── External Forward-Pass Hook ───────────────────────────────────────── */
 
 /**
- * Run forward pass starting from pre-subsampled encoder input (testing).
- * Data should be [T_sub, d_model] float32, already subsampled+projected.
- * Bypasses subsampling entirely — tests encoder blocks + CTC head only.
+ * Callback for replacing the encoder forward pass with an external backend.
+ * Called instead of the built-in cblas/vDSP encoder when set.
+ *
+ * @param user_ctx   Opaque pointer passed through from set_external_forward
+ * @param mel_in     Mel spectrogram [T, n_mels], row-major float32
+ * @param T          Number of input time frames
+ * @param n_mels     Number of mel bins
+ * @param logits_out Output logits [T_sub, vocab_size], caller-allocated
+ * @param max_T_sub  Maximum output time steps (buffer capacity)
+ * @return           Number of output time steps, or -1 to fallback to built-in
  */
-int conformer_stt_forward_subsample_output(ConformerSTT *stt,
-                                            const float *sub_out, int T_sub);
+typedef int (*conformer_external_forward_fn)(void *user_ctx,
+    const float *mel_in, int T, int n_mels,
+    float *logits_out, int max_T_sub);
+
+/**
+ * Set an external forward-pass hook. When set, the encoder will call this
+ * function instead of the built-in conformer blocks. If it returns -1,
+ * the built-in path is used as fallback.
+ *
+ * @param stt        Engine instance
+ * @param fn         External forward function, or NULL to disable
+ * @param user_ctx   Opaque pointer passed to fn
+ */
+void conformer_stt_set_external_forward(ConformerSTT *stt,
+    conformer_external_forward_fn fn, void *user_ctx);
+
+/**
+ * Get a pointer to the logits workspace buffer and its stride.
+ * Useful for external forward hooks that need the same output buffer.
+ */
+float *conformer_stt_get_logits_buf(ConformerSTT *stt, int *out_vocab);
 
 #endif /* CONFORMER_STT_H */

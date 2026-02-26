@@ -48,6 +48,14 @@ struct SentenceBuffer {
     int   warmup_n;        /* Number of warmup sentences (0 = disabled) */
     int   warmup_min_words; /* Min words during warmup phase */
     int   base_min_words;  /* Original min_words (restored after warmup) */
+
+    /* Eager flush: word-count threshold for streaming TTS */
+    int   eager_flush_words;      /* 0 = disabled; >0 = flush after N words */
+    int   base_eager_flush_words; /* saved value for reset (re-arm each turn) */
+
+    /* Prosody hints for each segment in the ring */
+    SentBufProsodyHint seg_hints[MAX_SEGMENTS];
+    SentBufProsodyHint last_hint; /* hint from most recently flushed segment */
 };
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
@@ -193,6 +201,45 @@ static void push_segment(SentenceBuffer *sb, const char *text, int len) {
     memcpy(sb->segments[slot], cleaned, (size_t)copy);
     sb->segments[slot][copy] = '\0';
     sb->seg_lens[slot] = copy;
+
+    /* Compute prosody hints for this segment */
+    SentBufProsodyHint *h = &sb->seg_hints[slot];
+    memset(h, 0, sizeof(*h));
+    h->suggested_rate = 1.0f;
+    h->suggested_pitch = 1.0f;
+    for (int ci = 0; ci < copy; ci++) {
+        if (cleaned[ci] == '!') h->exclamation_count++;
+        if (cleaned[ci] == '?') h->question_count++;
+        if (ci + 2 < copy && cleaned[ci] == '.' && cleaned[ci+1] == '.' && cleaned[ci+2] == '.')
+            h->has_ellipsis = 1;
+        if (cleaned[ci] == '*' || cleaned[ci] == '_') h->has_emphasis = 1;
+    }
+    /* Detect ALL CAPS words (2+ alpha chars, all uppercase) */
+    {
+        int in_w = 0, caps = 0, alpha = 0;
+        for (int ci = 0; ci <= copy; ci++) {
+            char c = (ci < copy) ? cleaned[ci] : ' ';
+            if (c >= 'A' && c <= 'Z') { in_w = 1; caps++; alpha++; }
+            else if (c >= 'a' && c <= 'z') { in_w = 1; caps = 0; alpha++; }
+            else {
+                if (in_w && caps >= 2 && caps == alpha) h->has_all_caps = 1;
+                in_w = 0; caps = 0; alpha = 0;
+            }
+        }
+    }
+    /* Suggested prosody adjustments based on detected patterns */
+    if (h->exclamation_count >= 2) {
+        h->suggested_pitch = 1.12f;
+        h->suggested_energy = 2.5f;
+    }
+    if (h->has_ellipsis) {
+        h->suggested_rate = 0.90f;
+    }
+    if (h->has_all_caps) {
+        h->suggested_pitch *= 1.05f;
+        h->suggested_energy += 1.5f;
+    }
+
     sb->seg_head = (sb->seg_head + 1) % MAX_SEGMENTS;
     sb->seg_count++;
 
@@ -276,6 +323,10 @@ static void try_flush(SentenceBuffer *sb) {
             if (remain > 0) memmove(buf, buf + end, (size_t)remain);
             sb->buf_len = remain;
             buf[remain] = '\0';
+
+            /* Disable eager mode after first real sentence boundary —
+               latency benefit only matters for the first sentence */
+            sb->eager_flush_words = 0;
             return;
         }
     }
@@ -298,6 +349,32 @@ static void try_flush(SentenceBuffer *sb) {
                     buf[remain] = '\0';
                     return;
                 }
+            }
+        }
+    }
+
+    /* Eager word-count flush for streaming TTS: flush at word boundary
+       even without sentence/clause punctuation. Enables Sonata to start
+       generating audio before a full sentence arrives from the LLM. */
+    if (sb->eager_flush_words > 0) {
+        int words = count_words(buf, len);
+        if (words >= sb->eager_flush_words) {
+            /* Find last complete word boundary to avoid splitting mid-word */
+            int end = len;
+            if (len > 0 && buf[len - 1] != ' ' && buf[len - 1] != '\n') {
+                for (int i = len - 1; i >= 0; i--) {
+                    if (buf[i] == ' ') { end = i; break; }
+                }
+            }
+            if (end > 0) {
+                push_segment(sb, buf, end);
+                int skip = end;
+                if (skip < len && buf[skip] == ' ') skip++;
+                int remain = len - skip;
+                if (remain > 0) memmove(buf, buf + skip, (size_t)remain);
+                sb->buf_len = remain;
+                buf[remain] = '\0';
+                return;
             }
         }
     }
@@ -356,6 +433,8 @@ int sentbuf_flush(SentenceBuffer *sb, char *out, int out_cap) {
     memcpy(out, sb->segments[slot], (size_t)copy);
     out[copy] = '\0';
 
+    sb->last_hint = sb->seg_hints[slot];
+
     sb->seg_tail = (sb->seg_tail + 1) % MAX_SEGMENTS;
     sb->seg_count--;
 
@@ -412,6 +491,9 @@ void sentbuf_reset(SentenceBuffer *sb) {
     if (sb->warmup_n > 0) {
         sb->min_words = sb->warmup_min_words;
     }
+
+    /* Re-arm eager flush for next turn */
+    sb->eager_flush_words = sb->base_eager_flush_words;
 }
 
 int sentbuf_predicted_length(const SentenceBuffer *sb) {
@@ -429,4 +511,17 @@ void sentbuf_set_adaptive(SentenceBuffer *sb, int warmup_n, int warmup_min) {
     sb->warmup_min_words = warmup_min > 0 ? warmup_min : 3;
     sb->base_min_words = sb->min_words;
     sb->min_words = sb->warmup_min_words;
+}
+
+void sentbuf_set_eager(SentenceBuffer *sb, int eager_words) {
+    if (!sb) return;
+    int val = eager_words > 0 ? eager_words : 0;
+    sb->eager_flush_words = val;
+    sb->base_eager_flush_words = val;
+}
+
+SentBufProsodyHint sentbuf_get_prosody_hint(const SentenceBuffer *sb) {
+    SentBufProsodyHint empty = {0, 0, 0, 0, 0, 1.0f, 1.0f, 0.0f};
+    if (!sb) return empty;
+    return sb->last_hint;
 }

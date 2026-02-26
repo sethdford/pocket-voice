@@ -29,7 +29,7 @@
 
 #define MAX_SOURCES      8   /* Max concurrent spatial sources (voices) */
 #define SPATIAL_SR       48000
-#define MAX_BLOCK_SIZE   4096
+#define MAX_BLOCK_SIZE   8192  /* Must be >= 2× TTS_AUDIO_BUF_SIZE (48kHz resampled) */
 
 /* -----------------------------------------------------------------------
  * 3D Position
@@ -64,6 +64,12 @@ typedef struct {
     int n_active_sources;
     uint32_t sample_rate;
 
+    /* Pre-allocated scratch buffers (eliminates per-call malloc) */
+    float *padded_buf;     /* [MAX_BLOCK_SIZE + HRTF_FILTER_LEN - 1] for convolution */
+    float *tmp_left;       /* [MAX_BLOCK_SIZE] for spatial_mix */
+    float *tmp_right;      /* [MAX_BLOCK_SIZE] for spatial_mix */
+    int    scratch_size;   /* Allocated scratch size in samples */
+
     int initialized;
 } SpatialAudioEngine;
 
@@ -95,6 +101,8 @@ static void compute_hrtf_coeffs(HRTFCoeffs *hrtf, SpatialPosition pos,
     /* ITD: Woodworth-Schlosberg model */
     float itd = HEAD_RADIUS / SPEED_OF_SOUND * (az_rad + sinf(az_rad));
     float delay_samples = fabsf(itd) * (float)sample_rate;
+    if (delay_samples > (float)(HRTF_FILTER_LEN - 2))
+        delay_samples = (float)(HRTF_FILTER_LEN - 2);
 
     /* Source on the left: az < 0 → right ear delayed */
     if (az_rad < 0) {
@@ -161,12 +169,24 @@ SpatialAudioEngine *spatial_create(uint32_t sample_rate) {
 
     engine->sample_rate = sample_rate ? sample_rate : SPATIAL_SR;
 
-    /* Initialize sources at default positions (spread in front) */
     for (int i = 0; i < MAX_SOURCES; i++) {
         engine->sources[i].position.azimuth = -60.0f + 120.0f * (float)i / (MAX_SOURCES - 1);
         engine->sources[i].position.elevation = 0.0f;
         engine->sources[i].position.distance = 1.5f;
         engine->sources[i].gain = 1.0f;
+    }
+
+    engine->scratch_size = MAX_BLOCK_SIZE;
+    int padded_sz = MAX_BLOCK_SIZE + HRTF_FILTER_LEN - 1;
+    engine->padded_buf = (float *)calloc(padded_sz, sizeof(float));
+    engine->tmp_left   = (float *)calloc(MAX_BLOCK_SIZE, sizeof(float));
+    engine->tmp_right  = (float *)calloc(MAX_BLOCK_SIZE, sizeof(float));
+    if (!engine->padded_buf || !engine->tmp_left || !engine->tmp_right) {
+        free(engine->padded_buf);
+        free(engine->tmp_left);
+        free(engine->tmp_right);
+        free(engine);
+        return NULL;
     }
 
     engine->initialized = 1;
@@ -213,30 +233,26 @@ int spatial_process(SpatialAudioEngine *engine, int source_idx,
     HRTFCoeffs hrtf;
     compute_hrtf_coeffs(&hrtf, src->position, (int)engine->sample_rate);
 
-    /* Apply HRTF convolution via vDSP_conv */
     int out_len = n_samples;
+    if (n_samples > engine->scratch_size) return -1;
 
-    /* Pad input for convolution */
     int padded_len = n_samples + HRTF_FILTER_LEN - 1;
-    float *padded = (float *)calloc(padded_len, sizeof(float));
+    float *padded = engine->padded_buf;
+    memset(padded, 0, padded_len * sizeof(float));
     memcpy(padded, mono_input, n_samples * sizeof(float));
 
-    /* Left channel: convolve with left HRTF */
     vDSP_conv(padded, 1,
               hrtf.left_filter + HRTF_FILTER_LEN - 1, -1,
               left_output, 1, out_len, HRTF_FILTER_LEN);
 
-    /* Right channel: convolve with right HRTF */
     vDSP_conv(padded, 1,
               hrtf.right_filter + HRTF_FILTER_LEN - 1, -1,
               right_output, 1, out_len, HRTF_FILTER_LEN);
 
-    /* Apply source gain */
     float gain = src->gain;
     vDSP_vsmul(left_output, 1, &gain, left_output, 1, out_len);
     vDSP_vsmul(right_output, 1, &gain, right_output, 1, out_len);
 
-    free(padded);
     return 0;
 }
 
@@ -258,28 +274,28 @@ int spatial_mix(SpatialAudioEngine *engine,
     if (!engine || n_sources <= 0) return -1;
     if (n_sources > MAX_SOURCES) n_sources = MAX_SOURCES;
 
+    if (n_samples > engine->scratch_size) return -1;
+
     memset(left_out, 0, n_samples * sizeof(float));
     memset(right_out, 0, n_samples * sizeof(float));
-
-    float *tmp_left = (float *)malloc(n_samples * sizeof(float));
-    float *tmp_right = (float *)malloc(n_samples * sizeof(float));
 
     for (int i = 0; i < n_sources; i++) {
         if (!mono_inputs[i]) continue;
 
-        spatial_process(engine, i, mono_inputs[i], tmp_left, tmp_right, n_samples);
+        spatial_process(engine, i, mono_inputs[i],
+                        engine->tmp_left, engine->tmp_right, n_samples);
 
-        /* Accumulate into mix */
-        vDSP_vadd(left_out, 1, tmp_left, 1, left_out, 1, n_samples);
-        vDSP_vadd(right_out, 1, tmp_right, 1, right_out, 1, n_samples);
+        vDSP_vadd(left_out, 1, engine->tmp_left, 1, left_out, 1, n_samples);
+        vDSP_vadd(right_out, 1, engine->tmp_right, 1, right_out, 1, n_samples);
     }
 
-    free(tmp_left);
-    free(tmp_right);
     return 0;
 }
 
 void spatial_destroy(SpatialAudioEngine *engine) {
     if (!engine) return;
+    free(engine->padded_buf);
+    free(engine->tmp_left);
+    free(engine->tmp_right);
     free(engine);
 }

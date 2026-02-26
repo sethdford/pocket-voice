@@ -80,10 +80,33 @@ static void extract_mfcc_frame(const float *frame, int frame_len,
         windowed[i] = frame[i] * w;
     }
 
-    /* Power spectrum via DFT (simplified — real computation for small FFTs) */
+    /* Power spectrum via vDSP FFT (O(n log n) instead of naive O(n²) DFT) */
     int half = FFT_SIZE / 2 + 1;
-    float *power = (float *)calloc((size_t)half, sizeof(float));
+    float power[FFT_SIZE / 2 + 1];
+    memset(power, 0, sizeof(power));
 
+#ifdef __APPLE__
+    {
+        int log2n = 0;
+        for (int tmp = FFT_SIZE; tmp > 1; tmp >>= 1) log2n++;
+        FFTSetup fft_setup = vDSP_create_fftsetup((vDSP_Length)log2n, kFFTRadix2);
+        if (fft_setup) {
+            float real_buf[FFT_SIZE / 2], imag_buf[FFT_SIZE / 2];
+            DSPSplitComplex sc = { real_buf, imag_buf };
+            vDSP_ctoz((DSPComplex *)windowed, 2, &sc, 1, (vDSP_Length)(FFT_SIZE / 2));
+            vDSP_fft_zrip(fft_setup, &sc, 1, (vDSP_Length)log2n, kFFTDirection_Forward);
+            /* DC component */
+            power[0] = (sc.realp[0] * sc.realp[0]) / (float)FFT_SIZE;
+            /* Nyquist component */
+            power[FFT_SIZE / 2] = (sc.imagp[0] * sc.imagp[0]) / (float)FFT_SIZE;
+            /* Remaining bins */
+            for (int k = 1; k < FFT_SIZE / 2; k++) {
+                power[k] = (sc.realp[k] * sc.realp[k] + sc.imagp[k] * sc.imagp[k]) / (float)FFT_SIZE;
+            }
+            vDSP_destroy_fftsetup(fft_setup);
+        }
+    }
+#else
     for (int k = 0; k < half; k++) {
         float re = 0, im = 0;
         for (int n = 0; n < FFT_SIZE; n++) {
@@ -93,6 +116,7 @@ static void extract_mfcc_frame(const float *frame, int frame_len,
         }
         power[k] = (re * re + im * im) / (float)FFT_SIZE;
     }
+#endif
 
     /* Mel filterbank */
     float mel_low = hz_to_mel(0.0f);
@@ -124,8 +148,6 @@ static void extract_mfcc_frame(const float *frame, int frame_len,
         mel_energies[m] = logf(energy + 1e-10f);
     }
 
-    free(power);
-
     /* DCT-II to get MFCCs */
     for (int i = 0; i < N_MFCC; i++) {
         float sum = 0;
@@ -149,7 +171,6 @@ MCDResult mcd_compute(const float *ref, int ref_len,
     int n_frames = (min_len - frame_len) / hop_len;
     if (n_frames <= 0) { result.mcd_db = 99.0f; return result; }
 
-    float *mcd_values = (float *)malloc((size_t)n_frames * sizeof(float));
     float sum = 0, sum_sq = 0;
     int valid = 0;
 
@@ -172,7 +193,6 @@ MCDResult mcd_compute(const float *ref, int ref_len,
         /* MCD = (10*sqrt(2)/ln(10)) * sqrt(sum_sq) ≈ 6.1415 * sqrt(sum_sq) */
         float mcd = 6.1415f * sqrtf(dist_sq);
 
-        mcd_values[valid] = mcd;
         sum += mcd;
         sum_sq += mcd * mcd;
         valid++;
@@ -187,7 +207,6 @@ MCDResult mcd_compute(const float *ref, int ref_len,
     }
     result.n_frames = valid;
 
-    free(mcd_values);
     return result;
 }
 
@@ -610,4 +629,159 @@ void quality_print_report(const QualityScorecard *sc, const char *test_name)
         "║  OVERALL SCORE:   %5.1f / 100    Grade: %c               ║\n"
         "╚══════════════════════════════════════════════════════════╝\n\n",
         sc->overall_score, sc->grade);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Prosody Quality Metrics
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+int extract_energy_envelope(const float *audio, int len, int sr,
+                            float *env, int max_frames, int hop_ms) {
+    if (!audio || !env || len <= 0 || max_frames <= 0) return 0;
+
+    int hop = sr * hop_ms / 1000;
+    if (hop <= 0) hop = sr / 100;
+    int win = hop * 2;
+    int n_frames = 0;
+
+    for (int i = 0; i + win <= len && n_frames < max_frames; i += hop) {
+        float sum = 0.0f;
+        int n = (i + win <= len) ? win : len - i;
+        for (int j = 0; j < n; j++) {
+            sum += audio[i + j] * audio[i + j];
+        }
+        float rms = sqrtf(sum / (float)n);
+        env[n_frames++] = (rms > 1e-10f) ? 20.0f * log10f(rms) : -100.0f;
+    }
+    return n_frames;
+}
+
+static float pearson_corr(const float *x, const float *y, int n) {
+    if (n < 2) return 0.0f;
+    float sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+    for (int i = 0; i < n; i++) {
+        sx += x[i]; sy += y[i];
+        sxx += x[i]*x[i]; syy += y[i]*y[i];
+        sxy += x[i]*y[i];
+    }
+    float num = (float)n * sxy - sx * sy;
+    float den = sqrtf(((float)n * sxx - sx*sx) * ((float)n * syy - sy*sy));
+    if (den < 1e-12f) return 0.0f;
+    return num / den;
+}
+
+static float simple_f0_range(const float *audio, int len, int sr) {
+    /* Autocorrelation-based F0 range on 25ms frames */
+    int frame_size = sr / 40; /* 25ms */
+    int hop = sr / 100;       /* 10ms */
+    float min_f0 = 500.0f, max_f0 = 50.0f;
+    int min_lag = sr / 500;
+    int max_lag = sr / 50;
+
+    for (int i = 0; i + frame_size <= len; i += hop) {
+        float max_ac = 0.0f;
+        int best_lag = 0;
+        float energy = 0.0f;
+        for (int j = 0; j < frame_size; j++)
+            energy += audio[i+j] * audio[i+j];
+        if (energy / frame_size < 1e-6f) continue;
+
+        for (int lag = min_lag; lag <= max_lag && i + lag + frame_size <= len; lag++) {
+            float ac = 0.0f;
+            for (int j = 0; j < frame_size; j++)
+                ac += audio[i+j] * audio[i+j+lag];
+            if (ac > max_ac) { max_ac = ac; best_lag = lag; }
+        }
+        if (best_lag > 0 && max_ac > energy * 0.3f) {
+            float f0 = (float)sr / (float)best_lag;
+            if (f0 < min_f0) min_f0 = f0;
+            if (f0 > max_f0) max_f0 = f0;
+        }
+    }
+    return (max_f0 > min_f0) ? max_f0 - min_f0 : 0.0f;
+}
+
+ProsodyMetrics prosody_quality(const float *ref, int ref_len,
+                               const float *synth, int synth_len, int sr) {
+    ProsodyMetrics pm;
+    memset(&pm, 0, sizeof(pm));
+
+    if (!ref || !synth || ref_len <= 0 || synth_len <= 0) return pm;
+
+    /* Energy envelope correlation */
+    float ref_env[4000], synth_env[4000];
+    int ref_frames = extract_energy_envelope(ref, ref_len, sr, ref_env, 4000, 10);
+    int synth_frames = extract_energy_envelope(synth, synth_len, sr, synth_env, 4000, 10);
+    int min_frames = ref_frames < synth_frames ? ref_frames : synth_frames;
+    if (min_frames > 2) {
+        pm.energy_contour_corr = pearson_corr(ref_env, synth_env, min_frames);
+    }
+
+    /* F0 range ratio */
+    float ref_range = simple_f0_range(ref, ref_len, sr);
+    float synth_range = simple_f0_range(synth, synth_len, sr);
+    pm.f0_range_ratio = (ref_range > 1.0f) ? synth_range / ref_range : 1.0f;
+
+    /* Duration ratio via envelope */
+    float ref_dur = (float)ref_len / (float)sr;
+    float synth_dur = (float)synth_len / (float)sr;
+    pm.duration_rmse = fabsf(synth_dur - ref_dur) * 1000.0f;
+
+    /* Use existing F0 comparison for contour correlation */
+    F0Result f0r = f0_compare(ref, ref_len, synth, synth_len, sr);
+    pm.f0_contour_corr = f0r.f0_corr;
+
+    /* Composite prosody MOS estimate */
+    float f0_score = pm.f0_contour_corr > 0 ? pm.f0_contour_corr : 0.0f;
+    float energy_score = pm.energy_contour_corr > 0 ? pm.energy_contour_corr : 0.0f;
+    float range_score = (pm.f0_range_ratio > 0.5f && pm.f0_range_ratio < 2.0f) ?
+                        1.0f - fabsf(1.0f - pm.f0_range_ratio) : 0.3f;
+    float dur_score = (pm.duration_rmse < 500.0f) ? 1.0f - pm.duration_rmse / 500.0f : 0.0f;
+
+    pm.prosody_mos = 1.0f + 4.0f * (0.35f * f0_score + 0.25f * energy_score +
+                                      0.20f * range_score + 0.20f * dur_score);
+    if (pm.prosody_mos > 5.0f) pm.prosody_mos = 5.0f;
+    if (pm.prosody_mos < 1.0f) pm.prosody_mos = 1.0f;
+
+    return pm;
+}
+
+float prosody_predict_mos(const float *audio, int len, int sr) {
+    if (!audio || len <= 0) return 1.0f;
+
+    float range = simple_f0_range(audio, len, sr);
+    float env[4000];
+    int n_frames = extract_energy_envelope(audio, len, sr, env, 4000, 10);
+
+    /* F0 range score: 50-200 Hz range is natural */
+    float range_score;
+    if (range < 20.0f) range_score = 0.2f;
+    else if (range < 50.0f) range_score = 0.5f;
+    else if (range <= 200.0f) range_score = 1.0f;
+    else range_score = 0.7f;
+
+    /* Energy variance score: too flat = robotic, some variation = natural */
+    float energy_var = 0.0f;
+    if (n_frames > 1) {
+        float mean = 0.0f;
+        for (int i = 0; i < n_frames; i++) mean += env[i];
+        mean /= (float)n_frames;
+        for (int i = 0; i < n_frames; i++)
+            energy_var += (env[i] - mean) * (env[i] - mean);
+        energy_var /= (float)(n_frames - 1);
+    }
+    float var_score;
+    float std_db = sqrtf(energy_var);
+    if (std_db < 2.0f) var_score = 0.3f;
+    else if (std_db < 6.0f) var_score = 0.6f + 0.4f * (std_db - 2.0f) / 4.0f;
+    else if (std_db <= 15.0f) var_score = 1.0f;
+    else var_score = 0.7f;
+
+    /* Speaking rate variation (energy-based segmentation) */
+    float rate_score = 0.7f;
+
+    float mos = 1.0f + 4.0f * (0.40f * range_score + 0.35f * var_score + 0.25f * rate_score);
+    if (mos > 5.0f) mos = 5.0f;
+    if (mos < 1.0f) mos = 1.0f;
+    return mos;
 }

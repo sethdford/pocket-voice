@@ -218,15 +218,17 @@ static void test_mel_frame_count(void) {
     MelSpectrogram *mel = mel_create(&cfg);
     if (!mel) FAIL("create failed");
 
-    /* 1600 samples = 100ms = 10 hops of 160 samples.
-     * With win_length=400, we need at least 400 samples for the first frame.
-     * Frames produced = floor((1600 - 400) / 160) + 1 = 8 */
+    /* 1600 samples = 100ms.
+     * mel_process adds center padding of n_fft/2 = 256 on first call
+     * (matching torch.stft center=True), so effective length = 1600 + 256 = 1856.
+     * Frames = floor((1856 - win_length) / hop_length) + 1 = 10 */
     float pcm[1600];
     memset(pcm, 0, sizeof(pcm));
     float mels[20 * 80];
     int frames = mel_process(mel, pcm, 1600, mels, 20);
 
-    int expected = (1600 - cfg.win_length) / cfg.hop_length + 1;
+    int center_pad = cfg.n_fft / 2;
+    int expected = (1600 + center_pad - cfg.win_length) / cfg.hop_length + 1;
     if (frames != expected) {
         char msg[128];
         snprintf(msg, sizeof(msg), "expected %d frames, got %d", expected, frames);

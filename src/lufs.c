@@ -36,9 +36,16 @@ struct LUFSMeter {
     int sample_rate;
     int window_ms;
 
-    /* K-weighting filters */
+    /* K-weighting filters (double precision for coefficient computation) */
     Biquad64 shelf;   /* stage 1: high shelf */
     Biquad64 hpf;     /* stage 2: high-pass */
+
+#ifdef __APPLE__
+    /* vDSP biquad cascade: 2 sections (shelf + HPF) for AMX-accelerated block processing.
+       Coefficients are double (per vDSP API), delay state is float. */
+    vDSP_biquad_Setup vdsp_setup;
+    float vdsp_delays[2 + 4 * 2]; /* 2 + 4*M floats where M=2 sections */
+#endif
 
     /* Block measurement */
     int block_size;        /* samples per 400ms block */
@@ -124,6 +131,7 @@ static void retune_biquad_hpf(Biquad64 *f, int sr)
     f->a2 = (1.0 - K / Q + K * K) / denom;
 }
 
+#ifndef __APPLE__
 static inline double biquad_process_d(Biquad64 *f, double x)
 {
     double y = f->b0 * x + f->b1 * f->x1 + f->b2 * f->x2
@@ -134,6 +142,7 @@ static inline double biquad_process_d(Biquad64 *f, double x)
     f->y1 = y;
     return y;
 }
+#endif
 
 /* ── Public API ───────────────────────────────────────── */
 
@@ -161,6 +170,16 @@ LUFSMeter *lufs_create(int sample_rate, int window_ms)
         return NULL;
     }
 
+#ifdef __APPLE__
+    /* Pack coefficients for vDSP_biquad: [b0,b1,b2,a1,a2] per section (double) */
+    double vdsp_coeffs[10] = {
+        m->shelf.b0, m->shelf.b1, m->shelf.b2, m->shelf.a1, m->shelf.a2,
+        m->hpf.b0,   m->hpf.b1,   m->hpf.b2,   m->hpf.a1,   m->hpf.a2,
+    };
+    m->vdsp_setup = vDSP_biquad_CreateSetup(vdsp_coeffs, 2);
+    memset(m->vdsp_delays, 0, sizeof(m->vdsp_delays));
+#endif
+
     m->block_pos = 0;
     m->n_blocks = 0;
     m->block_idx = 0;
@@ -175,6 +194,9 @@ void lufs_destroy(LUFSMeter *m)
     if (!m) return;
     free(m->block_buf);
     free(m->block_powers);
+#ifdef __APPLE__
+    if (m->vdsp_setup) vDSP_biquad_DestroySetup(m->vdsp_setup);
+#endif
     free(m);
 }
 
@@ -183,6 +205,9 @@ void lufs_reset(LUFSMeter *m)
     if (!m) return;
     m->shelf.x1 = m->shelf.x2 = m->shelf.y1 = m->shelf.y2 = 0.0;
     m->hpf.x1 = m->hpf.x2 = m->hpf.y1 = m->hpf.y2 = 0.0;
+#ifdef __APPLE__
+    memset(m->vdsp_delays, 0, sizeof(m->vdsp_delays));
+#endif
     m->block_pos = 0;
     m->n_blocks = 0;
     m->block_idx = 0;
@@ -190,48 +215,63 @@ void lufs_reset(LUFSMeter *m)
     m->total_blocks = 0;
 }
 
+static inline void lufs_commit_block(LUFSMeter *m)
+{
+    float dot;
+#ifdef __APPLE__
+    vDSP_dotpr(m->block_buf, 1, m->block_buf, 1, &dot,
+               (vDSP_Length)m->block_size);
+#else
+    dot = 0.0f;
+    for (int j = 0; j < m->block_size; j++)
+        dot += m->block_buf[j] * m->block_buf[j];
+#endif
+    double power = (double)dot / (double)m->block_size;
+    m->block_powers[m->block_idx] = power;
+    m->block_idx = (m->block_idx + 1) % MAX_BLOCKS;
+    if (m->n_blocks < MAX_BLOCKS) m->n_blocks++;
+    m->sum_powers += power;
+    m->total_blocks++;
+
+    int keep = m->block_size - m->hop_size;
+    memmove(m->block_buf, m->block_buf + m->hop_size,
+            (size_t)keep * sizeof(float));
+    m->block_pos = keep;
+}
+
 float lufs_measure(LUFSMeter *m, const float *audio, int n)
 {
     if (!m || !audio || n <= 0) return -70.0f;
 
+#ifdef __APPLE__
+    /* K-weight the entire input via vDSP_biquad cascade (AMX-accelerated).
+       Process in chunks that fill up to one block at a time. */
+    if (m->vdsp_setup) {
+        int remaining = n;
+        const float *src = audio;
+        while (remaining > 0) {
+            int space = m->block_size - m->block_pos;
+            int chunk = remaining < space ? remaining : space;
+            vDSP_biquad(m->vdsp_setup, m->vdsp_delays, src, 1,
+                        m->block_buf + m->block_pos, 1, chunk);
+            m->block_pos += chunk;
+            src += chunk;
+            remaining -= chunk;
+            if (m->block_pos >= m->block_size)
+                lufs_commit_block(m);
+        }
+    }
+#else
     for (int i = 0; i < n; i++) {
-        /* K-weight the sample */
         double s = (double)audio[i];
         s = biquad_process_d(&m->shelf, s);
         s = biquad_process_d(&m->hpf, s);
         m->block_buf[m->block_pos] = (float)s;
         m->block_pos++;
-
-        /* When we have a full 400ms block, compute its power */
-        if (m->block_pos >= m->block_size) {
-            double sum_sq = 0.0;
-
-#ifdef __APPLE__
-            /* vDSP vectorized dot product for mean square */
-            float dot;
-            vDSP_dotpr(m->block_buf, 1, m->block_buf, 1, &dot,
-                       (vDSP_Length)m->block_size);
-            sum_sq = (double)dot;
-#else
-            for (int j = 0; j < m->block_size; j++)
-                sum_sq += (double)m->block_buf[j] * (double)m->block_buf[j];
-#endif
-
-            double power = sum_sq / (double)m->block_size;
-            m->block_powers[m->block_idx] = power;
-            m->block_idx = (m->block_idx + 1) % MAX_BLOCKS;
-            if (m->n_blocks < MAX_BLOCKS) m->n_blocks++;
-
-            m->sum_powers += power;
-            m->total_blocks++;
-
-            /* Slide by hop_size (keep last block_size - hop_size samples) */
-            int keep = m->block_size - m->hop_size;
-            memmove(m->block_buf, m->block_buf + m->hop_size,
-                    (size_t)keep * sizeof(float));
-            m->block_pos = keep;
-        }
+        if (m->block_pos >= m->block_size)
+            lufs_commit_block(m);
     }
+#endif
 
     /* Compute momentary LUFS from the most recent window */
     int window_blocks = (m->window_ms / 100); /* 100ms per hop */
@@ -255,7 +295,8 @@ float lufs_normalize(LUFSMeter *m, float *audio, int n, float target_lufs)
 {
     if (!m || !audio || n <= 0) return 0.0f;
 
-    /* Measure current loudness */
+    /* NOTE: lufs_measure() advances internal state. Call lufs_reset() before
+       re-measuring the same buffer to get consistent results. */
     float current = lufs_measure(m, audio, n);
     if (current <= -70.0f) return 0.0f; /* silence, don't amplify */
 

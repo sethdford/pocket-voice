@@ -1,0 +1,445 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Sonata Prosody Dashboard</title>
+    <style>
+      :root {
+        --bg: #0d1117;
+        --surface: #161b22;
+        --border: #30363d;
+        --text: #c9d1d9;
+        --accent: #58a6ff;
+        --green: #3fb950;
+        --yellow: #d29922;
+        --red: #f85149;
+        --purple: #bc8cff;
+      }
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        padding: 20px;
+      }
+      h1 {
+        color: var(--accent);
+        margin-bottom: 20px;
+        font-size: 1.5rem;
+      }
+      .controls {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        margin-bottom: 20px;
+        flex-wrap: wrap;
+      }
+      .controls input[type="file"] {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        color: var(--text);
+        padding: 8px 12px;
+        border-radius: 6px;
+      }
+      .controls button {
+        background: var(--accent);
+        color: #fff;
+        border: none;
+        padding: 8px 16px;
+        border-radius: 6px;
+        cursor: pointer;
+        font-weight: 600;
+      }
+      .controls button:hover {
+        opacity: 0.9;
+      }
+      .stats {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+        gap: 12px;
+        margin-bottom: 24px;
+      }
+      .stat-card {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 16px;
+      }
+      .stat-card .label {
+        font-size: 0.75rem;
+        color: #8b949e;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+      }
+      .stat-card .value {
+        font-size: 1.5rem;
+        font-weight: 700;
+        margin-top: 4px;
+      }
+      .stat-card .value.green {
+        color: var(--green);
+      }
+      .stat-card .value.yellow {
+        color: var(--yellow);
+      }
+      .stat-card .value.accent {
+        color: var(--accent);
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-bottom: 24px;
+      }
+      th,
+      td {
+        text-align: left;
+        padding: 10px 12px;
+        border-bottom: 1px solid var(--border);
+      }
+      th {
+        background: var(--surface);
+        color: var(--accent);
+        font-size: 0.8rem;
+        text-transform: uppercase;
+        position: sticky;
+        top: 0;
+      }
+      td {
+        font-size: 0.9rem;
+      }
+      tr:hover td {
+        background: var(--surface);
+      }
+      .emotion-tag {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 12px;
+        font-size: 0.75rem;
+        font-weight: 600;
+      }
+      .emotion-happy {
+        background: #1a3a1a;
+        color: var(--green);
+      }
+      .emotion-excited {
+        background: #3a2a1a;
+        color: var(--yellow);
+      }
+      .emotion-sad {
+        background: #1a1a3a;
+        color: var(--accent);
+      }
+      .emotion-angry {
+        background: #3a1a1a;
+        color: var(--red);
+      }
+      .emotion-neutral {
+        background: #2a2a2a;
+        color: #8b949e;
+      }
+      .chart-container {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 16px;
+        margin-bottom: 24px;
+      }
+      .chart-container h3 {
+        font-size: 0.9rem;
+        color: var(--accent);
+        margin-bottom: 12px;
+      }
+      canvas {
+        width: 100%;
+        height: 200px;
+      }
+      .section-title {
+        font-size: 1.1rem;
+        color: var(--accent);
+        margin: 24px 0 12px;
+        border-bottom: 1px solid var(--border);
+        padding-bottom: 8px;
+      }
+      #drop-zone {
+        border: 2px dashed var(--border);
+        border-radius: 12px;
+        padding: 40px;
+        text-align: center;
+        margin-bottom: 24px;
+        transition: all 0.2s;
+      }
+      #drop-zone.drag-over {
+        border-color: var(--accent);
+        background: rgba(88, 166, 255, 0.05);
+      }
+      #drop-zone p {
+        color: #8b949e;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Sonata Prosody Dashboard</h1>
+
+    <div id="drop-zone">
+      <p>Drop a <code>prosody.jsonl</code> file here, or:</p>
+      <input type="file" id="file-input" accept=".jsonl,.json,.txt" />
+    </div>
+
+    <div id="content" style="display: none">
+      <div class="stats" id="stats"></div>
+
+      <div
+        class="chart-container"
+        id="pitch-chart-container"
+        style="display: none"
+      >
+        <h3>Pitch (F0) Over Segments</h3>
+        <canvas id="pitch-canvas"></canvas>
+      </div>
+
+      <div
+        class="chart-container"
+        id="energy-chart-container"
+        style="display: none"
+      >
+        <h3>Energy / Volume Over Segments</h3>
+        <canvas id="energy-canvas"></canvas>
+      </div>
+
+      <h2 class="section-title">Segments</h2>
+      <table id="segment-table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Text</th>
+            <th>Pitch</th>
+            <th>Rate</th>
+            <th>Volume</th>
+            <th>Emotion</th>
+            <th>Contour</th>
+            <th>Duration</th>
+          </tr>
+        </thead>
+        <tbody id="segment-body"></tbody>
+      </table>
+
+      <h2 class="section-title">Turns</h2>
+      <table id="turn-table">
+        <thead>
+          <tr>
+            <th>Turn</th>
+            <th>User</th>
+            <th>VRL (ms)</th>
+            <th>TTS RTF</th>
+            <th>Pitch</th>
+            <th>Rate</th>
+            <th>Energy</th>
+          </tr>
+        </thead>
+        <tbody id="turn-body"></tbody>
+      </table>
+    </div>
+
+    <script>
+      const dropZone = document.getElementById("drop-zone");
+      const fileInput = document.getElementById("file-input");
+
+      dropZone.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        dropZone.classList.add("drag-over");
+      });
+      dropZone.addEventListener("dragleave", () =>
+        dropZone.classList.remove("drag-over"),
+      );
+      dropZone.addEventListener("drop", (e) => {
+        e.preventDefault();
+        dropZone.classList.remove("drag-over");
+        if (e.dataTransfer.files.length) processFile(e.dataTransfer.files[0]);
+      });
+      fileInput.addEventListener("change", (e) => {
+        if (e.target.files.length) processFile(e.target.files[0]);
+      });
+
+      function processFile(file) {
+        const reader = new FileReader();
+        reader.onload = (e) => parseAndRender(e.target.result);
+        reader.readAsText(file);
+      }
+
+      function parseAndRender(text) {
+        const lines = text.trim().split("\n").filter(Boolean);
+        const entries = lines
+          .map((l) => {
+            try {
+              return JSON.parse(l);
+            } catch {
+              return null;
+            }
+          })
+          .filter(Boolean);
+
+        const segments = entries.filter((e) => e.type === "segment");
+        const turns = entries.filter((e) => e.type === "turn");
+        const contours = entries.filter((e) => e.type === "contour");
+
+        document.getElementById("content").style.display = "block";
+        dropZone.style.display = "none";
+
+        renderStats(segments, turns);
+        renderSegments(segments);
+        renderTurns(turns);
+        if (segments.length > 1) renderCharts(segments);
+      }
+
+      function renderStats(segments, turns) {
+        const stats = document.getElementById("stats");
+        const avgPitch = segments.length
+          ? segments.reduce((s, e) => s + (e.pitch || 1), 0) / segments.length
+          : 0;
+        const avgRate = segments.length
+          ? segments.reduce((s, e) => s + (e.rate || 1), 0) / segments.length
+          : 0;
+        const avgVrl = turns.length
+          ? turns.reduce((s, e) => s + (e.vrl_ms || 0), 0) / turns.length
+          : 0;
+        const emotions = {};
+        segments.forEach((s) => {
+          if (s.emotion) emotions[s.emotion] = (emotions[s.emotion] || 0) + 1;
+        });
+        const topEmotion = Object.entries(emotions).sort(
+          (a, b) => b[1] - a[1],
+        )[0];
+
+        stats.innerHTML = `
+        <div class="stat-card"><div class="label">Segments</div><div class="value accent">${segments.length}</div></div>
+        <div class="stat-card"><div class="label">Turns</div><div class="value accent">${turns.length}</div></div>
+        <div class="stat-card"><div class="label">Avg Pitch</div><div class="value green">${avgPitch.toFixed(2)}×</div></div>
+        <div class="stat-card"><div class="label">Avg Rate</div><div class="value green">${avgRate.toFixed(2)}×</div></div>
+        <div class="stat-card"><div class="label">Avg VRL</div><div class="value ${avgVrl < 500 ? "green" : avgVrl < 1000 ? "yellow" : "red"}">${avgVrl.toFixed(0)} ms</div></div>
+        <div class="stat-card"><div class="label">Top Emotion</div><div class="value">${topEmotion ? topEmotion[0] : "—"}</div></div>
+    `;
+      }
+
+      function renderSegments(segments) {
+        const body = document.getElementById("segment-body");
+        body.innerHTML = segments
+          .map(
+            (s, i) => `<tr>
+        <td>${i + 1}</td>
+        <td>${(s.text || "").substring(0, 60)}${(s.text || "").length > 60 ? "…" : ""}</td>
+        <td>${(s.pitch || 1).toFixed(2)}</td>
+        <td>${(s.rate || 1).toFixed(2)}</td>
+        <td>${(s.volume_db || 0).toFixed(1)} dB</td>
+        <td>${s.emotion ? `<span class="emotion-tag emotion-${s.emotion}">${s.emotion}</span>` : "—"}</td>
+        <td>${s.contour || "—"}</td>
+        <td>${s.duration_ms || 0} ms</td>
+    </tr>`,
+          )
+          .join("");
+      }
+
+      function renderTurns(turns) {
+        const body = document.getElementById("turn-body");
+        body.innerHTML = turns
+          .map(
+            (t) => `<tr>
+        <td>${t.turn_id || "?"}</td>
+        <td>${(t.user_text || "").substring(0, 40)}${(t.user_text || "").length > 40 ? "…" : ""}</td>
+        <td style="color:${(t.vrl_ms || 0) < 500 ? "var(--green)" : (t.vrl_ms || 0) < 1000 ? "var(--yellow)" : "var(--red)"}">${(t.vrl_ms || 0).toFixed(0)}</td>
+        <td>${(t.tts_rtf || 0).toFixed(3)}</td>
+        <td>${(t.response_pitch || 1).toFixed(2)}</td>
+        <td>${(t.response_rate || 1).toFixed(2)}</td>
+        <td>${(t.response_energy || 0).toFixed(1)}</td>
+    </tr>`,
+          )
+          .join("");
+      }
+
+      function renderCharts(segments) {
+        renderLineChart(
+          "pitch-canvas",
+          "pitch-chart-container",
+          segments.map((s, i) => i + 1),
+          segments.map((s) => s.pitch || 1),
+          "var(--accent)",
+        );
+        renderLineChart(
+          "energy-canvas",
+          "energy-chart-container",
+          segments.map((s, i) => i + 1),
+          segments.map((s) => s.volume_db || 0),
+          "var(--green)",
+        );
+      }
+
+      function renderLineChart(canvasId, containerId, labels, data, color) {
+        const container = document.getElementById(containerId);
+        container.style.display = "block";
+        const canvas = document.getElementById(canvasId);
+        const ctx = canvas.getContext("2d");
+        const dpr = window.devicePixelRatio || 1;
+        const rect = canvas.getBoundingClientRect();
+        canvas.width = rect.width * dpr;
+        canvas.height = rect.height * dpr;
+        ctx.scale(dpr, dpr);
+
+        const w = rect.width,
+          h = rect.height;
+        const pad = { top: 10, right: 20, bottom: 25, left: 45 };
+        const pw = w - pad.left - pad.right,
+          ph = h - pad.top - pad.bottom;
+
+        const minY = Math.min(...data) - 0.1;
+        const maxY = Math.max(...data) + 0.1;
+        const rangeY = maxY - minY || 1;
+
+        ctx.clearRect(0, 0, w, h);
+
+        // Grid
+        ctx.strokeStyle = "#30363d";
+        ctx.lineWidth = 0.5;
+        for (let i = 0; i <= 4; i++) {
+          const y = pad.top + ph - (ph * i) / 4;
+          ctx.beginPath();
+          ctx.moveTo(pad.left, y);
+          ctx.lineTo(w - pad.right, y);
+          ctx.stroke();
+          ctx.fillStyle = "#8b949e";
+          ctx.font = "10px sans-serif";
+          ctx.textAlign = "right";
+          ctx.fillText(
+            (minY + (rangeY * i) / 4).toFixed(2),
+            pad.left - 4,
+            y + 3,
+          );
+        }
+
+        // Line
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        data.forEach((d, i) => {
+          const x = pad.left + (pw * i) / (data.length - 1 || 1);
+          const y = pad.top + ph - (ph * (d - minY)) / rangeY;
+          i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+
+        // Dots
+        ctx.fillStyle = color;
+        data.forEach((d, i) => {
+          const x = pad.left + (pw * i) / (data.length - 1 || 1);
+          const y = pad.top + ph - (ph * (d - minY)) / rangeY;
+          ctx.beginPath();
+          ctx.arc(x, y, 3, 0, Math.PI * 2);
+          ctx.fill();
+        });
+      }
+    </script>
+  </body>
+</html>

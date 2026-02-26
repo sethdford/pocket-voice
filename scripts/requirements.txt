@@ -3,3 +3,4 @@ numpy
 pyyaml
 huggingface_hub
 sentencepiece
+safetensors

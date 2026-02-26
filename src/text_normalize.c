@@ -718,6 +718,147 @@ int text_unit(const char *text, char *out, int out_cap) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * URL and Email normalization
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+int text_url(const char *text, char *out, int out_cap) {
+    OutBuf ob; ob_init(&ob, out, out_cap);
+    const char *p = text;
+
+    if (str_starts_with(p, "https://")) {
+        ob_append(&ob, "H T T P S colon slash slash ");
+        p += 8;
+    } else if (str_starts_with(p, "http://")) {
+        ob_append(&ob, "H T T P colon slash slash ");
+        p += 7;
+    } else if (str_starts_with(p, "ftp://")) {
+        ob_append(&ob, "F T P colon slash slash ");
+        p += 6;
+    }
+
+    /* Remove trailing www. prefix verbosely */
+    if (str_starts_with(p, "www.")) {
+        ob_append(&ob, "W W W dot ");
+        p += 4;
+    }
+
+    while (*p) {
+        if (*p == '.') {
+            ob_append(&ob, " dot ");
+        } else if (*p == '/') {
+            ob_append(&ob, " slash ");
+        } else if (*p == '-') {
+            ob_append(&ob, " dash ");
+        } else if (*p == '_') {
+            ob_append(&ob, " underscore ");
+        } else if (*p == '?') {
+            ob_append(&ob, " question mark ");
+        } else if (*p == '=') {
+            ob_append(&ob, " equals ");
+        } else if (*p == '&') {
+            ob_append(&ob, " ampersand ");
+        } else if (*p == '#') {
+            ob_append(&ob, " hash ");
+        } else if (*p == '%') {
+            ob_append(&ob, " percent ");
+        } else if (*p == ':') {
+            ob_append(&ob, " colon ");
+        } else if (*p == '@') {
+            ob_append(&ob, " at ");
+        } else {
+            ob_append_ch(&ob, *p);
+        }
+        p++;
+    }
+
+    return ob_len(&ob);
+}
+
+int text_email(const char *text, char *out, int out_cap) {
+    OutBuf ob; ob_init(&ob, out, out_cap);
+    const char *at = strchr(text, '@');
+    if (!at) { ob_append(&ob, text); return ob_len(&ob); }
+
+    for (const char *p = text; p < at; p++) {
+        if (*p == '.')       ob_append(&ob, " dot ");
+        else if (*p == '-')  ob_append(&ob, " dash ");
+        else if (*p == '_')  ob_append(&ob, " underscore ");
+        else if (*p == '+')  ob_append(&ob, " plus ");
+        else                 ob_append_ch(&ob, *p);
+    }
+
+    ob_append(&ob, " at ");
+
+    for (const char *p = at + 1; *p; p++) {
+        if (*p == '.')       ob_append(&ob, " dot ");
+        else if (*p == '-')  ob_append(&ob, " dash ");
+        else                 ob_append_ch(&ob, *p);
+    }
+
+    return ob_len(&ob);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Abbreviation expansion
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+typedef struct { const char *abbrev; const char *full; } AbbrevEntry;
+
+static const AbbrevEntry ABBREVIATIONS[] = {
+    { "Dr.",    "Doctor" },
+    { "Mr.",    "Mister" },
+    { "Mrs.",   "Missus" },
+    { "Ms.",    "Miz" },
+    { "Prof.",  "Professor" },
+    { "Jr.",    "Junior" },
+    { "Sr.",    "Senior" },
+    { "St.",    "Saint" },
+    { "vs.",    "versus" },
+    { "e.g.",   "for example" },
+    { "i.e.",   "that is" },
+    { "etc.",   "etcetera" },
+    { "approx.","approximately" },
+    { "dept.",  "department" },
+    { "govt.",  "government" },
+    { "Inc.",   "Incorporated" },
+    { "Corp.",  "Corporation" },
+    { "Ltd.",   "Limited" },
+    { "Ave.",   "Avenue" },
+    { "Blvd.",  "Boulevard" },
+    { "Rd.",    "Road" },
+    { "Apt.",   "Apartment" },
+    { "Feb.",   "February" },
+    { "Jan.",   "January" },
+    { "Mar.",   "March" },
+    { "Apr.",   "April" },
+    { "Jun.",   "June" },
+    { "Jul.",   "July" },
+    { "Aug.",   "August" },
+    { "Sep.",   "September" },
+    { "Oct.",   "October" },
+    { "Nov.",   "November" },
+    { "Dec.",   "December" },
+    { NULL, NULL },
+};
+
+/* Check if p points to the start of a known abbreviation.
+ * Returns length of abbreviation if found, 0 otherwise. */
+static int match_abbreviation(const char *p, const char **expansion) {
+    for (const AbbrevEntry *a = ABBREVIATIONS; a->abbrev; a++) {
+        int alen = (int)strlen(a->abbrev);
+        if (strncmp(p, a->abbrev, (size_t)alen) == 0) {
+            char after = p[alen];
+            if (after == '\0' || after == ' ' || after == ',' ||
+                after == '\n' || after == '\t') {
+                *expansion = a->full;
+                return alen;
+            }
+        }
+    }
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * Main entry: text_normalize
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -746,6 +887,10 @@ int text_normalize(const char *text, const char *interpret_as,
         return text_fraction(text, out, out_cap);
     if (streqi(interpret_as, "unit"))
         return text_unit(text, out, out_cap);
+    if (streqi(interpret_as, "url") || streqi(interpret_as, "uri"))
+        return text_url(text, out, out_cap);
+    if (streqi(interpret_as, "email"))
+        return text_email(text, out, out_cap);
 
     /* Unknown interpret_as — passthrough */
     snprintf(out, (size_t)out_cap, "%s", text);
@@ -761,6 +906,72 @@ int text_auto_normalize(const char *text, char *out, int out_cap) {
     const char *p = text;
 
     while (*p) {
+        /* URL: http://, https://, or www. prefix */
+        if (str_starts_with(p, "http://") || str_starts_with(p, "https://") ||
+            str_starts_with(p, "ftp://") || str_starts_with(p, "www.")) {
+            const char *end = p;
+            while (*end && !isspace((unsigned char)*end) &&
+                   *end != ',' && *end != ')' && *end != ']') end++;
+            /* Strip trailing punctuation */
+            while (end > p && (*(end-1) == '.' || *(end-1) == ',' || *(end-1) == ';')) end--;
+            char token[512] = {0};
+            int tlen = (int)(end - p);
+            if (tlen > 511) tlen = 511;
+            memcpy(token, p, (size_t)tlen);
+            token[tlen] = '\0';
+            char norm[1024];
+            text_url(token, norm, sizeof(norm));
+            ob_append(&ob, norm);
+            p = end;
+            continue;
+        }
+
+        /* Email: word@word.word — look for @ with alphanumeric on both sides */
+        if (*p == '@' && p > text && (isalnum((unsigned char)*(p-1)) || *(p-1) == '.' ||
+            *(p-1) == '_' || *(p-1) == '-' || *(p-1) == '+')) {
+            /* Back up to start of local part */
+            const char *local_start = p - 1;
+            while (local_start > text && (isalnum((unsigned char)*(local_start-1)) ||
+                   *(local_start-1) == '.' || *(local_start-1) == '_' ||
+                   *(local_start-1) == '-' || *(local_start-1) == '+')) {
+                local_start--;
+            }
+            /* Forward through domain */
+            const char *domain_end = p + 1;
+            while (isalnum((unsigned char)*domain_end) || *domain_end == '.' || *domain_end == '-') {
+                domain_end++;
+            }
+            if (domain_end > p + 1 && *(domain_end - 1) != '.') {
+                /* Rewind output to remove the already-copied local part */
+                int local_len = (int)(p - local_start);
+                ob.pos -= local_len;
+                if (ob.pos < 0) ob.pos = 0;
+                ob.buf[ob.pos] = '\0';
+
+                char token[256] = {0};
+                int tlen = (int)(domain_end - local_start);
+                if (tlen > 255) tlen = 255;
+                memcpy(token, local_start, (size_t)tlen);
+                token[tlen] = '\0';
+                char norm[512];
+                text_email(token, norm, sizeof(norm));
+                ob_append(&ob, norm);
+                p = domain_end;
+                continue;
+            }
+        }
+
+        /* Abbreviation: known abbreviations with trailing dot */
+        if (isupper((unsigned char)*p) || *p == 'e' || *p == 'i' || *p == 'v') {
+            const char *expansion = NULL;
+            int alen = match_abbreviation(p, &expansion);
+            if (alen > 0) {
+                ob_append(&ob, expansion);
+                p += alen;
+                continue;
+            }
+        }
+
         /* Currency: $123.45 or €50 */
         if (*p == '$' || (unsigned char)*p == 0xc2 || (unsigned char)*p == 0xe2) {
             int sym_len = 0;
@@ -879,6 +1090,213 @@ int text_auto_normalize(const char *text, char *out, int out_cap) {
                 ob_append_ch(&ob, *p);
                 p++;
             }
+        }
+    }
+
+    return ob_len(&ob);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Inline IPA expansion: <<p|h|o|n>> → <phoneme alphabet="ipa" ph="phon">phon</phoneme>
+ * Also supports [ipa:phon] as an alternative syntax.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+int text_expand_inline_ipa(const char *text, char *out, int out_cap) {
+    OutBuf ob;
+    ob_init(&ob, out, out_cap);
+    const char *p = text;
+
+    while (*p) {
+        /* Cartesia-compatible: <<phoneme|phoneme|...>> */
+        if (p[0] == '<' && p[1] == '<') {
+            const char *start = p + 2;
+            const char *end = strstr(start, ">>");
+            if (end && end - start < 512) {
+                char ipa[512];
+                int ipa_len = 0;
+                for (const char *c = start; c < end && ipa_len < 511; c++) {
+                    if (*c != '|') ipa[ipa_len++] = *c;
+                }
+                ipa[ipa_len] = '\0';
+
+                ob_append(&ob, "<phoneme alphabet=\"ipa\" ph=\"");
+                ob_append(&ob, ipa);
+                ob_append(&ob, "\">");
+                ob_append(&ob, ipa);
+                ob_append(&ob, "</phoneme>");
+                p = end + 2;
+                continue;
+            }
+        }
+
+        /* Alternative syntax: [ipa:phonemes] */
+        if (p[0] == '[' && p[1] == 'i' && p[2] == 'p' && p[3] == 'a' && p[4] == ':') {
+            const char *start = p + 5;
+            const char *end = strchr(start, ']');
+            if (end && end - start < 512) {
+                char ipa[512];
+                int ipa_len = (int)(end - start);
+                if (ipa_len > 511) ipa_len = 511;
+                memcpy(ipa, start, (size_t)ipa_len);
+                ipa[ipa_len] = '\0';
+
+                ob_append(&ob, "<phoneme alphabet=\"ipa\" ph=\"");
+                ob_append(&ob, ipa);
+                ob_append(&ob, "\">");
+                ob_append(&ob, ipa);
+                ob_append(&ob, "</phoneme>");
+                p = end + 1;
+                continue;
+            }
+        }
+
+        ob_append_ch(&ob, *p);
+        p++;
+    }
+
+    return ob_len(&ob);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Pronunciation dictionary: case-insensitive text substitution
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+int text_apply_pronunciation_dict(const char *text, char *out, int out_cap,
+                                  const char (*words)[64], const char (*replacements)[256],
+                                  int n_entries) {
+    if (!text || !out || out_cap <= 0 || n_entries <= 0) {
+        if (out && out_cap > 0) {
+            snprintf(out, (size_t)out_cap, "%s", text ? text : "");
+            return text ? (int)strlen(text) : 0;
+        }
+        return 0;
+    }
+
+    OutBuf ob;
+    ob_init(&ob, out, out_cap);
+    const char *p = text;
+
+    while (*p) {
+        int matched = 0;
+        for (int i = 0; i < n_entries; i++) {
+            int wlen = (int)strlen(words[i]);
+            if (wlen == 0) continue;
+            if (strncasecmp(p, words[i], (size_t)wlen) == 0) {
+                char after = p[wlen];
+                if (after == '\0' || after == ' ' || after == ',' || after == '.'
+                    || after == '!' || after == '?' || after == ';' || after == ':'
+                    || after == '\'' || after == '"') {
+                    ob_append(&ob, replacements[i]);
+                    p += wlen;
+                    matched = 1;
+                    break;
+                }
+            }
+        }
+        if (!matched) {
+            ob_append_ch(&ob, *p);
+            p++;
+        }
+    }
+
+    return ob_len(&ob);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Nonverbalism expansion: [laughter] [sigh] [gasp] [breath] → SSML
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+int text_expand_nonverbalisms(const char *text, char *out, int out_cap) {
+    static const struct {
+        const char *marker;
+        int         marker_len;
+        const char *ssml;
+    } NV_MAP[] = {
+        {"[laughter]", 10,
+         "<break time=\"200ms\"/><emotion type=\"happy\"> </emotion><break time=\"200ms\"/>"},
+        {"[laughs]",   8,
+         "<break time=\"200ms\"/><emotion type=\"happy\"> </emotion><break time=\"200ms\"/>"},
+        {"[sigh]",     6,
+         "<break time=\"300ms\"/><emotion type=\"sad\"> </emotion><break time=\"150ms\"/>"},
+        {"[sighs]",    7,
+         "<break time=\"300ms\"/><emotion type=\"sad\"> </emotion><break time=\"150ms\"/>"},
+        {"[gasp]",     6,
+         "<break time=\"100ms\"/><emotion type=\"surprised\"> </emotion><break time=\"100ms\"/>"},
+        {"[gasps]",    7,
+         "<break time=\"100ms\"/><emotion type=\"surprised\"> </emotion><break time=\"100ms\"/>"},
+        {"[breath]",   8,
+         "<break time=\"250ms\"/>"},
+        {"[pause]",    7,
+         "<break time=\"500ms\"/>"},
+        {"[long pause]", 12,
+         "<break time=\"1000ms\"/>"},
+        {"[cough]",    7,
+         "<break time=\"150ms\"/><break time=\"200ms\"/>"},
+        {"[coughs]",   8,
+         "<break time=\"150ms\"/><break time=\"200ms\"/>"},
+        {"[yawn]",     6,
+         "<break time=\"400ms\"/><emotion type=\"tired\"> </emotion><break time=\"200ms\"/>"},
+        {"[yawns]",    7,
+         "<break time=\"400ms\"/><emotion type=\"tired\"> </emotion><break time=\"200ms\"/>"},
+        {"[hmm]",      5,
+         "<break time=\"300ms\"/><emotion type=\"serious\"> </emotion>"},
+        {"[um]",       4,
+         "<break time=\"200ms\"/>"},
+        {"[uh]",       4,
+         "<break time=\"150ms\"/>"},
+        {"[applause]", 10,
+         "<break time=\"500ms\"/><break time=\"1000ms\"/>"},
+        {"[crying]",   8,
+         "<break time=\"300ms\"/><emotion type=\"sad\"> </emotion><break time=\"300ms\"/>"},
+        {"[cries]",    7,
+         "<break time=\"300ms\"/><emotion type=\"sad\"> </emotion><break time=\"300ms\"/>"},
+        {"[sniff]",    7,
+         "<break time=\"150ms\"/><emotion type=\"sad\"> </emotion>"},
+        {"[clears throat]", 15,
+         "<break time=\"300ms\"/><break time=\"150ms\"/>"},
+        {"[shudder]",  9,
+         "<break time=\"200ms\"/><emotion type=\"fearful\"> </emotion><break time=\"100ms\"/>"},
+        {"[groan]",    7,
+         "<break time=\"200ms\"/><emotion type=\"tired\"> </emotion><break time=\"150ms\"/>"},
+        {"[groans]",   8,
+         "<break time=\"200ms\"/><emotion type=\"tired\"> </emotion><break time=\"150ms\"/>"},
+        {"[chuckle]",  9,
+         "<break time=\"150ms\"/><emotion type=\"amused\"> </emotion><break time=\"100ms\"/>"},
+        {"[chuckles]", 10,
+         "<break time=\"150ms\"/><emotion type=\"amused\"> </emotion><break time=\"100ms\"/>"},
+        {"[whisper]",  9,
+         "<emotion type=\"whisper\">"},
+        {"[/whisper]", 10,
+         "</emotion>"},
+        {"[shout]",    7,
+         "<emotion type=\"emphatic\">"},
+        {"[/shout]",   8,
+         "</emotion>"},
+        {NULL, 0, NULL}
+    };
+
+    OutBuf ob;
+    ob_init(&ob, out, out_cap);
+    const char *p = text;
+
+    while (*p) {
+        if (*p == '[') {
+            int matched = 0;
+            for (int i = 0; NV_MAP[i].marker; i++) {
+                if (strncasecmp(p, NV_MAP[i].marker, (size_t)NV_MAP[i].marker_len) == 0) {
+                    ob_append(&ob, NV_MAP[i].ssml);
+                    p += NV_MAP[i].marker_len;
+                    matched = 1;
+                    break;
+                }
+            }
+            if (!matched) {
+                ob_append_ch(&ob, *p);
+                p++;
+            }
+        } else {
+            ob_append_ch(&ob, *p);
+            p++;
         }
     }
 

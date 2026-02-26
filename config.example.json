@@ -1,0 +1,71 @@
+{
+  "stt": {
+    "engine": "conformer",
+    "cstt_model": "models/parakeet-ctc-1.1b-fp16.cstt",
+    "beam_size": 5,
+    "lm_path": "models/3-gram.pruned.1e-7.bin",
+    "lm_weight": 1.5,
+    "word_score": 0
+  },
+  "tts": {
+    "engine": "sonata-v3",
+    "phonemize": false,
+    "phoneme_map": "models/sonata/phoneme_map.json",
+    "speaker_encoder": "models/ecapa_tdnn.onnx",
+    "ref_wav": null,
+    "clone_voice": null
+  },
+  "sonata": {
+    "lm_weights": "models/sonata/sonata_lm.safetensors",
+    "lm_config": "models/sonata/sonata_lm_config.json",
+    "tokenizer": "models/tokenizer.model",
+    "flow_weights": "models/sonata/sonata_flow.safetensors",
+    "flow_config": "models/sonata/sonata_flow_config.json",
+    "decoder_weights": "models/sonata/sonata_decoder.safetensors",
+    "decoder_config": "models/sonata/sonata_decoder_config.json",
+    "speaker": 0,
+    "cfg_scale": 1.5,
+    "flow_steps": 8,
+    "heun": false,
+    "speculate_k": 5,
+    "emosteer": null
+  },
+  "sonata_v3": {
+    "flow_weights": "models/sonata/flow_v3.safetensors",
+    "flow_config": "models/sonata/flow_v3_config.json",
+    "vocoder_weights": "models/sonata/vocoder.safetensors",
+    "vocoder_config": "models/sonata/vocoder_config.json",
+    "n_steps": 8,
+    "cfg_scale": 1.5,
+    "heun": false,
+    "streaming_mode": 0,
+    "phonemes": true,
+    "phoneme_map": "models/sonata/phoneme_map.json"
+  },
+  "llm": {
+    "engine": "claude",
+    "model": "claude-sonnet-4-20250514",
+    "system_prompt": "You are a helpful voice assistant. Keep responses concise.",
+    "prosody": false
+  },
+  "audio": {
+    "pitch": 1,
+    "volume_db": 0,
+    "spatial": false,
+    "hw_resample": true,
+    "silero_vad": null,
+    "native_vad": null
+  },
+  "prosody": {
+    "emphasis_predict": true,
+    "multi_voice_quotes": true,
+    "adaptive_prompt": true,
+    "feedback_loop": true,
+    "log_file": null
+  },
+  "server": {
+    "enabled": false,
+    "port": 8080
+  },
+  "profiler": true
+}

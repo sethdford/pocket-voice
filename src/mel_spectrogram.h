@@ -24,6 +24,9 @@ typedef struct {
     float fmin;         /* Minimum mel frequency (default 0) */
     float fmax;         /* Maximum mel frequency (default sample_rate / 2) */
     float log_floor;    /* Floor value before log (default 1e-10) */
+    float preemph;      /* Pre-emphasis coefficient (default 0.97, 0 = disabled) */
+    int slaney_norm;    /* Apply Slaney mel normalization (default 1). Set 0 for raw triangular. */
+    int periodic_window; /* Use periodic Hann window like PyTorch (default 0 = symmetric). */
 } MelConfig;
 
 /* Fill config with standard ASR defaults (16kHz, 80 mels, 25ms window, 10ms hop). */

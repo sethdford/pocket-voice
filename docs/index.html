@@ -14,7 +14,7 @@
     <meta property="og:title" content="pocket-voice" />
     <meta
       property="og:description"
-      content="Zero-Python real-time voice pipeline for Apple Silicon. 18 native C libraries. 157 tests. Under 200ms latency."
+      content="Zero-Python real-time voice pipeline for Apple Silicon. 43 C libraries, 5 Rust crates, 1 metallib. 30 test suites. Under 200ms latency."
     />
     <meta property="og:type" content="website" />
     <meta
@@ -1394,7 +1394,7 @@
               </svg>
             </div>
             <span class="pipe-lbl">TTS</span
-            ><span class="pipe-det">Kyutai 1.6B</span>
+            ><span class="pipe-det">Sonata TTS</span>
           </div>
           <div class="pipe-arr rv-c">
             <svg
@@ -1435,16 +1435,16 @@
       <div class="s-inner">
         <div class="stats" id="stats">
           <div class="stat rv-c">
-            <div class="stat-v" data-count="18">0</div>
+            <div class="stat-v" data-count="43">0</div>
             <div class="stat-l">Native C Libraries</div>
           </div>
           <div class="stat rv-c">
-            <div class="stat-v" data-count="2">0</div>
+            <div class="stat-v" data-count="5">0</div>
             <div class="stat-l">Rust cdylibs</div>
           </div>
           <div class="stat rv-c">
-            <div class="stat-v" data-count="157">0</div>
-            <div class="stat-l">Automated Tests</div>
+            <div class="stat-v" data-count="30">0</div>
+            <div class="stat-l">Test Suites</div>
           </div>
           <div class="stat rv-c">
             <div class="stat-v" data-count="0">0</div>
@@ -1809,8 +1809,8 @@
             <span class="cc-tag cc-blue">Metal GPU</span>
             <h3>ML Inference</h3>
             <p>
-              Kyutai STT 1B and TTS 1.6B transformers. Attention, feed-forward,
-              and Mimi codec on Metal shaders.
+              Sonata LM (241M), Sonata Flow (35.7M), and Conformer STT on Metal
+              shaders. Custom tensor_ops.metallib for GPU compute.
             </p>
           </div>
           <div class="chip-card rv-c">
@@ -1840,8 +1840,11 @@
     ></div>
     <section id="modules" class="s s-gray" style="padding-top: 80px">
       <div class="s-inner">
-        <h2 class="s-title">18 native libraries.</h2>
-        <p class="s-sub">Each compiles independently. Linked at build time.</p>
+        <h2 class="s-title">49 native modules.</h2>
+        <p class="s-sub">
+          43 C libraries, 5 Rust crates, 1 Metal shader. Each compiles
+          independently.
+        </p>
 
         <div class="mod-group rv">
           <div class="mod-group-title">Audio Engine</div>
@@ -1874,26 +1877,38 @@
               <div class="mod-d c"></div>
               <span class="mod-n">opus_codec.c</span>
             </div>
+            <div class="mod rv-c">
+              <div class="mod-d c"></div>
+              <span class="mod-n">noise_gate.c</span>
+            </div>
           </div>
         </div>
         <div class="mod-group rv">
-          <div class="mod-group-title">Speech &amp; Intelligence</div>
+          <div class="mod-group-title">Speech Recognition</div>
           <div class="mod-list">
-            <div class="mod rv-c">
-              <div class="mod-d rs"></div>
-              <span class="mod-n">pocket_stt (Rust)</span>
-            </div>
-            <div class="mod rv-c">
-              <div class="mod-d rs"></div>
-              <span class="mod-n">pocket_tts_rs (Rust)</span>
-            </div>
             <div class="mod rv-c">
               <div class="mod-d c"></div>
               <span class="mod-n">conformer_stt.c</span>
             </div>
             <div class="mod rv-c">
               <div class="mod-d c"></div>
+              <span class="mod-n">sonata_stt.c</span>
+            </div>
+            <div class="mod rv-c">
+              <div class="mod-d c"></div>
               <span class="mod-n">mel_spectrogram.c</span>
+            </div>
+            <div class="mod rv-c">
+              <div class="mod-d c"></div>
+              <span class="mod-n">bnns_conformer.c</span>
+            </div>
+            <div class="mod rv-c">
+              <div class="mod-d c"></div>
+              <span class="mod-n">ctc_beam_decoder.cpp</span>
+            </div>
+            <div class="mod rv-c">
+              <div class="mod-d c"></div>
+              <span class="mod-n">tdt_decoder.c</span>
             </div>
             <div class="mod rv-c">
               <div class="mod-d c"></div>
@@ -1905,7 +1920,78 @@
             </div>
             <div class="mod rv-c">
               <div class="mod-d c"></div>
-              <span class="mod-n">bnns_mimi_decoder.c</span>
+              <span class="mod-n">native_vad.c</span>
+            </div>
+            <div class="mod rv-c">
+              <div class="mod-d c"></div>
+              <span class="mod-n">speech_detector.c</span>
+            </div>
+          </div>
+        </div>
+        <div class="mod-group rv">
+          <div class="mod-group-title">Sonata TTS</div>
+          <div class="mod-list">
+            <div class="mod rv-c">
+              <div class="mod-d c"></div>
+              <span class="mod-n">sonata_istft.c</span>
+            </div>
+            <div class="mod rv-c">
+              <div class="mod-d c"></div>
+              <span class="mod-n">sonata_refiner.c</span>
+            </div>
+            <div class="mod rv-c">
+              <div class="mod-d c"></div>
+              <span class="mod-n">bnns_convnext_decoder.c</span>
+            </div>
+            <div class="mod rv-c">
+              <div class="mod-d c"></div>
+              <span class="mod-n">phonemizer.c</span>
+            </div>
+          </div>
+        </div>
+        <div class="mod-group rv">
+          <div class="mod-group-title">Prosody &amp; Expression</div>
+          <div class="mod-list">
+            <div class="mod rv-c">
+              <div class="mod-d c"></div>
+              <span class="mod-n">prosody_predict.c</span>
+            </div>
+            <div class="mod rv-c">
+              <div class="mod-d c"></div>
+              <span class="mod-n">prosody_log.c</span>
+            </div>
+            <div class="mod rv-c">
+              <div class="mod-d c"></div>
+              <span class="mod-n">emphasis_predict.c</span>
+            </div>
+          </div>
+        </div>
+        <div class="mod-group rv">
+          <div class="mod-group-title">Social Intelligence</div>
+          <div class="mod-list">
+            <div class="mod rv-c">
+              <div class="mod-d c"></div>
+              <span class="mod-n">speaker_encoder.c</span>
+            </div>
+            <div class="mod rv-c">
+              <div class="mod-d c"></div>
+              <span class="mod-n">speaker_diarizer.c</span>
+            </div>
+            <div class="mod rv-c">
+              <div class="mod-d c"></div>
+              <span class="mod-n">conversation_memory.c</span>
+            </div>
+            <div class="mod rv-c">
+              <div class="mod-d c"></div>
+              <span class="mod-n">audio_emotion.c</span>
+            </div>
+            <div class="mod rv-c">
+              <div class="mod-d c"></div>
+              <span class="mod-n">backchannel.c</span>
+            </div>
+            <div class="mod rv-c">
+              <div class="mod-d c"></div>
+              <span class="mod-n">voice_onboard.c</span>
             </div>
           </div>
         </div>
@@ -1924,14 +2010,80 @@
               <div class="mod-d c"></div>
               <span class="mod-n">text_normalize.c</span>
             </div>
+            <div class="mod rv-c">
+              <div class="mod-d c"></div>
+              <span class="mod-n">spm_tokenizer.c</span>
+            </div>
           </div>
         </div>
         <div class="mod-group rv">
-          <div class="mod-group-title">Infrastructure</div>
+          <div class="mod-group-title">Infrastructure &amp; Networking</div>
           <div class="mod-list">
             <div class="mod rv-c">
               <div class="mod-d c"></div>
               <span class="mod-n">vm_ring.c</span>
+            </div>
+            <div class="mod rv-c">
+              <div class="mod-d c"></div>
+              <span class="mod-n">metal_loader.c</span>
+            </div>
+            <div class="mod rv-c">
+              <div class="mod-d c"></div>
+              <span class="mod-n">http_api.c</span>
+            </div>
+            <div class="mod rv-c">
+              <div class="mod-d c"></div>
+              <span class="mod-n">websocket.c</span>
+            </div>
+            <div class="mod rv-c">
+              <div class="mod-d c"></div>
+              <span class="mod-n">web_remote.c</span>
+            </div>
+            <div class="mod rv-c">
+              <div class="mod-d c"></div>
+              <span class="mod-n">apple_perf.c</span>
+            </div>
+            <div class="mod rv-c">
+              <div class="mod-d c"></div>
+              <span class="mod-n">latency_profiler.c</span>
+            </div>
+            <div class="mod rv-c">
+              <div class="mod-d c"></div>
+              <span class="mod-n">voice_quality.c</span>
+            </div>
+          </div>
+        </div>
+        <div class="mod-group rv">
+          <div class="mod-group-title">Rust Crates</div>
+          <div class="mod-list">
+            <div class="mod rv-c">
+              <div class="mod-d rs"></div>
+              <span class="mod-n">pocket_stt (Rust)</span>
+            </div>
+            <div class="mod rv-c">
+              <div class="mod-d rs"></div>
+              <span class="mod-n">pocket_llm (Rust)</span>
+            </div>
+            <div class="mod rv-c">
+              <div class="mod-d rs"></div>
+              <span class="mod-n">sonata_lm (Rust)</span>
+            </div>
+            <div class="mod rv-c">
+              <div class="mod-d rs"></div>
+              <span class="mod-n">sonata_flow (Rust)</span>
+            </div>
+            <div class="mod rv-c">
+              <div class="mod-d rs"></div>
+              <span class="mod-n">sonata_storm (Rust)</span>
+            </div>
+          </div>
+        </div>
+        <div class="mod-group rv">
+          <div class="mod-group-title">GPU &amp; Headers</div>
+          <div class="mod-list">
+            <div class="mod rv-c">
+              <div class="mod-d c"></div>
+              <span class="mod-n">tensor_ops.metal</span>
             </div>
             <div class="mod rv-c">
               <div class="mod-d h"></div>
@@ -1952,6 +2104,14 @@
             <div class="mod rv-c">
               <div class="mod-d h"></div>
               <span class="mod-n">triple_buffer.h</span>
+            </div>
+            <div class="mod rv-c">
+              <div class="mod-d h"></div>
+              <span class="mod-n">lstm_ops.h</span>
+            </div>
+            <div class="mod rv-c">
+              <div class="mod-d h"></div>
+              <span class="mod-n">silero_vad.h</span>
             </div>
           </div>
         </div>
@@ -2011,7 +2171,7 @@
               <span class="t-fl">--pitch</span> <span class="t-str">1.15</span>
               <span class="t-fl">--spatial</span> <span class="t-str">30</span>
 
-              <span class="t-cm"># Run all 157 tests</span>
+              <span class="t-cm"># Run all 30 test suites</span>
               <span class="t-pr">$</span> <span class="t-fn">make</span>
               <span class="t-str">test</span></code
             >
@@ -2023,7 +2183,7 @@
     <!-- TESTS -->
     <section id="tests" class="s s-dark rv" style="padding-top: 40px">
       <div class="s-inner">
-        <h2 class="s-title">157 tests.<br />Zero failures.</h2>
+        <h2 class="s-title">30 suites.<br />Zero failures.</h2>
         <p class="s-sub">Every module proven. Every edge case covered.</p>
 
         <div class="test-wrap">
@@ -2034,8 +2194,8 @@
                 <circle class="fg" cx="100" cy="100" r="90" />
               </svg>
               <div class="test-ring-label">
-                <span class="test-ring-num">157</span
-                ><span class="test-ring-txt">passing</span>
+                <span class="test-ring-num">30</span
+                ><span class="test-ring-txt">suites passing</span>
               </div>
             </div>
           </div>
@@ -2043,24 +2203,7 @@
             <div class="test-r rv-c">
               <span class="test-n">test-quality</span>
               <div class="test-c">
-                <span class="test-b">35</span>
-                <div class="test-chk">
-                  <svg
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="3"
-                    stroke-linecap="round"
-                  >
-                    <polyline points="20 6 9 17 4 12" />
-                  </svg>
-                </div>
-              </div>
-            </div>
-            <div class="test-r rv-c">
-              <span class="test-n">test-eou</span>
-              <div class="test-c">
-                <span class="test-b">33</span>
+                <span class="test-b">PASS</span>
                 <div class="test-chk">
                   <svg
                     viewBox="0 0 24 24"
@@ -2077,7 +2220,7 @@
             <div class="test-r rv-c">
               <span class="test-n">test-pipeline</span>
               <div class="test-c">
-                <span class="test-b">35</span>
+                <span class="test-b">PASS</span>
                 <div class="test-chk">
                   <svg
                     viewBox="0 0 24 24"
@@ -2092,9 +2235,26 @@
               </div>
             </div>
             <div class="test-r rv-c">
-              <span class="test-n">test-new-modules</span>
+              <span class="test-n">test-sonata</span>
               <div class="test-c">
-                <span class="test-b">22</span>
+                <span class="test-b">PASS</span>
+                <div class="test-chk">
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="3"
+                    stroke-linecap="round"
+                  >
+                    <polyline points="20 6 9 17 4 12" />
+                  </svg>
+                </div>
+              </div>
+            </div>
+            <div class="test-r rv-c">
+              <span class="test-n">test-eou</span>
+              <div class="test-c">
+                <span class="test-b">PASS</span>
                 <div class="test-chk">
                   <svg
                     viewBox="0 0 24 24"
@@ -2111,7 +2271,7 @@
             <div class="test-r rv-c">
               <span class="test-n">test-conformer</span>
               <div class="test-c">
-                <span class="test-b">8</span>
+                <span class="test-b">PASS</span>
                 <div class="test-chk">
                   <svg
                     viewBox="0 0 24 24"
@@ -2126,9 +2286,9 @@
               </div>
             </div>
             <div class="test-r rv-c">
-              <span class="test-n">test-roundtrip</span>
+              <span class="test-n">test-sonata-storm</span>
               <div class="test-c">
-                <span class="test-b">7</span>
+                <span class="test-b">PASS</span>
                 <div class="test-chk">
                   <svg
                     viewBox="0 0 24 24"
@@ -2143,9 +2303,9 @@
               </div>
             </div>
             <div class="test-r rv-c">
-              <span class="test-n">test-bugfixes</span>
+              <span class="test-n">test-http-api</span>
               <div class="test-c">
-                <span class="test-b">6</span>
+                <span class="test-b">PASS</span>
                 <div class="test-chk">
                   <svg
                     viewBox="0 0 24 24"
@@ -2160,9 +2320,9 @@
               </div>
             </div>
             <div class="test-r rv-c">
-              <span class="test-n">bench-quality</span>
+              <span class="test-n">test-prosody-predict</span>
               <div class="test-c">
-                <span class="test-b">11</span>
+                <span class="test-b">PASS</span>
                 <div class="test-chk">
                   <svg
                     viewBox="0 0 24 24"
@@ -2175,6 +2335,45 @@
                   </svg>
                 </div>
               </div>
+            </div>
+            <div class="test-r rv-c">
+              <span class="test-n">test-conversation-memory</span>
+              <div class="test-c">
+                <span class="test-b">PASS</span>
+                <div class="test-chk">
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="3"
+                    stroke-linecap="round"
+                  >
+                    <polyline points="20 6 9 17 4 12" />
+                  </svg>
+                </div>
+              </div>
+            </div>
+            <div class="test-r rv-c">
+              <span class="test-n">test-audio-emotion</span>
+              <div class="test-c">
+                <span class="test-b">PASS</span>
+                <div class="test-chk">
+                  <svg
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="3"
+                    stroke-linecap="round"
+                  >
+                    <polyline points="20 6 9 17 4 12" />
+                  </svg>
+                </div>
+              </div>
+            </div>
+            <div class="test-r rv-c" style="justify-content: center">
+              <span class="test-n" style="color: var(--gray-500)"
+                >+ 20 more suites</span
+              >
             </div>
           </div>
         </div>

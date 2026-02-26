@@ -9,7 +9,8 @@
  * reclaim space once ALL consumers have advanced past it.
  *
  * Uses the VM-mirrored ring buffer (vm_ring.h) as the backing store
- * for zero-copy wraparound reads.
+ * for zero-copy wraparound reads (mach_vm_remap double-maps same
+ * physical pages, so reads near the wrap boundary are contiguous).
  */
 
 #ifndef SPMC_RING_H
@@ -19,6 +20,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include "vm_ring.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -40,12 +42,12 @@ typedef struct {
     } consumers[SPMC_MAX_CONSUMERS];
 
     int n_consumers;
-    void *backing;           /* raw allocation for cleanup */
+    VMRingBuffer vm_backing;  /* VM-mirrored backing store */
 } SPMCRing;
 
 /**
- * Create a SPMC ring buffer.
- * @param n_floats      Desired capacity (rounded up to power-of-two)
+ * Create a SPMC ring buffer backed by mach_vm_remap mirrored pages.
+ * @param n_floats      Desired capacity (rounded up to power-of-two, page-aligned)
  * @param n_consumers   Number of consumers (max SPMC_MAX_CONSUMERS)
  * @return 0 on success, -1 on failure
  */
@@ -55,17 +57,12 @@ static inline int spmc_create(SPMCRing *ring, uint32_t n_floats, int n_consumers
 
     memset(ring, 0, sizeof(SPMCRing));
 
-    /* Round up to power of two */
-    uint32_t po2 = 1;
-    while (po2 < n_floats) po2 <<= 1;
+    /* vm_ring_create handles power-of-two rounding and page alignment */
+    if (vm_ring_create(&ring->vm_backing, n_floats) != 0) return -1;
 
-    /* Allocate 2x for simple wraparound (software mirroring fallback) */
-    ring->backing = calloc(po2 * 2, sizeof(float));
-    if (!ring->backing) return -1;
-
-    ring->buffer = (float *)ring->backing;
-    ring->size = po2;
-    ring->mask = po2 - 1;
+    ring->buffer = ring->vm_backing.buffer;
+    ring->size = ring->vm_backing.size;
+    ring->mask = ring->vm_backing.mask;
     ring->n_consumers = n_consumers;
     atomic_store(&ring->head, 0);
 
@@ -80,7 +77,7 @@ static inline int spmc_create(SPMCRing *ring, uint32_t n_floats, int n_consumers
 static inline void spmc_destroy(SPMCRing *ring)
 {
     if (!ring) return;
-    free(ring->backing);
+    vm_ring_destroy(&ring->vm_backing);
     memset(ring, 0, sizeof(SPMCRing));
 }
 
@@ -102,11 +99,14 @@ static inline uint32_t spmc_available_write(const SPMCRing *ring)
 {
     uint64_t h = atomic_load_explicit(&ring->head, memory_order_relaxed);
     uint64_t mt = spmc_min_tail(ring);
+    if (h < mt) return 0; /* Guard against underflow under race conditions */
     return ring->size - (uint32_t)(h - mt);
 }
 
 /**
  * Producer: write data into ring.
+ * With VM mirroring, a single memcpy always works — the hardware page table
+ * makes the second half alias the first, so wraparound is transparent.
  * @return 0 on success, -1 if would overrun slowest consumer
  */
 static inline int spmc_write(SPMCRing *ring, const float *data, uint32_t count)
@@ -115,23 +115,9 @@ static inline int spmc_write(SPMCRing *ring, const float *data, uint32_t count)
 
     uint64_t h = atomic_load_explicit(&ring->head, memory_order_relaxed);
     uint32_t offset = (uint32_t)(h & ring->mask);
-    uint32_t first = ring->size - offset;
 
-    if (first >= count) {
-        memcpy(ring->buffer + offset, data, (size_t)count * sizeof(float));
-        /* Always mirror to second half so consumers reading near the
-           boundary via spmc_peek() see contiguous data */
-        memcpy(ring->buffer + ring->size + offset, data,
-               (size_t)count * sizeof(float));
-    } else {
-        /* Write wraps around the primary region */
-        memcpy(ring->buffer + offset, data, (size_t)first * sizeof(float));
-        memcpy(ring->buffer, data + first, (size_t)(count - first) * sizeof(float));
-        /* Mirror both parts into the second half */
-        memcpy(ring->buffer + ring->size + offset, data, (size_t)first * sizeof(float));
-        memcpy(ring->buffer + ring->size, data + first,
-               (size_t)(count - first) * sizeof(float));
-    }
+    /* Single contiguous write — VM mirror handles wraparound transparently */
+    memcpy(ring->buffer + offset, data, (size_t)count * sizeof(float));
 
     atomic_store_explicit(&ring->head, h + count, memory_order_release);
     return 0;
@@ -149,6 +135,7 @@ static inline uint32_t spmc_available_read(const SPMCRing *ring, int consumer_id
 /**
  * Consumer: read data from ring.
  * Each consumer reads independently at its own pace.
+ * With VM mirroring, a single memcpy always works.
  * @return 0 on success, -1 if insufficient data
  */
 static inline int spmc_read(SPMCRing *ring, int consumer_id, float *out, uint32_t count)
@@ -159,14 +146,9 @@ static inline int spmc_read(SPMCRing *ring, int consumer_id, float *out, uint32_
     uint64_t t = atomic_load_explicit(&ring->consumers[consumer_id].tail,
                                        memory_order_relaxed);
     uint32_t offset = (uint32_t)(t & ring->mask);
-    uint32_t first = ring->size - offset;
 
-    if (first >= count) {
-        memcpy(out, ring->buffer + offset, (size_t)count * sizeof(float));
-    } else {
-        memcpy(out, ring->buffer + offset, (size_t)first * sizeof(float));
-        memcpy(out + first, ring->buffer, (size_t)(count - first) * sizeof(float));
-    }
+    /* Single contiguous read — VM mirror handles wraparound transparently */
+    memcpy(out, ring->buffer + offset, (size_t)count * sizeof(float));
 
     atomic_store_explicit(&ring->consumers[consumer_id].tail, t + count,
                            memory_order_release);

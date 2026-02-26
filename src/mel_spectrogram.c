@@ -35,9 +35,8 @@ struct MelSpectrogram {
     float *mel_bank;        /* Mel filterbank [n_mels * n_bins] where n_bins = n_fft/2 + 1 */
     int    n_bins;          /* n_fft / 2 + 1 */
 
-    /* vDSP FFT */
-    FFTSetup fft_setup;
-    int fft_log2n;
+    /* vDSP DFT (modern API, replaces deprecated FFTSetup) */
+    vDSP_DFT_Setup dft_setup;
     DSPSplitComplex fft_split;
     float *fft_real;        /* [n_fft / 2] */
     float *fft_imag;        /* [n_fft / 2] */
@@ -51,6 +50,14 @@ struct MelSpectrogram {
     float *windowed;        /* [n_fft] */
     float *power_spec;      /* [n_bins] */
     float *mel_frame;       /* [n_mels] */
+
+    /* Pre-emphasis state */
+    float preemph_last;     /* Last sample from previous call (for streaming) */
+    int   preemph_init;     /* 1 if preemph_last has been initialized */
+
+    /* Pre-allocated pre-emphasis buffer (avoids malloc per mel_process call) */
+    float *preemph_buf;
+    int    preemph_cap;
 };
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -72,55 +79,54 @@ static float mel_to_hz(float mel) {
  * Output: row-major matrix [n_mels, n_bins].
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-static void build_mel_filterbank(float *bank, int n_mels, int n_fft,
-                                  int sample_rate, float fmin, float fmax) {
+static int build_mel_filterbank(float *bank, int n_mels, int n_fft,
+                                 int sample_rate, float fmin, float fmax,
+                                 int slaney_norm) {
     int n_bins = n_fft / 2 + 1;
     float mel_min = hz_to_mel(fmin);
     float mel_max = hz_to_mel(fmax);
 
-    /* n_mels + 2 equally-spaced points in mel scale */
     int n_pts = n_mels + 2;
-    float *mel_pts = (float *)malloc(n_pts * sizeof(float));
-    float *hz_pts  = (float *)malloc(n_pts * sizeof(float));
-    int   *bin_pts = (int *)malloc(n_pts * sizeof(int));
-
-    for (int i = 0; i < n_pts; i++) {
-        mel_pts[i] = mel_min + (mel_max - mel_min) * i / (n_pts - 1);
-        hz_pts[i]  = mel_to_hz(mel_pts[i]);
-        bin_pts[i] = (int)floorf((n_fft + 1) * hz_pts[i] / sample_rate);
+    float *mel_f = (float *)malloc(n_pts * sizeof(float));
+    float *fft_freqs = (float *)malloc(n_bins * sizeof(float));
+    if (!mel_f || !fft_freqs) {
+        free(mel_f);
+        free(fft_freqs);
+        return -1;
     }
+
+    for (int i = 0; i < n_pts; i++)
+        mel_f[i] = mel_to_hz(mel_min + (mel_max - mel_min) * i / (n_pts - 1));
+    for (int k = 0; k < n_bins; k++)
+        fft_freqs[k] = (float)k * (float)sample_rate / (float)n_fft;
 
     memset(bank, 0, (size_t)n_mels * n_bins * sizeof(float));
 
     for (int m = 0; m < n_mels; m++) {
-        int left   = bin_pts[m];
-        int center = bin_pts[m + 1];
-        int right  = bin_pts[m + 2];
+        float f_left   = mel_f[m];
+        float f_center = mel_f[m + 1];
+        float f_right  = mel_f[m + 2];
 
-        /* Rising slope */
-        for (int k = left; k < center && k < n_bins; k++) {
-            if (center > left)
-                bank[m * n_bins + k] = (float)(k - left) / (center - left);
+        for (int k = 0; k < n_bins; k++) {
+            float freq = fft_freqs[k];
+            if (freq >= f_left && freq <= f_center && f_center > f_left)
+                bank[m * n_bins + k] = (freq - f_left) / (f_center - f_left);
+            else if (freq > f_center && freq <= f_right && f_right > f_center)
+                bank[m * n_bins + k] = (f_right - freq) / (f_right - f_center);
         }
-        /* Falling slope */
-        for (int k = center; k < right && k < n_bins; k++) {
-            if (right > center)
-                bank[m * n_bins + k] = (float)(right - k) / (right - center);
-        }
-    }
 
-    /* Slaney-style normalization: scale each filter by 2 / (hz_right - hz_left) */
-    for (int m = 0; m < n_mels; m++) {
-        float width = hz_pts[m + 2] - hz_pts[m];
-        if (width > 0.0f) {
-            float scale = 2.0f / width;
-            vDSP_vsmul(bank + m * n_bins, 1, &scale, bank + m * n_bins, 1, n_bins);
+        if (slaney_norm) {
+            float width = f_right - f_left;
+            if (width > 0.0f) {
+                float scale = 2.0f / width;
+                vDSP_vsmul(bank + m * n_bins, 1, &scale, bank + m * n_bins, 1, n_bins);
+            }
         }
     }
 
-    free(mel_pts);
-    free(hz_pts);
-    free(bin_pts);
+    free(mel_f);
+    free(fft_freqs);
+    return 0;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -135,7 +141,10 @@ void mel_config_default(MelConfig *cfg) {
     cfg->n_mels      = 80;
     cfg->fmin         = 0.0f;
     cfg->fmax         = 0.0f;  /* 0 → use sample_rate / 2 */
-    cfg->log_floor    = 1e-6f;
+    cfg->log_floor    = 5.96046448e-8f;
+    cfg->preemph      = 0.0f;
+    cfg->slaney_norm  = 1;
+    cfg->periodic_window = 0;
 }
 
 MelSpectrogram *mel_create(const MelConfig *cfg) {
@@ -156,23 +165,29 @@ MelSpectrogram *mel_create(const MelConfig *cfg) {
     int n_fft = mel->cfg.n_fft;
     mel->n_bins = n_fft / 2 + 1;
 
-    /* Hann window */
+    /* Hann window — symmetric, matching NeMo / librosa / PyTorch(periodic=False).
+       vDSP_HANN_NORM scales to unit energy which inflates the power spectrum by 8/3;
+       compute the standard formula directly instead. */
     mel->window = (float *)malloc(cfg->win_length * sizeof(float));
     if (!mel->window) goto fail;
-    vDSP_hann_window(mel->window, cfg->win_length, vDSP_HANN_NORM);
+    {
+        float denom = cfg->periodic_window ? (float)cfg->win_length : (float)(cfg->win_length - 1);
+        for (int i = 0; i < cfg->win_length; i++)
+            mel->window[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / denom));
+    }
 
     /* Mel filterbank */
     mel->mel_bank = (float *)calloc((size_t)mel->cfg.n_mels * mel->n_bins, sizeof(float));
     if (!mel->mel_bank) goto fail;
-    build_mel_filterbank(mel->mel_bank, mel->cfg.n_mels, n_fft,
-                         mel->cfg.sample_rate, mel->cfg.fmin, mel->cfg.fmax);
+    if (build_mel_filterbank(mel->mel_bank, mel->cfg.n_mels, n_fft,
+                             mel->cfg.sample_rate, mel->cfg.fmin, mel->cfg.fmax,
+                             mel->cfg.slaney_norm) != 0) {
+        goto fail;
+    }
 
-    /* vDSP FFT setup */
-    int log2n = 0, tmp = n_fft;
-    while (tmp > 1) { tmp >>= 1; log2n++; }
-    mel->fft_log2n = log2n;
-    mel->fft_setup = vDSP_create_fftsetup(log2n, kFFTRadix2);
-    if (!mel->fft_setup) goto fail;
+    /* vDSP DFT setup (modern API — better AMX scheduling, non-power-of-2 support) */
+    mel->dft_setup = vDSP_DFT_zrop_CreateSetup(NULL, n_fft, vDSP_DFT_FORWARD);
+    if (!mel->dft_setup) goto fail;
 
     mel->fft_real = (float *)calloc(n_fft / 2, sizeof(float));
     mel->fft_imag = (float *)calloc(n_fft / 2, sizeof(float));
@@ -201,7 +216,7 @@ fail:
 
 void mel_destroy(MelSpectrogram *mel) {
     if (!mel) return;
-    if (mel->fft_setup) vDSP_destroy_fftsetup(mel->fft_setup);
+    if (mel->dft_setup) vDSP_DFT_DestroySetup(mel->dft_setup);
     free(mel->window);
     free(mel->mel_bank);
     free(mel->fft_real);
@@ -210,6 +225,7 @@ void mel_destroy(MelSpectrogram *mel) {
     free(mel->windowed);
     free(mel->power_spec);
     free(mel->mel_frame);
+    free(mel->preemph_buf);
     free(mel);
 }
 
@@ -234,29 +250,30 @@ static void extract_one_frame(MelSpectrogram *mel, const float *pcm_frame) {
     memset(mel->windowed, 0, n_fft * sizeof(float));
     vDSP_vmul(pcm_frame, 1, mel->window, 1, mel->windowed, 1, win_length);
 
-    /* 2. Pack into split complex for vDSP real FFT */
+    /* 2. Pack into split complex for vDSP real DFT */
     vDSP_ctoz((const DSPComplex *)mel->windowed, 2,
               &mel->fft_split, 1, n_fft / 2);
 
-    /* 3. Forward real FFT (in-place) */
-    vDSP_fft_zrip(mel->fft_setup, &mel->fft_split, 1,
-                  mel->fft_log2n, kFFTDirection_Forward);
+    /* 3. Forward real DFT (in-place via modern vDSP_DFT API) */
+    vDSP_DFT_Execute(mel->dft_setup,
+                     mel->fft_split.realp, mel->fft_split.imagp,
+                     mel->fft_split.realp, mel->fft_split.imagp);
 
     /* 4. Power spectrum: |X[k]|^2 = real^2 + imag^2
      *    Bin 0 (DC) and bin N/2 (Nyquist) are packed in realp[0] and imagp[0]. */
     float dc_power  = mel->fft_split.realp[0] * mel->fft_split.realp[0];
     float nyq_power = mel->fft_split.imagp[0] * mel->fft_split.imagp[0];
 
-    /* Bins 1..N/2-1 */
-    vDSP_zvmags(&mel->fft_split, 1, mel->power_spec + 1, 1, n_fft / 2 - 1);
+    /* Bins 1..N/2-1: offset past the packed DC/Nyquist at index 0 */
+    DSPSplitComplex bins_offset = { mel->fft_split.realp + 1, mel->fft_split.imagp + 1 };
+    vDSP_zvmags(&bins_offset, 1, mel->power_spec + 1, 1, n_fft / 2 - 1);
 
     /* Fixup DC and Nyquist */
     mel->power_spec[0]          = dc_power;
     mel->power_spec[n_bins - 1] = nyq_power;
 
-    /* Scale factor for vDSP FFT normalization: 1/(2N)^2 → 1/(4N^2) */
-    float fft_scale = 1.0f / ((float)n_fft * (float)n_fft * 0.25f);
-    vDSP_vsmul(mel->power_spec, 1, &fft_scale, mel->power_spec, 1, n_bins);
+    /* vDSP_DFT_Execute (modern API) returns correctly-scaled results —
+       no additional scaling needed. */
 
     /* 5. Mel filterbank: mel_frame = mel_bank @ power_spec
      *    mel_bank is [n_mels, n_bins], power_spec is [n_bins], output is [n_mels]
@@ -267,12 +284,9 @@ static void extract_one_frame(MelSpectrogram *mel, const float *pcm_frame) {
                 mel->power_spec, 1,
                 0.0f, mel->mel_frame, 1);
 
-    /* 6. Log mel: clamp floor, then natural log (matching NeMo convention) */
-    float floor_val = mel->cfg.log_floor;
-    for (int i = 0; i < n_mels; i++) {
-        if (mel->mel_frame[i] < floor_val)
-            mel->mel_frame[i] = floor_val;
-    }
+    /* 6. Log mel: log(mel + eps), NeMo default log_zero_guard_value = 2^-24 */
+    float eps = mel->cfg.log_floor;
+    vDSP_vsadd(mel->mel_frame, 1, &eps, mel->mel_frame, 1, n_mels);
     int n = n_mels;
     vvlogf(mel->mel_frame, mel->mel_frame, &n);
 }
@@ -287,17 +301,45 @@ int mel_process(MelSpectrogram *mel, const float *pcm, int n_samples,
     int n_mels = mel->cfg.n_mels;
     int frames_out = 0;
 
-    /* Append new PCM to accumulator */
+    /* Apply pre-emphasis: y[t] = x[t] - coeff * x[t-1] (using pre-allocated buffer) */
+    const float *src = pcm;
+    if (mel->cfg.preemph > 0.0f) {
+        if (n_samples > mel->preemph_cap) {
+            free(mel->preemph_buf);
+            mel->preemph_cap = n_samples + mel->cfg.sample_rate;
+            mel->preemph_buf = (float *)malloc(mel->preemph_cap * sizeof(float));
+            if (!mel->preemph_buf) { mel->preemph_cap = 0; return -1; }
+        }
+        float prev = mel->preemph_init ? mel->preemph_last : pcm[0];
+        float coeff = mel->cfg.preemph;
+        for (int i = 0; i < n_samples; i++) {
+            mel->preemph_buf[i] = pcm[i] - coeff * prev;
+            prev = pcm[i];
+        }
+        mel->preemph_last = pcm[n_samples - 1];
+        mel->preemph_init = 1;
+        src = mel->preemph_buf;
+    }
+
+    /* Center padding: on first call, prepend n_fft/2 zeros (matches torch.stft center=True) */
+    int center_pad = 0;
+    if (mel->pcm_len == 0)
+        center_pad = mel->cfg.n_fft / 2;
+
+    int total_new = center_pad + n_samples;
     int space = mel->pcm_cap - mel->pcm_len;
-    if (n_samples > space) {
-        /* Grow buffer */
-        int new_cap = mel->pcm_len + n_samples + mel->cfg.sample_rate;
+    if (total_new > space) {
+        int new_cap = mel->pcm_len + total_new + mel->cfg.sample_rate;
         float *new_buf = (float *)realloc(mel->pcm_buf, new_cap * sizeof(float));
         if (!new_buf) return -1;
         mel->pcm_buf = new_buf;
         mel->pcm_cap = new_cap;
     }
-    memcpy(mel->pcm_buf + mel->pcm_len, pcm, n_samples * sizeof(float));
+    if (center_pad > 0) {
+        memset(mel->pcm_buf + mel->pcm_len, 0, center_pad * sizeof(float));
+        mel->pcm_len += center_pad;
+    }
+    memcpy(mel->pcm_buf + mel->pcm_len, src, n_samples * sizeof(float));
     mel->pcm_len += n_samples;
 
     /* Extract frames: need at least win_length samples per frame */
@@ -323,6 +365,8 @@ int mel_process(MelSpectrogram *mel, const float *pcm, int n_samples,
 void mel_reset(MelSpectrogram *mel) {
     if (!mel) return;
     mel->pcm_len = 0;
+    mel->preemph_last = 0.0f;
+    mel->preemph_init = 0;
 }
 
 int mel_n_mels(const MelSpectrogram *mel) {

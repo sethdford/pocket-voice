@@ -6,15 +6,31 @@ pocket-voice
 
 # Rust
 src/stt/target/
-src/tts/target/
+src/llm/target/
+src/mimi_lite_tts/target/
+src/sonata_lm/target/
+src/sonata_flow/target/
+src/sonata_storm/target/
+src/local_llm/target/
+
+# Build outputs
+gen_wav
+gen_wav_dbg.dSYM/
+bench_output/
+tests/test_full
 
 # Model files
+models/
 *.cstt
 *.vocab
 
 # Python
 .venv/
+.venv312/
 __pycache__/
+
+# Test audio files (generated, not source)
+test_speech_*.wav
 
 # macOS
 .DS_Store
@@ -22,3 +38,14 @@ __pycache__/
 # IDE
 .vscode/
 .idea/
+models/*.arpa
+models/*.bin
+third_party/
+
+# Training artifacts
+train/
+*.pt
+*.safetensors
+*.ckpt
+wandb/
+tensorboard/

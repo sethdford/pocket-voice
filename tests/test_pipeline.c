@@ -151,6 +151,35 @@ static void test_sentence_buffer(void) {
 
     sentbuf_destroy(sb);
 
+    /* Eager flush: fires before sentence boundary */
+    sb = sentbuf_create(SENTBUF_MODE_SENTENCE, 5);
+    sentbuf_set_eager(sb, 4);
+    sentbuf_add(sb, "One two three four five six", 27);
+    ASSERT_INT_EQ(sentbuf_has_segment(sb), 1);
+    sentbuf_flush(sb, out, sizeof(out));
+    printf("  eager-flush: \"%s\"\n", out);
+
+    /* Sentence boundary flushes and disables eager mode */
+    sentbuf_add(sb, " seven.", 7);
+    ASSERT_INT_EQ(sentbuf_has_segment(sb), 1);
+    sentbuf_flush(sb, out, sizeof(out));
+    ASSERT_STR_EQ(out, "six seven.");
+    printf("  post-sentence: \"%s\"\n", out);
+
+    /* After sentence boundary, eager is disabled — 5 words don't trigger */
+    sentbuf_add(sb, "Aa bb cc dd ee", 14);
+    ASSERT_INT_EQ(sentbuf_has_segment(sb), 0);
+    sentbuf_flush_all(sb, out, sizeof(out)); /* drain */
+
+    /* Reset re-arms eager for next turn */
+    sentbuf_reset(sb);
+    sentbuf_set_eager(sb, 4);
+    sentbuf_add(sb, "Alpha beta gamma delta", 22);
+    ASSERT_INT_EQ(sentbuf_has_segment(sb), 1);
+    sentbuf_flush(sb, out, sizeof(out));
+    printf("  re-armed: \"%s\"\n", out);
+    sentbuf_destroy(sb);
+
     /* Speculative mode */
     sb = sentbuf_create(SENTBUF_MODE_SPECULATIVE, 3);
     sentbuf_add(sb, "One two three, four five. ", 25);
@@ -217,6 +246,31 @@ static void test_ssml_parser(void) {
     ASSERT_INT_EQ(ssml_is_ssml("plain text"), 0);
     ASSERT_INT_EQ(ssml_is_ssml("<?xml version=\"1.0\"?><speak>hi</speak>"), 1);
 
+    /* <spell> tag */
+    n = ssml_parse("<speak>Code <spell>ABC</spell> is active</speak>",
+                   segs, SSML_MAX_SEGMENTS);
+    {
+        int found_spelled = 0;
+        for (int i = 0; i < n; i++) {
+            if (strstr(segs[i].text, "A B C")) found_spelled = 1;
+        }
+        ASSERT_INT_EQ(found_spelled, 1);
+        printf("  <spell>ABC</spell> → \"%s\" ✓\n",
+               found_spelled ? "A B C" : "(not found)");
+    }
+
+    /* <spell> with digits */
+    n = ssml_parse("<speak>PIN <spell>1234</spell></speak>",
+                   segs, SSML_MAX_SEGMENTS);
+    {
+        int found_spelled = 0;
+        for (int i = 0; i < n; i++) {
+            if (strstr(segs[i].text, "one two three four")) found_spelled = 1;
+        }
+        ASSERT_INT_EQ(found_spelled, 1);
+        printf("  <spell>1234</spell> → digits spelled ✓\n");
+    }
+
     /* Prosody parsers */
     float rate;
     rate = ssml_parse_rate("slow");
@@ -240,10 +294,65 @@ static void test_ssml_parser(void) {
            tests_passed - prev_passed, tests_run - prev_run);
 }
 
+static void test_nonverbalisms_extended(void) {
+    int prev_passed = tests_passed, prev_run = tests_run;
+    printf("=== nonverbalisms (extended) ===\n");
+
+    char out[8192];
+
+    text_expand_nonverbalisms("[cough] excuse me", out, sizeof(out));
+    ASSERT_INT_EQ(strstr(out, "<break") != NULL, 1);
+    printf("  [cough] → break tags ✓\n");
+
+    text_expand_nonverbalisms("I'm [yawn] tired", out, sizeof(out));
+    ASSERT_INT_EQ(strstr(out, "tired") != NULL, 1);
+    printf("  [yawn] → emotion + break ✓\n");
+
+    text_expand_nonverbalisms("[hmm] let me think", out, sizeof(out));
+    ASSERT_INT_EQ(strstr(out, "<break") != NULL, 1);
+    printf("  [hmm] → break + serious ✓\n");
+
+    text_expand_nonverbalisms("[applause] Thank you!", out, sizeof(out));
+    ASSERT_INT_EQ(strstr(out, "<break") != NULL, 1);
+    printf("  [applause] → long break ✓\n");
+
+    text_expand_nonverbalisms("[crying] I miss you", out, sizeof(out));
+    ASSERT_INT_EQ(strstr(out, "sad") != NULL, 1);
+    printf("  [crying] → sad emotion ✓\n");
+
+    text_expand_nonverbalisms("[chuckle] that's funny", out, sizeof(out));
+    ASSERT_INT_EQ(strstr(out, "amused") != NULL, 1);
+    printf("  [chuckle] → amused emotion ✓\n");
+
+    text_expand_nonverbalisms("[clears throat] anyway", out, sizeof(out));
+    ASSERT_INT_EQ(strstr(out, "<break") != NULL, 1);
+    printf("  [clears throat] → break tags ✓\n");
+
+    text_expand_nonverbalisms("[shout]Hey![/shout]", out, sizeof(out));
+    ASSERT_INT_EQ(strstr(out, "emphatic") != NULL, 1);
+    printf("  [shout]...[/shout] → emphatic emotion ✓\n");
+
+    text_expand_nonverbalisms("[groan] not again", out, sizeof(out));
+    ASSERT_INT_EQ(strstr(out, "tired") != NULL, 1);
+    printf("  [groan] → tired emotion ✓\n");
+
+    text_expand_nonverbalisms("[sniff] it's okay", out, sizeof(out));
+    ASSERT_INT_EQ(strstr(out, "sad") != NULL, 1);
+    printf("  [sniff] → sad emotion ✓\n");
+
+    text_expand_nonverbalisms("[um] I don't know", out, sizeof(out));
+    ASSERT_INT_EQ(strstr(out, "<break") != NULL, 1);
+    printf("  [um] → break (hesitation) ✓\n");
+
+    printf("  nonverbalisms extended: %d/%d passed\n\n",
+           tests_passed - prev_passed, tests_run - prev_run);
+}
+
 int main(void) {
     test_text_normalize();
     test_sentence_buffer();
     test_ssml_parser();
+    test_nonverbalisms_extended();
 
     printf("═══════════════════════════\n");
     printf("Total: %d/%d tests passed\n", tests_passed, tests_run);
