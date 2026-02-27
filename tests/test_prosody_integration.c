@@ -317,6 +317,266 @@ static void test_prosody_boost_math(void) {
          "pitch boost: 0.92 × 1.2 deviation = 0.904");
 }
 
+/* ── Multi-Sentence Emotion Transitions ───────────────────────────────────── */
+
+static void test_multi_sentence_emotions(void) {
+    printf("\n=== Multi-Sentence: Emotion Transitions ===\n");
+
+    /* Happy → Sad transition */
+    EmotionDetection det1 = prosody_detect_emotion("That is wonderful news!");
+    EmotionDetection det2 = prosody_detect_emotion("But unfortunately it didn't last.");
+
+    TEST(det1.emotion != det2.emotion || det1.confidence != det2.confidence,
+         "different sentences produce different emotion signals");
+    TEST(det1.emotion == EMOTION_HAPPY || det1.emotion == EMOTION_EXCITED,
+         "wonderful → happy/excited");
+    TEST(det2.emotion == EMOTION_SAD || det2.emotion == EMOTION_NEUTRAL,
+         "unfortunately → sad/neutral");
+
+    /* Neutral → Surprised → Angry sequence */
+    EmotionDetection seq[3];
+    seq[0] = prosody_detect_emotion("The report is on the table.");
+    seq[1] = prosody_detect_emotion("Wait, WHAT?! That's incredible!");
+    seq[2] = prosody_detect_emotion("I am absolutely furious about this!");
+
+    TEST(seq[0].emotion == EMOTION_NEUTRAL, "report sentence → neutral");
+    TEST(seq[1].emotion != EMOTION_NEUTRAL, "WHAT?! → non-neutral");
+    TEST(seq[2].emotion == EMOTION_ANGRY || seq[2].emotion != EMOTION_NEUTRAL,
+         "furious → angry/non-neutral");
+
+    /* Verify prosody hints change with emotion */
+    TEST(seq[0].hint.pitch != seq[2].hint.pitch ||
+         seq[0].hint.rate != seq[2].hint.rate ||
+         seq[0].hint.energy != seq[2].hint.energy,
+         "different emotions produce different prosody hints");
+}
+
+/* ── Prosody Parameter Range Validation ──────────────────────────────────── */
+
+static void test_prosody_param_ranges(void) {
+    printf("\n=== Prosody Parameter Ranges ===\n");
+
+    /* Test that analyze_text produces in-range parameters */
+    const char *test_texts[] = {
+        "Hello there.",
+        "How are you doing today?",
+        "THAT IS AMAZING!!!",
+        "I need apples, bananas, and oranges.",
+        "Unfortunately, it failed miserably.",
+        "Stop right now!",
+        NULL
+    };
+
+    for (int t = 0; test_texts[t]; t++) {
+        MultiScaleProsody msp = prosody_analyze_text(test_texts[t]);
+
+        /* Utterance-level pitch should be reasonable */
+        TEST(msp.utterance.pitch >= 0.5f && msp.utterance.pitch <= 2.0f,
+             "utterance pitch in [0.5, 2.0]");
+
+        /* Rate should be reasonable */
+        TEST(msp.utterance.rate >= 0.5f && msp.utterance.rate <= 2.0f,
+             "utterance rate in [0.5, 2.0]");
+
+        /* Energy is a dB offset, typically [-6, +6] */
+        TEST(msp.utterance.energy >= -10.0f && msp.utterance.energy <= 10.0f,
+             "utterance energy in [-10, 10]");
+
+        /* Contour should be a valid enum */
+        TEST(msp.contour >= PROSODY_CONTOUR_DECLARATIVE &&
+             msp.contour <= PROSODY_CONTOUR_LIST,
+             "contour is valid enum value");
+
+        /* n_words in [0, 64] */
+        TEST(msp.n_words >= 0 && msp.n_words <= 64,
+             "n_words in [0, 64]");
+
+        /* Per-word hints in range */
+        for (int w = 0; w < msp.n_words; w++) {
+            TEST(msp.word_hints[w].pitch >= 0.0f && msp.word_hints[w].pitch <= 3.0f,
+                 "word pitch in [0, 3]");
+            TEST(msp.word_hints[w].rate >= 0.0f && msp.word_hints[w].rate <= 3.0f,
+                 "word rate in [0, 3]");
+            TEST(msp.emphasis_mask[w] == 0 || msp.emphasis_mask[w] == 1,
+                 "emphasis_mask is 0 or 1");
+        }
+    }
+}
+
+/* ── Full Pipeline with Multiple Emotion Types ────────────────────────────── */
+
+static void test_pipeline_varied_emotions(void) {
+    printf("\n=== Pipeline: Varied Emotion Types ===\n");
+
+    struct {
+        const char *text;
+        const char *label;
+    } cases[] = {
+        {"I'm so happy and grateful for this!", "happy text"},
+        {"That's terrifying and awful.", "fearful text"},
+        {"STOP DOING THAT RIGHT NOW!", "angry text"},
+        {"Well, this is quite ordinary.", "neutral text"},
+        {"Oh wow, I never expected that!", "surprised text"},
+        {NULL, NULL}
+    };
+
+    for (int i = 0; cases[i].text; i++) {
+        /* Emphasis prediction */
+        char emphasized[4096];
+        int n_emph = emphasis_predict(cases[i].text, emphasized, sizeof(emphasized));
+        TEST(n_emph >= 0, cases[i].label);
+
+        /* SSML parse */
+        SSMLSegment segments[SSML_MAX_SEGMENTS];
+        int nseg = ssml_parse(emphasized, segments, SSML_MAX_SEGMENTS);
+        TEST(nseg >= 1, "SSML parse succeeds");
+
+        /* Prosody analysis */
+        MultiScaleProsody msp = prosody_analyze_text(cases[i].text);
+        TEST(msp.n_words > 0, "words detected");
+
+        /* Emotion detection */
+        EmotionDetection det = prosody_detect_emotion(cases[i].text);
+        TEST(det.emotion >= 0 && det.emotion < EMOTION_COUNT, "valid emotion");
+        TEST(det.confidence >= 0.0f && det.confidence <= 1.0f, "valid confidence");
+
+        printf("    %s: emph=%d segs=%d words=%d emotion=%d conf=%.2f\n",
+               cases[i].label, n_emph, nseg, msp.n_words,
+               det.emotion, det.confidence);
+    }
+}
+
+/* ── Prosody Clamping: Boost Limits ──────────────────────────────────────── */
+
+static void test_prosody_clamping(void) {
+    printf("\n=== Prosody Clamping ===\n");
+
+    /* Boost should be clamped to [1.0, 1.3] */
+    float boost = 1.0f;
+
+    /* Simulate repeated low quality → boost escalation */
+    for (int i = 0; i < 20; i++) {
+        float quality = 0.3f;  /* always low */
+        if (quality < 0.7f) boost += 0.05f;
+        if (boost > 1.3f) boost = 1.3f;
+    }
+    TEST(fabsf(boost - 1.3f) < 0.01f, "boost caps at 1.3");
+
+    /* Apply max boost to extreme pitch */
+    float seg_pitch = 1.20f;
+    float boosted = 1.0f + (seg_pitch - 1.0f) * boost;
+    TEST(boosted >= 1.0f && boosted <= 1.5f, "boosted pitch in sane range");
+    printf("    pitch 1.20 × boost 1.3 → %.3f\n", boosted);
+
+    /* Apply to negative deviation */
+    seg_pitch = 0.80f;
+    boosted = 1.0f - (1.0f - seg_pitch) * boost;
+    TEST(boosted >= 0.5f && boosted <= 1.0f, "negative boosted pitch in sane range");
+    printf("    pitch 0.80 × boost 1.3 → %.3f\n", boosted);
+
+    /* Volume boost clamping */
+    float vol_db = 5.0f;
+    float boosted_vol = vol_db * boost;
+    TEST(boosted_vol <= 10.0f, "volume boost doesn't exceed 10 dB");
+
+    /* Zero deviation → no change regardless of boost */
+    seg_pitch = 1.0f;
+    boosted = 1.0f + (seg_pitch - 1.0f) * boost;
+    TEST(fabsf(boosted - 1.0f) < 0.001f, "zero deviation unaffected by boost");
+}
+
+/* ── Sentence Buffer to Full Pipeline: Multiple Sentences ─────────────────── */
+
+static void test_sentbuf_multi_sentence_pipeline(void) {
+    printf("\n=== SentBuf: Multi-Sentence Pipeline ===\n");
+
+    SentenceBuffer *sb = sentbuf_create(0, 3);
+    TEST(sb != NULL, "sentence buffer created");
+
+    /* Feed two sentences */
+    const char *stream[] = {
+        "I ", "am ", "really ", "happy ", "today. ",
+        "But ", "tomorrow ", "might ", "be ", "different."
+    };
+    for (int i = 0; i < 10; i++) {
+        sentbuf_add(sb, stream[i], (int)strlen(stream[i]));
+    }
+
+    /* Process all available segments */
+    char sentence[4096];
+    int seg_count = 0;
+    while (sentbuf_has_segment(sb)) {
+        int slen = sentbuf_flush(sb, sentence, sizeof(sentence));
+        if (slen <= 0) break;
+        seg_count++;
+
+        /* Run each through full pipeline */
+        char emphasized[4096];
+        emphasis_predict(sentence, emphasized, sizeof(emphasized));
+
+        SSMLSegment segments[SSML_MAX_SEGMENTS];
+        int nseg = ssml_parse(emphasized, segments, SSML_MAX_SEGMENTS);
+        TEST(nseg >= 1, "sentence produces SSML segments");
+
+        EmotionDetection det = prosody_detect_emotion(sentence);
+        TEST(det.emotion >= 0, "emotion detected for sentence");
+    }
+
+    /* Flush remaining */
+    int remaining = sentbuf_flush_all(sb, sentence, sizeof(sentence));
+    if (remaining > 0) {
+        seg_count++;
+        EmotionDetection det = prosody_detect_emotion(sentence);
+        TEST(det.emotion >= 0, "emotion detected for remaining text");
+    }
+
+    TEST(seg_count >= 1, "processed at least 1 segment from stream");
+    printf("    (total segments processed: %d)\n", seg_count);
+
+    sentbuf_destroy(sb);
+}
+
+/* ── Duration + Prosody Combined Validation ──────────────────────────────── */
+
+static void test_duration_prosody_combined(void) {
+    printf("\n=== Duration + Prosody Combined ===\n");
+
+    const char *text = "This is a test sentence with several words.";
+
+    /* Duration estimation */
+    float durations[256];
+    int n = prosody_estimate_durations(text, 64, durations, 256);
+    TEST(n == 64, "64 duration frames estimated");
+
+    /* All durations should be non-negative */
+    int all_valid = 1;
+    for (int i = 0; i < n; i++) {
+        if (durations[i] < 0.0f) { all_valid = 0; break; }
+    }
+    TEST(all_valid, "all durations non-negative");
+
+    /* Prosody analysis */
+    MultiScaleProsody msp = prosody_analyze_text(text);
+    TEST(msp.n_words > 0, "multi-scale words detected");
+
+    /* Emotion should be neutral for this bland text */
+    EmotionDetection det = prosody_detect_emotion(text);
+    TEST(det.emotion == EMOTION_NEUTRAL, "bland text → neutral emotion");
+
+    /* Conversational adaptation with the detected emotion's hint */
+    ConversationProsodyState state;
+    prosody_conversation_init(&state);
+    prosody_conversation_update(&state, 2.0f, 8, -20.0f, 150.0f);
+    ProsodyHint adapt = prosody_conversation_adapt(&state);
+
+    /* Combined: apply emotion hint and adaptation */
+    float final_pitch = det.hint.pitch * adapt.pitch;
+    float final_rate = det.hint.rate * adapt.rate;
+    TEST(final_pitch > 0.0f, "combined pitch positive");
+    TEST(final_rate > 0.0f, "combined rate positive");
+    printf("    combined: pitch=%.3f rate=%.3f\n", final_pitch, final_rate);
+}
+
 /* ── Main ─────────────────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -331,6 +591,14 @@ int main(void) {
     test_conversational_adaptation_pipeline();
     test_sentbuf_emphasis_chain();
     test_prosody_boost_math();
+
+    /* Extended tests */
+    test_multi_sentence_emotions();
+    test_prosody_param_ranges();
+    test_pipeline_varied_emotions();
+    test_prosody_clamping();
+    test_sentbuf_multi_sentence_pipeline();
+    test_duration_prosody_combined();
 
     printf("\n════════════════════════════════════════════\n");
     printf("  Results: %d passed, %d failed\n", pass_count, fail_count);

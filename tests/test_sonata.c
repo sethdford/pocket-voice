@@ -590,11 +590,423 @@ static void test_voice_cloning(void) {
     CHECK(1, "clear_speaker_embedding NULL is no-op");
 }
 
+/* ─── Test 13: iSTFT zero magnitude (silence) ───────────────────────────── */
+
+static void test_istft_zero_magnitude(void) {
+    printf("\n═══ Test 13: iSTFT zero magnitude → silence ═══\n");
+
+    int n_fft = 1024;
+    int hop = 480;
+    int n_bins = n_fft / 2 + 1;
+
+    SonataISTFT *dec = sonata_istft_create(n_fft, hop);
+    CHECK(dec != NULL, "iSTFT create for zero-mag test");
+
+    /* All-zero magnitude with arbitrary phases */
+    int n_frames = 10;
+    float *magnitudes = calloc(n_frames * n_bins, sizeof(float));
+    float *phases = calloc(n_frames * n_bins, sizeof(float));
+    float *audio = calloc(n_frames * hop, sizeof(float));
+
+    /* Set phases to non-zero to verify magnitude gates output */
+    for (int f = 0; f < n_frames; f++)
+        for (int b = 0; b < n_bins; b++)
+            phases[f * n_bins + b] = (float)(f * b) * 0.5f;
+
+    int total = sonata_istft_decode_batch(dec, magnitudes, phases, n_frames, audio);
+    CHECK(total == n_frames * hop, "zero-mag: correct sample count");
+
+    float rms = 0;
+    for (int i = 0; i < total; i++) rms += audio[i] * audio[i];
+    rms = sqrtf(rms / total);
+    CHECKF(rms < 1e-6f, "zero-mag RMS = %.2e (should be ~0)", rms);
+
+    sonata_istft_destroy(dec);
+    free(magnitudes);
+    free(phases);
+    free(audio);
+}
+
+/* ─── Test 14: iSTFT single frame decode ────────────────────────────────── */
+
+static void test_istft_single_frame(void) {
+    printf("\n═══ Test 14: iSTFT single frame decode ═══\n");
+
+    int n_fft = 1024;
+    int hop = 480;
+    int n_bins = n_fft / 2 + 1;
+
+    SonataISTFT *dec = sonata_istft_create(n_fft, hop);
+    CHECK(dec != NULL, "iSTFT create for single frame");
+
+    float magnitude[513], phase[513], audio[480];
+    memset(magnitude, 0, sizeof(magnitude));
+    memset(phase, 0, sizeof(phase));
+
+    /* Single 1kHz tone bin */
+    int bin_1k = (int)(1000.0f * n_fft / 24000.0f);
+    magnitude[bin_1k] = 5.0f;
+    phase[bin_1k] = 0.0f;
+
+    int ns = sonata_istft_decode_frame(dec, magnitude, phase, audio);
+    CHECK(ns == hop, "single frame returns hop_length samples");
+
+    /* Verify no NaN/Inf in output */
+    int has_nan = 0;
+    for (int i = 0; i < ns; i++) {
+        if (isnan(audio[i]) || isinf(audio[i])) { has_nan = 1; break; }
+    }
+    CHECK(!has_nan, "single frame output has no NaN/Inf");
+
+    sonata_istft_destroy(dec);
+}
+
+/* ─── Test 15: iSTFT very large magnitudes ──────────────────────────────── */
+
+static void test_istft_large_magnitude(void) {
+    printf("\n═══ Test 15: iSTFT large magnitude values ═══\n");
+
+    int n_fft = 1024;
+    int hop = 480;
+    int n_bins = n_fft / 2 + 1;
+
+    SonataISTFT *dec = sonata_istft_create(n_fft, hop);
+
+    float *mag = calloc(n_bins, sizeof(float));
+    float *phase = calloc(n_bins, sizeof(float));
+    float audio[480];
+
+    /* Fill with large magnitudes */
+    for (int b = 0; b < n_bins; b++) {
+        mag[b] = 1e6f;
+        phase[b] = 0.0f;
+    }
+
+    int ns = sonata_istft_decode_frame(dec, mag, phase, audio);
+    CHECK(ns == hop, "large-mag: returns correct sample count");
+
+    /* Check no NaN/Inf */
+    int ok = 1;
+    for (int i = 0; i < ns; i++) {
+        if (isnan(audio[i]) || isinf(audio[i])) { ok = 0; break; }
+    }
+    CHECK(ok, "large-mag: no NaN/Inf in output");
+
+    sonata_istft_destroy(dec);
+    free(mag);
+    free(phase);
+}
+
+/* ─── Test 16: iSTFT reset clears overlap ───────────────────────────────── */
+
+static void test_istft_reset(void) {
+    printf("\n═══ Test 16: iSTFT reset clears overlap state ═══\n");
+
+    int n_fft = 1024;
+    int hop = 480;
+    int n_bins = n_fft / 2 + 1;
+
+    SonataISTFT *dec = sonata_istft_create(n_fft, hop);
+
+    /* Decode a few frames to build up overlap state */
+    float *mag = calloc(n_bins, sizeof(float));
+    float *phase = calloc(n_bins, sizeof(float));
+    float audio_a[480], audio_b[480];
+
+    int bin_440 = (int)(440.0f * n_fft / 24000.0f);
+    mag[bin_440] = 10.0f;
+    phase[bin_440] = 1.5f;
+
+    sonata_istft_decode_frame(dec, mag, phase, audio_a);
+    sonata_istft_decode_frame(dec, mag, phase, audio_a);
+
+    /* Reset and decode fresh */
+    sonata_istft_reset(dec);
+
+    /* Decode same frame from clean state */
+    SonataISTFT *dec2 = sonata_istft_create(n_fft, hop);
+    float audio_fresh[480];
+
+    sonata_istft_decode_frame(dec, mag, phase, audio_b);
+    sonata_istft_decode_frame(dec2, mag, phase, audio_fresh);
+
+    /* After reset, output should match a fresh decoder */
+    float max_diff = 0;
+    for (int i = 0; i < hop; i++) {
+        float d = fabsf(audio_b[i] - audio_fresh[i]);
+        if (d > max_diff) max_diff = d;
+    }
+    CHECKF(max_diff < 1e-5f, "reset: max diff from fresh = %.2e (< 1e-5)", max_diff);
+
+    sonata_istft_destroy(dec);
+    sonata_istft_destroy(dec2);
+    free(mag);
+    free(phase);
+}
+
+/* ─── Test 17: iSTFT phase unwrapping correctness ───────────────────────── */
+
+static void test_istft_phase_unwrap(void) {
+    printf("\n═══ Test 17: iSTFT phase unwrapping correctness ═══\n");
+
+    int n_fft = 1024;
+    int hop = 480;
+    int n_bins = n_fft / 2 + 1;
+    int n_frames = 50;
+
+    SonataISTFT *dec = sonata_istft_create(n_fft, hop);
+
+    float *audio = calloc(n_frames * hop, sizeof(float));
+    float mag[513], ph[513];
+
+    /* 1kHz pure tone with linearly increasing phase (proper phase unwrap) */
+    float freq_hz = 1000.0f;
+    int bin = (int)(freq_hz * n_fft / 24000.0f);
+
+    for (int f = 0; f < n_frames; f++) {
+        memset(mag, 0, n_bins * sizeof(float));
+        memset(ph, 0, n_bins * sizeof(float));
+        mag[bin] = 10.0f;
+        /* Phase increments by 2*pi*freq*hop/sr per frame — the expected iSTFT phase */
+        ph[bin] = 2.0f * M_PI * freq_hz * (f + 1) * hop / 24000.0f;
+
+        float frame[480];
+        int ns = sonata_istft_decode_frame(dec, mag, ph, frame);
+        memcpy(audio + f * hop, frame, ns * sizeof(float));
+    }
+
+    /* Measure energy — should be significant for a pure tone */
+    float rms = 0;
+    for (int i = 0; i < n_frames * hop; i++) rms += audio[i] * audio[i];
+    rms = sqrtf(rms / (n_frames * hop));
+    CHECK(rms > 0.01f, "phase-unwrap: 1kHz tone has energy");
+
+    /* Check smoothness — derivative should be bounded for a pure tone */
+    float max_deriv = 0;
+    for (int i = 1; i < n_frames * hop; i++) {
+        float d = fabsf(audio[i] - audio[i - 1]);
+        if (d > max_deriv) max_deriv = d;
+    }
+    CHECK(max_deriv < 2.0f, "phase-unwrap: no harsh discontinuities");
+
+    sonata_istft_destroy(dec);
+    free(audio);
+}
+
+/* ─── SPM Tokenizer FFI (C API, used for round-trip tests) ──────────────── */
+
+typedef struct SPMTokenizer SPMTokenizer;
+extern SPMTokenizer *spm_create_from_vocab(const char **pieces,
+                                            const float *scores, int n_pieces);
+extern int spm_decode(const SPMTokenizer *tok, const int *ids, int n_ids,
+                      char *out_text, int out_cap);
+
+/* ─── Test 18: SPM encode/decode round-trip ─────────────────────────────── */
+
+static void test_spm_roundtrip(void) {
+    printf("\n═══ Test 18: SPM encode/decode round-trip ═══\n");
+
+    /* Build a synthetic vocabulary */
+    const char *pieces[] = {
+        "<unk>",          /* 0 = UNK */
+        "\xe2\x96\x81",  /* 1 = SP space marker (▁) */
+        "h", "e", "l", "o",  /* 2-5 */
+        "\xe2\x96\x81w", /* 6 = ▁w */
+        "or",             /* 7 */
+        "ld",             /* 8 */
+        "he",             /* 9 */
+        "ll",             /* 10 */
+        "\xe2\x96\x81hello", /* 11 = ▁hello */
+        "\xe2\x96\x81world", /* 12 = ▁world */
+    };
+    float scores[] = {
+        0.0f,    /* unk */
+        -1.0f,   /* space */
+        -3.0f,   /* h */
+        -3.0f,   /* e */
+        -3.0f,   /* l */
+        -3.0f,   /* o */
+        -2.5f,   /* ▁w */
+        -2.5f,   /* or */
+        -2.5f,   /* ld */
+        -2.0f,   /* he */
+        -2.0f,   /* ll */
+        -0.5f,   /* ▁hello */
+        -0.5f,   /* ▁world */
+    };
+    int n_pieces = sizeof(pieces) / sizeof(pieces[0]);
+
+    SPMTokenizer *tok = spm_create_from_vocab(pieces, scores, n_pieces);
+    CHECK(tok != NULL, "create_from_vocab succeeds");
+    if (!tok) return;
+
+    int vocab = spm_vocab_size(tok);
+    CHECKF(vocab == n_pieces, "vocab_size = %d (expected %d)", vocab, n_pieces);
+
+    /* Encode a simple string */
+    int ids[64];
+    int n = spm_encode(tok, "hello world", ids, 64);
+    CHECK(n > 0, "encode 'hello world' produces tokens");
+
+    /* Decode back */
+    char text[256];
+    int tlen = spm_decode(tok, ids, n, text, 256);
+    CHECK(tlen > 0, "decode produces text");
+
+    /* The decoded text should contain 'hello' and 'world' */
+    CHECK(strstr(text, "hello") != NULL, "round-trip contains 'hello'");
+    CHECK(strstr(text, "world") != NULL, "round-trip contains 'world'");
+    printf("    round-trip: '%s' → %d tokens → '%s'\n", "hello world", n, text);
+
+    spm_destroy(tok);
+}
+
+/* ─── Test 19: SPM empty string encoding ────────────────────────────────── */
+
+static void test_spm_empty_string(void) {
+    printf("\n═══ Test 19: SPM empty string encoding ═══\n");
+
+    const char *pieces[] = {"<unk>", "a", "b"};
+    float scores[] = {0.0f, -1.0f, -1.0f};
+    SPMTokenizer *tok = spm_create_from_vocab(pieces, scores, 3);
+    CHECK(tok != NULL, "create for empty-string test");
+    if (!tok) return;
+
+    int ids[64];
+    int n = spm_encode(tok, "", ids, 64);
+    CHECK(n == 0, "encode empty string → 0 tokens");
+
+    spm_destroy(tok);
+}
+
+/* ─── Test 20: SPM NULL safety ──────────────────────────────────────────── */
+
+static void test_spm_null_safety(void) {
+    printf("\n═══ Test 20: SPM NULL safety ═══\n");
+
+    /* create_from_vocab with NULL args */
+    SPMTokenizer *tok = spm_create_from_vocab(NULL, NULL, 0);
+    CHECK(tok == NULL, "create_from_vocab(NULL, NULL, 0) → NULL");
+
+    tok = spm_create_from_vocab(NULL, NULL, 5);
+    CHECK(tok == NULL, "create_from_vocab(NULL, NULL, 5) → NULL");
+
+    /* encode with NULL tokenizer */
+    int ids[8];
+    int n = spm_encode(NULL, "hello", ids, 8);
+    CHECK(n <= 0, "encode(NULL tok) returns <= 0");
+
+    /* decode with NULL tokenizer */
+    char buf[64];
+    int d = spm_decode(NULL, ids, 1, buf, 64);
+    CHECK(d == -1, "decode(NULL tok) returns -1");
+
+    /* encode with NULL text */
+    const char *p[] = {"<unk>", "a"};
+    float s[] = {0.0f, -1.0f};
+    tok = spm_create_from_vocab(p, s, 2);
+    if (tok) {
+        n = spm_encode(tok, NULL, ids, 8);
+        CHECK(n <= 0, "encode(NULL text) returns <= 0");
+        spm_destroy(tok);
+    }
+}
+
+/* ─── Test 21: SPM very long string ─────────────────────────────────────── */
+
+static void test_spm_long_string(void) {
+    printf("\n═══ Test 21: SPM very long string ═══\n");
+
+    const char *pieces[] = {
+        "<unk>", "a", "b", "c", " ",
+        "\xe2\x96\x81a", "\xe2\x96\x81b",
+    };
+    float scores[] = {0.0f, -1.0f, -1.0f, -1.0f, -2.0f, -0.5f, -0.5f};
+    int n_pieces = sizeof(pieces) / sizeof(pieces[0]);
+
+    SPMTokenizer *tok = spm_create_from_vocab(pieces, scores, n_pieces);
+    CHECK(tok != NULL, "create for long-string test");
+    if (!tok) return;
+
+    /* Build a 4000-char string of "abcabc..." */
+    char *long_str = malloc(4001);
+    for (int i = 0; i < 4000; i++) long_str[i] = 'a' + (i % 3);
+    long_str[4000] = '\0';
+
+    int ids[8192];
+    int n = spm_encode(tok, long_str, ids, 8192);
+    CHECK(n > 0, "encode 4000-char string produces tokens");
+    CHECKF(n <= 8192, "token count %d fits in buffer", n);
+
+    /* Verify no garbage — all IDs should be valid */
+    int valid = 1;
+    for (int i = 0; i < n; i++) {
+        if (ids[i] < 0 || ids[i] >= n_pieces) { valid = 0; break; }
+    }
+    CHECK(valid, "all token IDs are valid vocab indices");
+
+    free(long_str);
+    spm_destroy(tok);
+}
+
+/* ─── Test 22: SPM output buffer overflow protection ────────────────────── */
+
+static void test_spm_overflow_protection(void) {
+    printf("\n═══ Test 22: SPM output buffer overflow ═══\n");
+
+    const char *pieces[] = {"<unk>", "a", "b", "c"};
+    float scores[] = {0.0f, -1.0f, -1.0f, -1.0f};
+    SPMTokenizer *tok = spm_create_from_vocab(pieces, scores, 4);
+    CHECK(tok != NULL, "create for overflow test");
+    if (!tok) return;
+
+    /* Encode with very small output buffer */
+    int ids[2];
+    int n = spm_encode(tok, "aabbcc", ids, 2);
+    CHECK(n <= 2, "encode with max_ids=2 respects limit");
+    CHECK(n >= 0, "encode returns non-negative count");
+
+    spm_destroy(tok);
+}
+
+/* ─── Test 23: SPM unicode handling ─────────────────────────────────────── */
+
+static void test_spm_unicode(void) {
+    printf("\n═══ Test 23: SPM unicode handling ═══\n");
+
+    /* Vocab with some multi-byte pieces */
+    const char *pieces[] = {
+        "<unk>",
+        "\xc3\xa9",  /* é (U+00E9, 2-byte UTF-8) */
+        "c", "a", "f",
+        "\xe2\x96\x81",  /* ▁ (space marker) */
+        "\xc3\xa9" "s",  /* és */
+    };
+    float scores[] = {0.0f, -1.0f, -2.0f, -2.0f, -2.0f, -1.0f, -0.5f};
+    int n_pieces = sizeof(pieces) / sizeof(pieces[0]);
+
+    SPMTokenizer *tok = spm_create_from_vocab(pieces, scores, n_pieces);
+    CHECK(tok != NULL, "create with unicode vocab");
+    if (!tok) return;
+
+    int ids[64];
+    int n = spm_encode(tok, "caf\xc3\xa9", ids, 64);
+    CHECK(n > 0, "encode 'café' produces tokens");
+
+    /* Decode and verify */
+    char text[256];
+    int tlen = spm_decode(tok, ids, n, text, 256);
+    CHECK(tlen > 0, "decode unicode produces text");
+    CHECK(strstr(text, "caf") != NULL, "decoded text contains 'caf'");
+
+    spm_destroy(tok);
+}
+
 /* ─── Main ──────────────────────────────────────────────────────────────── */
 
 int main(void) {
     printf("╔════════════════════════════════════════════════╗\n");
-    printf("║  Sonata TTS — Comprehensive Test Suite (v3)   ║\n");
+    printf("║  Sonata TTS — Comprehensive Test Suite (v4)   ║\n");
     printf("╚════════════════════════════════════════════════╝\n");
 
     system("mkdir -p bench_output");
@@ -611,6 +1023,21 @@ int main(void) {
     test_speculative_api();
     test_bnns_convnext();
     test_voice_cloning();
+
+    /* New iSTFT edge-case tests */
+    test_istft_zero_magnitude();
+    test_istft_single_frame();
+    test_istft_large_magnitude();
+    test_istft_reset();
+    test_istft_phase_unwrap();
+
+    /* New SPM tokenizer tests */
+    test_spm_roundtrip();
+    test_spm_empty_string();
+    test_spm_null_safety();
+    test_spm_long_string();
+    test_spm_overflow_protection();
+    test_spm_unicode();
 
     printf("\n══════════════════════════════════════════\n");
     printf("Results: %d / %d passed\n", g_pass, g_pass + g_fail);

@@ -205,6 +205,241 @@ static void test_sentence_buffer_hints(void) {
     ASSERT_EQ(hint.exclamation_count, 0, "hint excl default = 0");
 }
 
+/* ═══════════════════════════════════════════════════════════════════ */
+/* Additional tests added by test-prosody agent                       */
+/* ═══════════════════════════════════════════════════════════════════ */
+
+static void test_syllable_counting_extended(void) {
+    printf("\n=== Syllable Counting: Extended ===\n");
+
+    /* Monosyllabic words */
+    ASSERT_EQ(prosody_count_syllables("cat"), 1, "cat = 1 syllable");
+    ASSERT_EQ(prosody_count_syllables("I"), 1, "I = 1 syllable");
+    ASSERT_EQ(prosody_count_syllables("through"), 1, "through = 1 syllable");
+    ASSERT_EQ(prosody_count_syllables("strength"), 1, "strength = 1 syllable");
+
+    /* Multi-syllable words */
+    ASSERT_EQ(prosody_count_syllables("computer"), 3, "computer = 3 syllables");
+    ASSERT_EQ(prosody_count_syllables("elephant"), 3, "elephant = 3 syllables");
+    ASSERT_EQ(prosody_count_syllables("understanding"), 4, "understanding = 4 syllables");
+
+    /* Silent-e rule: trailing 'e' after consonant shouldn't add a syllable */
+    ASSERT_EQ(prosody_count_syllables("make"), 1, "make (silent-e) = 1 syllable");
+    ASSERT_EQ(prosody_count_syllables("time"), 1, "time (silent-e) = 1 syllable");
+    ASSERT_EQ(prosody_count_syllables("smile"), 1, "smile (silent-e) = 1 syllable");
+    ASSERT_EQ(prosody_count_syllables("complete"), 2, "complete (silent-e) = 2 syllables");
+    ASSERT_EQ(prosody_count_syllables("telephone"), 3, "telephone (silent-e) = 3 syllables");
+
+    /* Compound-ish words */
+    ASSERT_EQ(prosody_count_syllables("sunshine"), 2, "sunshine = 2 syllables");
+    ASSERT_EQ(prosody_count_syllables("basketball"), 3, "basketball = 3 syllables");
+
+    /* Words with consecutive vowels (diphthongs/digraphs) */
+    ASSERT_EQ(prosody_count_syllables("boat"), 1, "boat (oa digraph) = 1 syllable");
+    ASSERT_EQ(prosody_count_syllables("create"), 2, "create = 2 syllables");
+
+    /* Sentence syllable counting with varied content */
+    int s = prosody_count_sentence_syllables("I like to create beautiful things");
+    ASSERT(s >= 8 && s <= 11, "mixed sentence syllable count in range");
+
+    s = prosody_count_sentence_syllables("A");
+    ASSERT(s >= 1, "single word sentence has syllables");
+
+    s = prosody_count_sentence_syllables("");
+    ASSERT_EQ(s, 0, "empty sentence = 0 syllables");
+
+    s = prosody_count_sentence_syllables(NULL);
+    ASSERT_EQ(s, 0, "NULL sentence = 0 syllables");
+}
+
+static void test_emotion_detection_extended(void) {
+    printf("\n=== Emotion Detection: Extended ===\n");
+
+    EmotionDetection det;
+
+    /* Question marks should influence detection */
+    det = prosody_detect_emotion("What happened to you???");
+    ASSERT(det.confidence > 0.0f, "multiple question marks have confidence");
+
+    /* Multiple exclamation marks = more intensity */
+    det = prosody_detect_emotion("That is incredible!!!");
+    ASSERT(det.emotion != EMOTION_NEUTRAL, "triple exclamation → non-neutral");
+    ASSERT(det.confidence >= 0.3f, "triple ! has good confidence");
+
+    /* ALL CAPS full sentence */
+    det = prosody_detect_emotion("I AM SO HAPPY RIGHT NOW");
+    ASSERT(det.emotion != EMOTION_NEUTRAL, "ALL CAPS sentence → non-neutral");
+
+    /* Mixed emotions: conflicting signals */
+    det = prosody_detect_emotion("I'm happy but also a little sad.");
+    ASSERT(det.confidence >= 0.0f, "mixed signals still produce valid confidence");
+
+    /* Fear/anxiety keywords */
+    det = prosody_detect_emotion("I'm terrified and scared to death!");
+    ASSERT(det.emotion == EMOTION_FEARFUL || det.emotion == EMOTION_ANGRY ||
+           det.emotion != EMOTION_NEUTRAL, "fear keywords → non-neutral");
+
+    /* Warm/gentle */
+    det = prosody_detect_emotion("Thank you so much, that's very kind of you.");
+    ASSERT(det.emotion == EMOTION_WARM || det.emotion == EMOTION_HAPPY ||
+           det.emotion != EMOTION_NEUTRAL, "warm text → non-neutral");
+
+    /* Very long text should not crash */
+    char long_text[2048];
+    memset(long_text, 0, sizeof(long_text));
+    for (int i = 0; i < 200; i++) {
+        strcat(long_text, "word ");
+    }
+    det = prosody_detect_emotion(long_text);
+    ASSERT(det.emotion >= 0 && det.emotion < EMOTION_COUNT,
+           "long text returns valid emotion enum");
+
+    /* Confidence always in [0.0, 1.0] */
+    det = prosody_detect_emotion("AMAZING!!! WOW!!! INCREDIBLE!!!");
+    ASSERT(det.confidence >= 0.0f && det.confidence <= 1.0f,
+           "confidence always in [0, 1]");
+
+    /* Hint pitch should be reasonable */
+    det = prosody_detect_emotion("I am so excited about this!");
+    ASSERT(det.hint.pitch >= 0.5f && det.hint.pitch <= 2.0f,
+           "emotion hint pitch in reasonable range");
+    ASSERT(det.hint.rate >= 0.5f && det.hint.rate <= 2.0f,
+           "emotion hint rate in reasonable range");
+}
+
+static void test_prosody_adaptation_extended(void) {
+    printf("\n=== Prosody Adaptation: Extended ===\n");
+
+    ConversationProsodyState state;
+    prosody_conversation_init(&state);
+
+    /* Verify initial state is clean */
+    ASSERT_NEAR(state.ema_rate, 0.0f, 0.01f, "initial ema_rate near 0");
+    ASSERT_NEAR(state.ema_energy, 0.0f, 0.01f, "initial ema_energy near 0");
+    ASSERT_NEAR(state.ema_pitch, 0.0f, 0.01f, "initial ema_pitch near 0");
+
+    /* Loud, high-pitched user → response should adapt */
+    prosody_conversation_update(&state, 1.5f, 8, -10.0f, 220.0f);
+    ProsodyHint hint = prosody_conversation_adapt(&state);
+    ASSERT(hint.energy != 0.0f || hint.pitch != 1.0f || hint.rate != 1.0f,
+           "loud user triggers adaptation");
+
+    /* Accumulate many samples to test stability */
+    for (int i = 0; i < 20; i++) {
+        prosody_conversation_update(&state, 2.0f, 7, -18.0f, 160.0f);
+    }
+    ASSERT(state.n_samples >= 20, "n_samples tracks accumulation");
+    hint = prosody_conversation_adapt(&state);
+
+    /* Adapted values should be in sane ranges */
+    ASSERT(hint.pitch >= 0.5f && hint.pitch <= 2.0f,
+           "adapted pitch in sane range [0.5, 2.0]");
+    ASSERT(hint.rate >= 0.5f && hint.rate <= 2.0f,
+           "adapted rate in sane range [0.5, 2.0]");
+
+    /* Re-init should reset everything */
+    prosody_conversation_init(&state);
+    ASSERT_EQ(state.n_samples, 0, "re-init resets n_samples to 0");
+    hint = prosody_conversation_adapt(&state);
+    ASSERT_NEAR(hint.pitch, 1.0f, 0.01f, "re-init → neutral pitch again");
+}
+
+static void test_emosteer_extended(void) {
+    printf("\n=== EmoSteer: Extended ===\n");
+
+    /* Non-existent path variants */
+    ASSERT(emosteer_load("") == NULL, "empty string path returns NULL");
+    ASSERT(emosteer_load("/tmp/this_should_not_exist_ever.json") == NULL,
+           "non-existent file returns NULL");
+
+    /* Count and direction on NULL bank */
+    ASSERT_EQ(emosteer_count(NULL), 0, "NULL bank count = 0 (repeated check)");
+    ASSERT(emosteer_get_direction(NULL, "happy") == NULL,
+           "NULL bank get_direction = NULL (repeated check)");
+    ASSERT(emosteer_get_direction(NULL, NULL) == NULL,
+           "NULL bank + NULL emotion = NULL");
+    ASSERT(emosteer_get_direction(NULL, "") == NULL,
+           "NULL bank + empty emotion = NULL");
+
+    /* Multiple destroy calls should be safe */
+    emosteer_destroy(NULL);
+    emosteer_destroy(NULL);
+    ASSERT(1, "double emosteer_destroy(NULL) is safe");
+}
+
+static void test_multi_scale_edge_cases(void) {
+    printf("\n=== Multi-Scale Prosody: Edge Cases ===\n");
+
+    /* Single word */
+    MultiScaleProsody msp = prosody_analyze_text("Hello");
+    ASSERT(msp.n_words >= 1, "single word detected");
+    ASSERT(msp.contour >= 0, "single word has valid contour");
+
+    /* Only punctuation */
+    msp = prosody_analyze_text("!!??!!");
+    ASSERT(msp.n_words >= 0, "punctuation-only doesn't crash");
+
+    /* Imperative (command) */
+    msp = prosody_analyze_text("Stop right there!");
+    ASSERT(msp.contour == PROSODY_CONTOUR_EXCLAMATORY ||
+           msp.contour == PROSODY_CONTOUR_IMPERATIVE,
+           "command → exclamatory or imperative");
+
+    /* Continuation (mid-sentence comma) */
+    msp = prosody_analyze_text("Well, I think so");
+    ASSERT(msp.n_words >= 3, "continuation phrase has words");
+
+    /* Very long text shouldn't overflow word_hints[64] */
+    char long_text[4096];
+    memset(long_text, 0, sizeof(long_text));
+    for (int i = 0; i < 100; i++) {
+        strcat(long_text, "word ");
+    }
+    strcat(long_text, "end.");
+    msp = prosody_analyze_text(long_text);
+    ASSERT(msp.n_words <= 64, "n_words capped at array size 64");
+    ASSERT(msp.contour >= 0, "long text has valid contour");
+
+    /* Emphasis mask consistency: emphasized count <= n_words */
+    msp = prosody_analyze_text("This is VERY IMPORTANT and CRITICAL");
+    int emph_count = 0;
+    for (int i = 0; i < msp.n_words; i++) {
+        if (msp.emphasis_mask[i]) emph_count++;
+    }
+    ASSERT(emph_count <= msp.n_words, "emphasis count <= word count");
+    ASSERT(emph_count >= 1, "ALL CAPS words detected as emphasis");
+}
+
+static void test_duration_estimation_extended(void) {
+    printf("\n=== Duration Estimation: Extended ===\n");
+
+    float durations[512];
+
+    /* Single word */
+    int n = prosody_estimate_durations("Hi", 10, durations, 512);
+    ASSERT(n == 10, "short text with 10 tokens");
+    for (int i = 0; i < n; i++) {
+        ASSERT(durations[i] >= 0.0f, "duration values non-negative");
+    }
+
+    /* Very long text */
+    char long_text[2048];
+    memset(long_text, 0, sizeof(long_text));
+    for (int i = 0; i < 50; i++) {
+        strcat(long_text, "The quick brown fox jumped over the lazy dog. ");
+    }
+    n = prosody_estimate_durations(long_text, 200, durations, 512);
+    ASSERT(n == 200, "200 tokens for long text");
+
+    /* max_frames limit: request more tokens than buffer can hold */
+    n = prosody_estimate_durations("Test", 1000, durations, 512);
+    ASSERT(n <= 512, "output capped at max_frames");
+
+    /* NULL durations buffer */
+    n = prosody_estimate_durations("Test", 10, NULL, 0);
+    ASSERT_EQ(n, 0, "NULL buffer returns 0");
+}
+
 int main(void) {
     printf("════════════════════════════════════════════\n");
     printf("  Prosody Prediction Tests\n");
@@ -217,6 +452,14 @@ int main(void) {
     test_conversational_adaptation();
     test_emosteer_loading();
     test_sentence_buffer_hints();
+
+    /* Extended tests */
+    test_syllable_counting_extended();
+    test_emotion_detection_extended();
+    test_prosody_adaptation_extended();
+    test_emosteer_extended();
+    test_multi_scale_edge_cases();
+    test_duration_estimation_extended();
 
     printf("\n════════════════════════════════════════════\n");
     printf("  Results: %d passed, %d failed\n", g_pass, g_fail);

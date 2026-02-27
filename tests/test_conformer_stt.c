@@ -240,11 +240,302 @@ static void test_mel_frame_count(void) {
     PASS();
 }
 
+/* ── Mel: White Noise ────────────────────────────────────── */
+
+static void test_mel_white_noise(void) {
+    TEST("mel: white noise has broad energy across bins");
+    MelConfig cfg;
+    mel_config_default(&cfg);
+    MelSpectrogram *mel = mel_create(&cfg);
+    if (!mel) FAIL("create failed");
+
+    /* 0.5s of pseudo-random noise */
+    int n = 8000;
+    float *pcm = (float *)malloc(n * sizeof(float));
+    unsigned int seed = 12345;
+    for (int i = 0; i < n; i++) {
+        seed = seed * 1664525u + 1013904223u;
+        pcm[i] = ((float)((int)(seed >> 16) % 2000 - 1000)) / 1000.0f;
+    }
+
+    float mels[100 * 80];
+    int frames = mel_process(mel, pcm, n, mels, 100);
+    if (frames <= 0) { free(pcm); mel_destroy(mel); FAIL("no frames"); }
+
+    /* Average across frames, check that energy is spread across bins */
+    float *avg = (float *)calloc(80, sizeof(float));
+    for (int f = 0; f < frames; f++)
+        for (int m = 0; m < 80; m++)
+            avg[m] += mels[f * 80 + m];
+    for (int m = 0; m < 80; m++) avg[m] /= (float)frames;
+
+    /* Count how many bins have energy above the median */
+    float sorted[80];
+    memcpy(sorted, avg, 80 * sizeof(float));
+    for (int i = 0; i < 79; i++)
+        for (int j = i + 1; j < 80; j++)
+            if (sorted[j] < sorted[i]) {
+                float tmp = sorted[i]; sorted[i] = sorted[j]; sorted[j] = tmp;
+            }
+    float median = sorted[40];
+    int above = 0;
+    for (int m = 0; m < 80; m++)
+        if (avg[m] >= median) above++;
+
+    /* White noise should have broad energy — at least 30 bins above median */
+    if (above < 30) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "only %d bins above median (expected >= 30)", above);
+        free(pcm); free(avg); mel_destroy(mel);
+        FAIL(msg);
+    }
+
+    free(pcm);
+    free(avg);
+    mel_destroy(mel);
+    PASS();
+}
+
+/* ── Mel: Frequency Bin Verification ─────────────────────── */
+
+static void test_mel_frequency_bins(void) {
+    TEST("mel: 4kHz sine has energy in higher bin than 500Hz");
+    MelConfig cfg;
+    mel_config_default(&cfg);
+
+    /* Process 500Hz tone */
+    MelSpectrogram *mel_lo = mel_create(&cfg);
+    if (!mel_lo) FAIL("create failed");
+    int n = 8000;
+    float *pcm = (float *)malloc(n * sizeof(float));
+    for (int i = 0; i < n; i++)
+        pcm[i] = 0.5f * sinf(2.0f * M_PI * 500.0f * i / 16000.0f);
+    float mels_lo[100 * 80];
+    int frames_lo = mel_process(mel_lo, pcm, n, mels_lo, 100);
+
+    /* Process 4kHz tone */
+    MelSpectrogram *mel_hi = mel_create(&cfg);
+    if (!mel_hi) { free(pcm); mel_destroy(mel_lo); FAIL("create failed"); }
+    for (int i = 0; i < n; i++)
+        pcm[i] = 0.5f * sinf(2.0f * M_PI * 4000.0f * i / 16000.0f);
+    float mels_hi[100 * 80];
+    int frames_hi = mel_process(mel_hi, pcm, n, mels_hi, 100);
+
+    if (frames_lo <= 2 || frames_hi <= 2) {
+        free(pcm); mel_destroy(mel_lo); mel_destroy(mel_hi);
+        FAIL("not enough frames");
+    }
+
+    /* Find peak bin for each, averaging middle frames */
+    int peak_lo = 0, peak_hi = 0;
+    float max_lo = -1e30f, max_hi = -1e30f;
+    for (int m = 0; m < 80; m++) {
+        float sum_lo = 0, sum_hi = 0;
+        for (int f = 2; f < frames_lo; f++) sum_lo += mels_lo[f * 80 + m];
+        for (int f = 2; f < frames_hi; f++) sum_hi += mels_hi[f * 80 + m];
+        if (sum_lo > max_lo) { max_lo = sum_lo; peak_lo = m; }
+        if (sum_hi > max_hi) { max_hi = sum_hi; peak_hi = m; }
+    }
+
+    if (peak_hi <= peak_lo) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "4kHz peak=%d not above 500Hz peak=%d", peak_hi, peak_lo);
+        free(pcm); mel_destroy(mel_lo); mel_destroy(mel_hi);
+        FAIL(msg);
+    }
+
+    free(pcm);
+    mel_destroy(mel_lo);
+    mel_destroy(mel_hi);
+    PASS();
+}
+
+/* ── Mel: Custom Parameters ──────────────────────────────── */
+
+static void test_mel_custom_params(void) {
+    TEST("mel: custom n_mels=40 and hop_length=320");
+    MelConfig cfg;
+    mel_config_default(&cfg);
+    cfg.n_mels = 40;
+    cfg.hop_length = 320;
+
+    MelSpectrogram *mel = mel_create(&cfg);
+    if (!mel) FAIL("create with custom params failed");
+    if (mel_n_mels(mel) != 40) { mel_destroy(mel); FAIL("expected 40 mels"); }
+    if (mel_hop_length(mel) != 320) { mel_destroy(mel); FAIL("expected hop 320"); }
+
+    /* Process 1s of audio, expect ~50 frames (16000/320) */
+    float *pcm = (float *)calloc(16000, sizeof(float));
+    float *out = (float *)malloc(200 * 40 * sizeof(float));
+    int frames = mel_process(mel, pcm, 16000, out, 200);
+
+    /* With center padding, frames should be approximately 16000/320 = 50 */
+    if (frames < 40 || frames > 60) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "expected ~50 frames, got %d", frames);
+        free(pcm); free(out); mel_destroy(mel);
+        FAIL(msg);
+    }
+
+    free(pcm);
+    free(out);
+    mel_destroy(mel);
+    PASS();
+}
+
+static void test_mel_large_nfft(void) {
+    TEST("mel: n_fft=1024, win_length=1024, hop=512");
+    MelConfig cfg;
+    mel_config_default(&cfg);
+    cfg.n_fft = 1024;
+    cfg.win_length = 1024;
+    cfg.hop_length = 512;
+
+    MelSpectrogram *mel = mel_create(&cfg);
+    if (!mel) FAIL("create with large nfft failed");
+
+    float *pcm = (float *)calloc(16000, sizeof(float));
+    float *out = (float *)malloc(200 * 80 * sizeof(float));
+    int frames = mel_process(mel, pcm, 16000, out, 200);
+    /* ~31 frames expected: (16000 + 512 - 1024) / 512 + 1 */
+    if (frames < 20 || frames > 45) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "expected ~31 frames, got %d", frames);
+        free(pcm); free(out); mel_destroy(mel);
+        FAIL(msg);
+    }
+
+    free(pcm);
+    free(out);
+    mel_destroy(mel);
+    PASS();
+}
+
+/* ── Mel: Edge Cases ─────────────────────────────────────── */
+
+static void test_mel_very_short_audio(void) {
+    TEST("mel: very short audio (< 1 frame) → 0 frames");
+    MelConfig cfg;
+    mel_config_default(&cfg);
+    MelSpectrogram *mel = mel_create(&cfg);
+    if (!mel) FAIL("create failed");
+
+    /* Only 10 samples — far less than one frame (hop=160) */
+    float pcm[10] = {0};
+    float out[80];
+    int frames = mel_process(mel, pcm, 10, out, 1);
+    if (frames != 0) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "expected 0 frames from 10 samples, got %d", frames);
+        mel_destroy(mel);
+        FAIL(msg);
+    }
+
+    mel_destroy(mel);
+    PASS();
+}
+
+static void test_mel_long_audio(void) {
+    TEST("mel: 10 seconds of audio processes correctly");
+    MelConfig cfg;
+    mel_config_default(&cfg);
+    MelSpectrogram *mel = mel_create(&cfg);
+    if (!mel) FAIL("create failed");
+
+    /* 10 seconds at 16kHz */
+    int n = 160000;
+    float *pcm = (float *)malloc(n * sizeof(float));
+    for (int i = 0; i < n; i++)
+        pcm[i] = 0.3f * sinf(2.0f * M_PI * 440.0f * i / 16000.0f);
+
+    int max_frames = 2000;
+    float *out = (float *)malloc(max_frames * 80 * sizeof(float));
+    int frames = mel_process(mel, pcm, n, out, max_frames);
+
+    /* Expected: ~1000 frames (160000/160) */
+    if (frames < 900 || frames > 1100) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "expected ~1000 frames, got %d", frames);
+        free(pcm); free(out); mel_destroy(mel);
+        FAIL(msg);
+    }
+
+    free(pcm);
+    free(out);
+    mel_destroy(mel);
+    PASS();
+}
+
+static void test_mel_null_inputs(void) {
+    TEST("mel: NULL inputs handled safely");
+    MelConfig cfg;
+    mel_config_default(&cfg);
+    MelSpectrogram *mel = mel_create(&cfg);
+    if (!mel) FAIL("create failed");
+
+    /* NULL pcm */
+    float out[80];
+    int frames = mel_process(mel, NULL, 100, out, 1);
+    if (frames != -1 && frames != 0) {
+        mel_destroy(mel);
+        FAIL("expected -1 or 0 from NULL pcm");
+    }
+
+    /* NULL output buffer */
+    float pcm[320] = {0};
+    frames = mel_process(mel, pcm, 320, NULL, 1);
+    if (frames != -1 && frames != 0) {
+        mel_destroy(mel);
+        FAIL("expected -1 or 0 from NULL output");
+    }
+
+    /* Zero max_frames */
+    frames = mel_process(mel, pcm, 320, out, 0);
+    if (frames != 0 && frames != -1) {
+        mel_destroy(mel);
+        FAIL("expected 0 or -1 from max_frames=0");
+    }
+
+    mel_destroy(mel);
+    PASS();
+}
+
+static void test_mel_n_mels_accessor(void) {
+    TEST("mel: n_mels accessor returns correct value");
+    if (mel_n_mels(NULL) != 0 && mel_n_mels(NULL) != -1) {
+        FAIL("mel_n_mels(NULL) should return 0 or -1");
+    }
+    if (mel_hop_length(NULL) != 0 && mel_hop_length(NULL) != -1) {
+        FAIL("mel_hop_length(NULL) should return 0 or -1");
+    }
+    PASS();
+}
+
 /* ── Conformer STT Tests ────────────────────────────────── */
 
 static void test_conformer_null_model(void) {
     TEST("conformer: create with nonexistent model returns NULL");
     ConformerSTT *stt = conformer_stt_create("/nonexistent/model.cstt");
+    if (stt != NULL) {
+        conformer_stt_destroy(stt);
+        FAIL("should have returned NULL");
+    }
+    PASS();
+}
+
+static void test_conformer_null_path(void) {
+    TEST("conformer: create with NULL path returns NULL");
+    ConformerSTT *stt = conformer_stt_create(NULL);
+    if (stt != NULL) {
+        conformer_stt_destroy(stt);
+        FAIL("should have returned NULL");
+    }
+    PASS();
+}
+
+static void test_conformer_empty_path(void) {
+    TEST("conformer: create with empty string returns NULL");
+    ConformerSTT *stt = conformer_stt_create("");
     if (stt != NULL) {
         conformer_stt_destroy(stt);
         FAIL("should have returned NULL");
@@ -268,6 +559,58 @@ static void test_conformer_null_safety(void) {
     PASS();
 }
 
+static void test_conformer_info_null(void) {
+    TEST("conformer: info accessors return 0 on NULL");
+    if (conformer_stt_d_model(NULL) != 0)
+        FAIL("d_model(NULL) should return 0");
+    if (conformer_stt_n_layers(NULL) != 0)
+        FAIL("n_layers(NULL) should return 0");
+    if (conformer_stt_vocab_size(NULL) != 0)
+        FAIL("vocab_size(NULL) should return 0");
+    if (conformer_stt_has_eou_support(NULL) != 0)
+        FAIL("has_eou_support(NULL) should return 0");
+    if (conformer_stt_is_tdt(NULL) != 0)
+        FAIL("is_tdt(NULL) should return 0");
+    PASS();
+}
+
+static void test_conformer_eou_null(void) {
+    TEST("conformer: EOU functions return safe defaults on NULL");
+    if (conformer_stt_has_eou(NULL) != 0)
+        FAIL("has_eou(NULL) should return 0");
+    if (conformer_stt_eou_prob(NULL, 4) != 0.0f)
+        FAIL("eou_prob(NULL) should return 0.0");
+    if (conformer_stt_eou_frame(NULL) != -1)
+        FAIL("eou_frame(NULL) should return -1");
+    PASS();
+}
+
+static void test_conformer_cache_null(void) {
+    TEST("conformer: cache-aware functions safe on NULL");
+    conformer_stt_set_cache_aware(NULL, 1);
+    conformer_stt_set_chunk_frames(NULL, 40);
+    if (conformer_stt_stride_ms(NULL) != 0)
+        FAIL("stride_ms(NULL) should return 0");
+    PASS();
+}
+
+static void test_conformer_beam_null(void) {
+    TEST("conformer: beam search functions safe on NULL");
+    int rc = conformer_stt_enable_beam_search(NULL, NULL, 16, 1.5f, 0.0f);
+    if (rc != -1) FAIL("enable_beam_search(NULL) should return -1");
+    conformer_stt_disable_beam_search(NULL);
+    PASS();
+}
+
+static void test_conformer_external_forward_null(void) {
+    TEST("conformer: external forward hook safe on NULL");
+    conformer_stt_set_external_forward(NULL, NULL, NULL);
+    int out_vocab = 0;
+    float *buf = conformer_stt_get_logits_buf(NULL, &out_vocab);
+    if (buf != NULL) FAIL("get_logits_buf(NULL) should return NULL");
+    PASS();
+}
+
 /* ── Main ───────────────────────────────────────────────── */
 
 int main(void) {
@@ -280,10 +623,25 @@ int main(void) {
     test_mel_streaming();
     test_mel_reset();
     test_mel_frame_count();
+    test_mel_white_noise();
+    test_mel_frequency_bins();
+    test_mel_custom_params();
+    test_mel_large_nfft();
+    test_mel_very_short_audio();
+    test_mel_long_audio();
+    test_mel_null_inputs();
+    test_mel_n_mels_accessor();
 
     printf("\nConformer STT Engine:\n");
     test_conformer_null_model();
+    test_conformer_null_path();
+    test_conformer_empty_path();
     test_conformer_null_safety();
+    test_conformer_info_null();
+    test_conformer_eou_null();
+    test_conformer_cache_null();
+    test_conformer_beam_null();
+    test_conformer_external_forward_null();
 
     printf("\n=== Results: %d passed, %d failed ===\n\n",
            tests_passed, tests_failed);

@@ -93,6 +93,12 @@ int main(void) {
     native_vad_reset(NULL);
     CHECK(1, "reset(NULL) is safe");
 
+    /* ── Additional API safety: NULL samples ─────────────────────────── */
+    printf("\n── Extended NULL Safety ──\n");
+    CHECK(native_vad_process(NULL, NULL) < 0.0f, "process(NULL, NULL) returns error");
+    CHECK(native_vad_process_audio(NULL, NULL, 0, NULL, 0) < 0,
+          "process_audio(all NULL) returns error");
+
     /* ── Integration tests (require extracted weights) ───────────────── */
     const char *weights_path = "models/silero_vad.nvad";
     if (!file_exists(weights_path)) {
@@ -133,6 +139,106 @@ int main(void) {
     for (int i = 0; i < 5; i++)
         tone_probs[i] = native_vad_process(vad, tone);
     printf("    After 5 tone chunks: %.4f\n", tone_probs[4]);
+
+    /* ── Multi-frequency speech-like signal ──────────────────────────── */
+    printf("\n── Multi-Frequency Speech-Like Signal ──\n");
+    native_vad_reset(vad);
+    float speech_like[512];
+    for (int i = 0; i < 512; i++) {
+        float t = (float)i / 16000.0f;
+        /* Voiced harmonics: F0=150Hz + 3 harmonics with amplitude envelope */
+        float voiced = 0.4f * sinf(2.0f * 3.14159f * 150.0f * t)
+                     + 0.25f * sinf(2.0f * 3.14159f * 300.0f * t)
+                     + 0.15f * sinf(2.0f * 3.14159f * 450.0f * t)
+                     + 0.10f * sinf(2.0f * 3.14159f * 600.0f * t);
+        float env = 0.6f + 0.4f * sinf(2.0f * 3.14159f * 4.0f * t);
+        speech_like[i] = voiced * env;
+    }
+    /* Feed multiple chunks to build up LSTM state */
+    for (int i = 0; i < 10; i++)
+        native_vad_process(vad, speech_like);
+    float prob_speech = native_vad_process(vad, speech_like);
+    printf("    Multi-freq speech-like probability: %.4f\n", prob_speech);
+    CHECK(prob_speech >= 0.0f && prob_speech <= 1.0f,
+          "multi-freq speech-like prob in valid range");
+
+    /* ── Transition: speech → silence → speech ───────────────────────── */
+    printf("\n── Speech-Silence-Speech Transition ──\n");
+    native_vad_reset(vad);
+    /* Feed speech */
+    float speech_probs_before[5];
+    for (int i = 0; i < 5; i++)
+        speech_probs_before[i] = native_vad_process(vad, speech_like);
+    /* Feed silence */
+    float silence_after_speech[5];
+    for (int i = 0; i < 5; i++)
+        silence_after_speech[i] = native_vad_process(vad, silence);
+    /* Feed speech again */
+    float speech_probs_after[5];
+    for (int i = 0; i < 5; i++)
+        speech_probs_after[i] = native_vad_process(vad, speech_like);
+    printf("    Before silence: %.4f, During silence: %.4f, After resume: %.4f\n",
+           speech_probs_before[4], silence_after_speech[4], speech_probs_after[4]);
+    CHECK(silence_after_speech[4] >= 0.0f && silence_after_speech[4] <= 1.0f,
+          "silence-after-speech prob in valid range");
+    CHECK(speech_probs_after[4] >= 0.0f && speech_probs_after[4] <= 1.0f,
+          "resumed speech prob in valid range");
+
+    /* ── Very quiet signal (near zero but not zero) ──────────────────── */
+    printf("\n── Near-Zero Signal ──\n");
+    native_vad_reset(vad);
+    float quiet[512];
+    for (int i = 0; i < 512; i++)
+        quiet[i] = 0.001f * sinf(2.0f * 3.14159f * 200.0f * (float)i / 16000.0f);
+    for (int i = 0; i < 5; i++)
+        native_vad_process(vad, quiet);
+    float prob_quiet = native_vad_process(vad, quiet);
+    printf("    Near-zero signal probability: %.4f\n", prob_quiet);
+    CHECK(prob_quiet >= 0.0f && prob_quiet <= 1.0f, "near-zero prob in valid range");
+    CHECK(prob_quiet < 0.5f, "near-zero signal has low speech probability");
+
+    /* ── Full-scale signal (clipping) ────────────────────────────────── */
+    printf("\n── Full-Scale Signal ──\n");
+    native_vad_reset(vad);
+    float loud[512];
+    for (int i = 0; i < 512; i++)
+        loud[i] = (i % 2 == 0) ? 1.0f : -1.0f;  /* Square wave at Nyquist */
+    float prob_loud = native_vad_process(vad, loud);
+    printf("    Full-scale probability: %.4f\n", prob_loud);
+    CHECK(prob_loud >= 0.0f && prob_loud <= 1.0f, "full-scale prob in valid range");
+
+    /* ── Chunk size verification with valid instance ─────────────────── */
+    printf("\n── Chunk Size with Valid Instance ──\n");
+    int cs = native_vad_chunk_size(vad);
+    CHECK(cs == 512, "chunk_size(valid) returns 512");
+
+    /* ── Batch processing edge cases ─────────────────────────────────── */
+    printf("\n── Batch Processing Edge Cases ──\n");
+    native_vad_reset(vad);
+
+    /* Exactly one chunk */
+    float one_chunk[512] = {0};
+    float one_prob[1];
+    int nc_one = native_vad_process_audio(vad, one_chunk, 512, one_prob, 1);
+    CHECK(nc_one == 1, "process_audio with exactly 1 chunk returns 1");
+    CHECK(one_prob[0] >= 0.0f && one_prob[0] <= 1.0f, "single chunk prob in range");
+
+    /* Less than one chunk (should return 0 chunks) */
+    native_vad_reset(vad);
+    float short_buf[256] = {0};
+    float short_probs[1];
+    int nc_short = native_vad_process_audio(vad, short_buf, 256, short_probs, 1);
+    CHECK(nc_short == 0, "process_audio with <512 samples returns 0 chunks");
+
+    /* max_probs smaller than available chunks */
+    native_vad_reset(vad);
+    float big_buf[2048];
+    memset(big_buf, 0, sizeof(big_buf));
+    float limited_probs[2];
+    int nc_limited = native_vad_process_audio(vad, big_buf, 2048, limited_probs, 2);
+    CHECK(nc_limited == 2, "process_audio capped by max_probs=2");
+    CHECK(limited_probs[0] >= 0.0f && limited_probs[1] >= 0.0f,
+          "capped batch probs in range");
 
     /* ── State reset consistency ─────────────────────────────────────── */
     printf("\n── State Reset ──\n");

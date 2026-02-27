@@ -762,11 +762,39 @@ test-phase2-regressions: tests/test_phase2_regressions.c \
 	  -o $(BUILD)/test-phase2-regressions tests/test_phase2_regressions.c
 	./$(BUILD)/test-phase2-regressions
 
-.PHONY: test test-eou test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-roundtrip test-llm-prosody test-websocket test-optimizations test-sonata test-sonata-quality test-sonata-stt test-sonata-v3 test-beam-search bench-sonata bench-quality bench-live bench-industry test-apple-perf test-quality-improvements test-real-models test-native-vad bench-vad test-speech-detector test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-sonata-storm test-audio-emotion test-sonata-flow-ffi test-sonata-lm-ffi test-pipeline-threading test-phase2-regressions test-phonemizer-v3 bench
+test-backchannel: tests/test_backchannel.c $(BUILD)/libbackchannel.dylib | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc -framework Accelerate \
+	  -L$(BUILD) -lbackchannel \
+	  -Wl,-rpath,$(CURDIR)/$(BUILD) -lm \
+	  -o $(BUILD)/test-backchannel tests/test_backchannel.c
+	./$(BUILD)/test-backchannel
+
+test-sonata-refiner: tests/test_sonata_refiner.c $(BUILD)/libsonata_refiner.dylib | $(BUILD)
+	$(CC) $(CFLAGS) -DACCELERATE_NEW_LAPACK -Isrc -framework Accelerate \
+	  -L$(BUILD) -lsonata_refiner \
+	  -Wl,-rpath,$(CURDIR)/$(BUILD) -lm \
+	  -o $(BUILD)/test-sonata-refiner tests/test_sonata_refiner.c
+	./$(BUILD)/test-sonata-refiner
+
+test-tdt-decoder: tests/test_tdt_decoder.c $(BUILD)/libtdt_decoder.dylib | $(BUILD)
+	$(CC) $(CFLAGS) -DACCELERATE_NEW_LAPACK -Isrc -framework Accelerate \
+	  -L$(BUILD) -ltdt_decoder \
+	  -Wl,-rpath,$(CURDIR)/$(BUILD) -lm \
+	  -o $(BUILD)/test-tdt-decoder tests/test_tdt_decoder.c
+	./$(BUILD)/test-tdt-decoder
+
+test-web-remote: tests/test_web_remote.c $(BUILD)/libweb_remote.dylib | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc \
+	  -L$(BUILD) -lweb_remote \
+	  -Wl,-rpath,$(CURDIR)/$(BUILD) -lm \
+	  -o $(BUILD)/test-web-remote tests/test_web_remote.c
+	./$(BUILD)/test-web-remote
+
+.PHONY: test test-eou test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-roundtrip test-llm-prosody test-websocket test-optimizations test-sonata test-sonata-quality test-sonata-stt test-sonata-v3 test-beam-search bench-sonata bench-quality bench-live bench-industry test-apple-perf test-quality-improvements test-real-models test-native-vad bench-vad test-speech-detector test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-sonata-storm test-audio-emotion test-sonata-flow-ffi test-sonata-lm-ffi test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-sonata-refiner test-tdt-decoder test-web-remote bench
 
 bench: libs pocket-voice
 	@bash scripts/benchmark.sh --all
-test: bench-quality test-quality test-eou test-roundtrip test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-llm-prosody test-optimizations test-beam-search test-sonata test-sonata-v3 test-sonata-quality test-sonata-stt test-real-models test-websocket test-native-vad test-speech-detector test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-quality-improvements test-sonata-storm test-audio-emotion test-sonata-flow-ffi test-sonata-lm-ffi test-pipeline-threading test-phase2-regressions test-phonemizer-v3
+test: bench-quality test-quality test-eou test-roundtrip test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-llm-prosody test-optimizations test-beam-search test-sonata test-sonata-v3 test-sonata-quality test-sonata-stt test-real-models test-websocket test-native-vad test-speech-detector test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-quality-improvements test-sonata-storm test-audio-emotion test-sonata-flow-ffi test-sonata-lm-ffi test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-sonata-refiner test-tdt-decoder test-web-remote
 	@echo ""
 	@echo "═══ Quality Benchmark Self-Tests ═══"
 	./$(BUILD)/bench-quality

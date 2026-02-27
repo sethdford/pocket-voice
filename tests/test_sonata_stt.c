@@ -698,6 +698,14 @@ static void test_beam_attach(void) {
     char buf[64];
     CHECK(sonata_stt_process_beam(NULL, NULL, 0, buf, sizeof(buf)) == -1,
           "process_beam(NULL) → -1");
+
+    /* process_beam with NULL pcm */
+    CHECK(sonata_stt_process_beam(NULL, NULL, 100, buf, sizeof(buf)) == -1,
+          "process_beam(NULL, NULL pcm) → -1");
+
+    /* process_beam with NULL output */
+    CHECK(sonata_stt_process_beam(NULL, NULL, 0, NULL, 64) == -1,
+          "process_beam(NULL, NULL out) → -1");
 }
 
 /* ═════════════════════════════════════════════════════════════════════════
@@ -754,6 +762,220 @@ static void test_refiner_api(void) {
 }
 
 /* ═════════════════════════════════════════════════════════════════════════
+ * Test 14: FP16 API
+ * ═════════════════════════════════════════════════════════════════════════ */
+
+static void test_fp16_api(void) {
+    printf("\n─── Test 14: FP16 API ───\n");
+
+    /* NULL safety */
+    CHECK(sonata_stt_enable_fp16(NULL) == -1, "enable_fp16(NULL) → -1");
+    CHECK(sonata_stt_is_fp16(NULL) == 0, "is_fp16(NULL) → 0");
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+ * Test 15: Constants and Properties Verification
+ * ═════════════════════════════════════════════════════════════════════════ */
+
+static void test_constants_verification(void) {
+    printf("\n─── Test 15: Constants Verification ───\n");
+
+    /* CTC vocabulary should be 29 chars (blank + space + a-z + apostrophe) */
+    CHECK(sizeof(CTC_CHARS) - 1 == 29, "CTC vocab size constant = 29");
+
+    /* Verify blank is at index 0 */
+    CHECK(CTC_CHARS[0] == '\0', "blank token at index 0");
+
+    /* Verify eou_id(NULL) returns -1 */
+    CHECK(sonata_stt_eou_id(NULL) == -1, "eou_id(NULL) → -1");
+
+    /* Verify vocab_size(NULL) returns 0 */
+    CHECK(sonata_stt_vocab_size(NULL) == 0, "vocab_size(NULL) → 0");
+
+    /* Verify enc_dim(NULL) returns 0 */
+    CHECK(sonata_stt_enc_dim(NULL) == 0, "enc_dim(NULL) → 0");
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+ * Test 16: Process with NULL/invalid arguments
+ * ═════════════════════════════════════════════════════════════════════════ */
+
+static void test_process_null_args(void) {
+    printf("\n─── Test 16: Process NULL/Invalid Args ───\n");
+
+    char buf[64];
+
+    /* process with NULL pcm */
+    CHECK(sonata_stt_process(NULL, NULL, 100, buf, sizeof(buf)) == -1,
+          "process(NULL, NULL pcm) → -1");
+
+    /* process with NULL output */
+    float pcm[100] = {0};
+    CHECK(sonata_stt_process(NULL, pcm, 100, NULL, 64) == -1,
+          "process(NULL, NULL out_text) → -1");
+
+    /* process with zero samples */
+    CHECK(sonata_stt_process(NULL, pcm, 0, buf, sizeof(buf)) == -1,
+          "process(NULL, n_samples=0) → -1");
+
+    /* get_logits with NULL */
+    float logits[100];
+    CHECK(sonata_stt_get_logits(NULL, pcm, 100, logits, 10) == -1,
+          "get_logits(NULL) → -1");
+
+    /* get_logits with NULL output buffer */
+    CHECK(sonata_stt_get_logits(NULL, pcm, 100, NULL, 10) == -1,
+          "get_logits(NULL, NULL out) → -1");
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+ * Test 17: Streaming edge cases
+ * ═════════════════════════════════════════════════════════════════════════ */
+
+static void test_streaming_edge_cases(void) {
+    printf("\n─── Test 17: Streaming Edge Cases ───\n");
+
+    /* Double stream_end should not crash */
+    sonata_stt_stream_end(NULL);
+    sonata_stt_stream_end(NULL);
+    CHECK(1, "double stream_end(NULL) no crash");
+
+    /* Flush without start */
+    char buf[64];
+    CHECK(sonata_stt_stream_flush(NULL, buf, sizeof(buf)) == -1,
+          "flush without start → -1");
+
+    /* Feed with NULL pcm */
+    CHECK(sonata_stt_stream_feed(NULL, NULL, 100) == -1,
+          "stream_feed(NULL, NULL pcm) → -1");
+
+    /* Feed with 0 samples */
+    float pcm[10] = {0};
+    CHECK(sonata_stt_stream_feed(NULL, pcm, 0) == -1,
+          "stream_feed(NULL, n=0) → -1");
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+ * Test 18: Weight file with wrong version
+ * ═════════════════════════════════════════════════════════════════════════ */
+
+static void test_weight_bad_version(void) {
+    printf("\n─── Test 18: Weight File Bad Version ───\n");
+
+    const char *tmp = "/tmp/test_sonata_stt_badver.cstt_sonata";
+    FILE *f = fopen(tmp, "wb");
+    if (!f) { g_fail++; printf("  [FAIL] cannot create temp file\n"); return; }
+
+    /* Valid magic but wrong version */
+    unsigned int header[10] = {
+        0x53545453,  /* STTS magic */
+        999,         /* invalid version */
+        256, 4, 4, 80, 31, 29, 0, 0
+    };
+    fwrite(header, sizeof(unsigned int), 10, f);
+    fclose(f);
+
+    SonataSTT *stt = sonata_stt_create(tmp);
+    CHECK(stt == NULL, "reject bad version number");
+    if (stt) sonata_stt_destroy(stt);
+
+    remove(tmp);
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+ * Test 19: Empty path and special path values
+ * ═════════════════════════════════════════════════════════════════════════ */
+
+static void test_special_paths(void) {
+    printf("\n─── Test 19: Special Paths ───\n");
+
+    /* Empty string */
+    SonataSTT *stt = sonata_stt_create("");
+    CHECK(stt == NULL, "create('') returns NULL");
+    if (stt) sonata_stt_destroy(stt);
+
+    /* Directory path */
+    stt = sonata_stt_create("/tmp");
+    CHECK(stt == NULL, "create('/tmp') returns NULL");
+    if (stt) sonata_stt_destroy(stt);
+
+    /* Truncated file (just 4 bytes) */
+    const char *tmp = "/tmp/test_sonata_truncated.cstt_sonata";
+    FILE *f = fopen(tmp, "wb");
+    if (f) {
+        unsigned int magic = 0x53545453;
+        fwrite(&magic, 4, 1, f);
+        fclose(f);
+
+        stt = sonata_stt_create(tmp);
+        CHECK(stt == NULL, "reject truncated weight file");
+        if (stt) sonata_stt_destroy(stt);
+
+        remove(tmp);
+    }
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
+ * Test 20: EOU with loaded model
+ * ═════════════════════════════════════════════════════════════════════════ */
+
+static void test_eou_with_model(void) {
+    printf("\n─── Test 20: EOU with Synthetic Model ───\n");
+
+    const char *tmp = "/tmp/test_sonata_stt_eou_model.cstt_sonata";
+    FILE *f = fopen(tmp, "wb");
+    if (!f) { g_fail++; printf("  [FAIL] cannot create temp file\n"); return; }
+
+    int D = 256, M = 80, K = 31, V = 30, NL = 4;
+    int ff = D * 4;
+    int per_block =
+        D + D + ff*D + ff + D*ff + D +
+        D + D + 3*D*D + 3*D + D*D + D +
+        D + D + 2*D*D + 2*D + D*K + D + D+D+D+D + D*D + D +
+        D + D + ff*D + ff + D*ff + D +
+        D + D;
+    int total = D*M + D + NL * per_block + D + D + D*D + D + V*D + V;
+
+    unsigned int header[10] = { 0x53545453, 1, D, NL, 4, M, K, V, total, 0 };
+    fwrite(header, sizeof(unsigned int), 10, f);
+    unsigned int seed = 456;
+    for (int i = 0; i < total; i++) {
+        seed = seed * 1664525u + 1013904223u;
+        float w = (float)((int)(seed >> 16) % 200 - 100) / 100000.0f;
+        fwrite(&w, sizeof(float), 1, f);
+    }
+    fclose(f);
+
+    SonataSTT *stt = sonata_stt_create(tmp);
+    if (!stt) { g_fail++; printf("  [FAIL] cannot load weight file\n"); remove(tmp); return; }
+
+    /* With V=30, eou_id should be 29 */
+    int eou = sonata_stt_eou_id(stt);
+    CHECKF(eou == 29, "eou_id=%d (expected 29)", eou);
+
+    /* Process some audio, then check EOU probs */
+    float pcm[12000];
+    for (int i = 0; i < 12000; i++)
+        pcm[i] = 0.2f * sinf(2.0f * 3.14159f * 440.0f * i / 24000.0f);
+
+    char text[256];
+    sonata_stt_process(stt, pcm, 12000, text, sizeof(text));
+
+    /* eou_peak should return something in valid range */
+    float peak = sonata_stt_eou_peak(stt, 5);
+    CHECKF(peak >= -1.0f && peak <= 1.0f,
+           "eou_peak=%f (expected [-1,1])", peak);
+
+    /* eou_probs should return frames */
+    float probs[100];
+    int frames = sonata_stt_eou_probs(stt, probs, 100);
+    CHECKF(frames >= 0, "eou_probs returns %d frames", frames);
+
+    sonata_stt_destroy(stt);
+    remove(tmp);
+}
+
+/* ═════════════════════════════════════════════════════════════════════════
  * Main
  * ═════════════════════════════════════════════════════════════════════════ */
 
@@ -775,6 +997,13 @@ int main(void) {
     test_get_words();
     test_beam_attach();
     test_refiner_api();
+    test_fp16_api();
+    test_constants_verification();
+    test_process_null_args();
+    test_streaming_edge_cases();
+    test_weight_bad_version();
+    test_special_paths();
+    test_eou_with_model();
 
     printf("\n╠══════════════════════════════════════════════╣\n");
     printf("║  Results: %d passed, %d failed              ║\n", g_pass, g_fail);

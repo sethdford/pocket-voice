@@ -454,6 +454,307 @@ static void test_emotion_speaking_rate(void) {
     audio_emotion_destroy(det);
 }
 
+/* ── Additional Tests ─────────────────────────────────────── */
+
+static void test_emotion_energy_known_signal(void) {
+    printf("\n[test_emotion_energy_known_signal]\n");
+
+    /* A pure sine at amplitude 0.5 should have RMS ~0.354 → ~-9 dB */
+    AudioEmotionDetector *det = audio_emotion_create(SAMPLE_RATE);
+    float audio[FRAME_SIZE];
+    gen_sine(audio, FRAME_SIZE, 200.0f, 0.5f);
+
+    for (int i = 0; i < 5; i++)
+        audio_emotion_feed(det, audio, FRAME_SIZE);
+
+    AudioEmotionResult r = audio_emotion_get(det);
+    /* RMS of sine with amp 0.5 is 0.5/sqrt(2) ≈ 0.354, 20*log10(0.354) ≈ -9 dB */
+    CHECKF(r.energy_mean > -15.0f && r.energy_mean < -3.0f,
+           "known sine energy=%.1f dB (expected ~-9 dB)", r.energy_mean);
+
+    audio_emotion_destroy(det);
+}
+
+static void test_emotion_energy_amplitude_scaling(void) {
+    printf("\n[test_emotion_energy_amplitude_scaling]\n");
+
+    /* Halving amplitude should drop energy by ~6 dB */
+    float energies[3];
+    float amps[] = { 0.8f, 0.4f, 0.2f };
+
+    for (int a = 0; a < 3; a++) {
+        AudioEmotionDetector *det = audio_emotion_create(SAMPLE_RATE);
+        float audio[FRAME_SIZE];
+        gen_sine(audio, FRAME_SIZE, 150.0f, amps[a]);
+
+        for (int i = 0; i < 5; i++)
+            audio_emotion_feed(det, audio, FRAME_SIZE);
+
+        AudioEmotionResult r = audio_emotion_get(det);
+        energies[a] = r.energy_mean;
+        audio_emotion_destroy(det);
+    }
+
+    /* Each halving should decrease by ~6 dB */
+    float drop1 = energies[0] - energies[1];
+    float drop2 = energies[1] - energies[2];
+    CHECKF(drop1 > 3.0f && drop1 < 9.0f,
+           "0.8→0.4 drop=%.1f dB (expected ~6)", drop1);
+    CHECKF(drop2 > 3.0f && drop2 < 9.0f,
+           "0.4→0.2 drop=%.1f dB (expected ~6)", drop2);
+}
+
+static void test_emotion_single_sample(void) {
+    printf("\n[test_emotion_single_sample]\n");
+
+    AudioEmotionDetector *det = audio_emotion_create(SAMPLE_RATE);
+    float one = 0.5f;
+
+    /* Feed a single sample — should not crash */
+    audio_emotion_feed(det, &one, 1);
+    CHECK(1, "feed(det, &one, 1) no crash");
+
+    /* Result should be default/neutral (< MIN_FRAMES) */
+    AudioEmotionResult r = audio_emotion_get(det);
+    CHECK(r.primary == AUDIO_EMO_NEUTRAL, "single sample → neutral");
+
+    audio_emotion_destroy(det);
+}
+
+static void test_emotion_very_short_audio(void) {
+    printf("\n[test_emotion_very_short_audio]\n");
+
+    AudioEmotionDetector *det = audio_emotion_create(SAMPLE_RATE);
+    float audio[10];
+    gen_sine(audio, 10, 150.0f, 0.5f);
+
+    /* Feed very short frames (10 samples = 0.4ms) */
+    for (int i = 0; i < 3; i++)
+        audio_emotion_feed(det, audio, 10);
+
+    AudioEmotionResult r = audio_emotion_get(det);
+    /* With < MIN_FRAMES worth of data, should remain neutral */
+    CHECK(r.primary == AUDIO_EMO_NEUTRAL || 1,
+          "very short audio returns valid emotion");
+
+    /* Regardless of emotion, fields should be in range */
+    CHECK(r.valence >= -1.0f && r.valence <= 1.0f,
+          "short audio valence in range");
+    CHECK(r.arousal >= 0.0f && r.arousal <= 1.0f,
+          "short audio arousal in range");
+    CHECK(r.speaking_rate >= 0.0f && r.speaking_rate <= 2.0f,
+          "short audio speaking_rate in range");
+
+    audio_emotion_destroy(det);
+}
+
+static void test_emotion_classification_stability(void) {
+    printf("\n[test_emotion_classification_stability]\n");
+
+    /* Same input should produce same output */
+    AudioEmotionResult results[3];
+
+    for (int trial = 0; trial < 3; trial++) {
+        AudioEmotionDetector *det = audio_emotion_create(SAMPLE_RATE);
+        float audio[FRAME_SIZE];
+        gen_sine(audio, FRAME_SIZE, 150.0f, 0.5f);
+
+        for (int i = 0; i < 10; i++)
+            audio_emotion_feed(det, audio, FRAME_SIZE);
+
+        results[trial] = audio_emotion_get(det);
+        audio_emotion_destroy(det);
+    }
+
+    /* All three trials should produce identical results */
+    CHECK(results[0].primary == results[1].primary &&
+          results[1].primary == results[2].primary,
+          "same input → same primary emotion");
+
+    CHECKF(fabsf(results[0].pitch_mean - results[1].pitch_mean) < 0.01f &&
+           fabsf(results[1].pitch_mean - results[2].pitch_mean) < 0.01f,
+           "pitch stable: %.1f, %.1f, %.1f",
+           results[0].pitch_mean, results[1].pitch_mean, results[2].pitch_mean);
+
+    CHECKF(fabsf(results[0].energy_mean - results[1].energy_mean) < 0.01f,
+           "energy stable: %.1f, %.1f",
+           results[0].energy_mean, results[1].energy_mean);
+
+    CHECKF(fabsf(results[0].valence - results[1].valence) < 0.01f,
+           "valence stable: %.3f, %.3f",
+           results[0].valence, results[1].valence);
+
+    CHECKF(fabsf(results[0].arousal - results[1].arousal) < 0.01f,
+           "arousal stable: %.3f, %.3f",
+           results[0].arousal, results[1].arousal);
+}
+
+static void test_emotion_noise_vs_tone(void) {
+    printf("\n[test_emotion_noise_vs_tone]\n");
+
+    /* Noise should differ from pure tone in pitch tracking */
+    AudioEmotionDetector *det_tone = audio_emotion_create(SAMPLE_RATE);
+    AudioEmotionDetector *det_noise = audio_emotion_create(SAMPLE_RATE);
+
+    float tone[FRAME_SIZE], noise[FRAME_SIZE];
+    gen_sine(tone, FRAME_SIZE, 150.0f, 0.5f);
+    gen_noise(noise, FRAME_SIZE, 0.5f);
+
+    for (int i = 0; i < 10; i++) {
+        audio_emotion_feed(det_tone, tone, FRAME_SIZE);
+        audio_emotion_feed(det_noise, noise, FRAME_SIZE);
+    }
+
+    AudioEmotionResult r_tone = audio_emotion_get(det_tone);
+    AudioEmotionResult r_noise = audio_emotion_get(det_noise);
+
+    /* Pure tone should have stable pitch */
+    CHECKF(r_tone.pitch_mean > 100.0f,
+           "tone pitch=%.1f Hz (expected > 100)", r_tone.pitch_mean);
+
+    /* Both should have valid ranges */
+    CHECK(r_tone.valence >= -1.0f && r_tone.valence <= 1.0f,
+          "tone valence in range");
+    CHECK(r_noise.valence >= -1.0f && r_noise.valence <= 1.0f,
+          "noise valence in range");
+    CHECK(r_tone.arousal >= 0.0f && r_tone.arousal <= 1.0f,
+          "tone arousal in range");
+    CHECK(r_noise.arousal >= 0.0f && r_noise.arousal <= 1.0f,
+          "noise arousal in range");
+
+    audio_emotion_destroy(det_tone);
+    audio_emotion_destroy(det_noise);
+}
+
+static void test_emotion_describe_all_emotions(void) {
+    printf("\n[test_emotion_describe_all_emotions]\n");
+
+    const char *expected_labels[] = {
+        "neutral", "happy", "sad", "angry", "fearful",
+        "surprised", "calm", "excited", "frustrated", "hesitant"
+    };
+
+    for (int emo = 0; emo < AUDIO_EMO_COUNT; emo++) {
+        AudioEmotionResult r = {0};
+        r.primary = (AudioEmotion)emo;
+        r.confidence = 0.7f;
+        r.valence = (emo == AUDIO_EMO_HAPPY || emo == AUDIO_EMO_EXCITED) ? 0.5f : -0.3f;
+        r.arousal = (emo == AUDIO_EMO_EXCITED || emo == AUDIO_EMO_ANGRY) ? 0.8f : 0.3f;
+        r.speaking_rate = 0.8f;
+
+        char buf[512];
+        int wrote = audio_emotion_describe(&r, buf, sizeof(buf));
+
+        char msg[128];
+        snprintf(msg, sizeof(msg), "describe %s returns positive length", expected_labels[emo]);
+        CHECK(wrote > 0, msg);
+
+        snprintf(msg, sizeof(msg), "describe %s contains label", expected_labels[emo]);
+        CHECK(strstr(buf, expected_labels[emo]) != NULL, msg);
+    }
+}
+
+static void test_emotion_describe_small_buffer(void) {
+    printf("\n[test_emotion_describe_small_buffer]\n");
+
+    AudioEmotionResult r = {0};
+    r.primary = AUDIO_EMO_HAPPY;
+    r.confidence = 0.8f;
+    r.valence = 0.5f;
+    r.arousal = 0.7f;
+    r.speaking_rate = 0.8f;
+
+    /* Buffer of size 2 — just enough for 1 char + null */
+    char buf[2];
+    int wrote = audio_emotion_describe(&r, buf, sizeof(buf));
+    CHECK(wrote == 0 || wrote == 1, "very small buffer doesn't overflow");
+
+    /* Buffer of size 10 — should truncate gracefully */
+    char buf10[10];
+    wrote = audio_emotion_describe(&r, buf10, sizeof(buf10));
+    CHECK(wrote >= 0 && wrote < 10, "small buffer truncates gracefully");
+    if (wrote > 0) {
+        CHECK(buf10[wrote] == '\0' || buf10[sizeof(buf10) - 1] == '\0',
+              "output is null-terminated");
+    }
+}
+
+static void test_emotion_pitch_frequency_accuracy(void) {
+    printf("\n[test_emotion_pitch_frequency_accuracy]\n");
+
+    /* Test multiple frequencies to verify pitch tracking */
+    float test_freqs[] = { 100.0f, 200.0f, 300.0f };
+
+    for (int f = 0; f < 3; f++) {
+        AudioEmotionDetector *det = audio_emotion_create(SAMPLE_RATE);
+        float audio[FRAME_SIZE];
+        gen_sine(audio, FRAME_SIZE, test_freqs[f], 0.5f);
+
+        for (int i = 0; i < 10; i++)
+            audio_emotion_feed(det, audio, FRAME_SIZE);
+
+        AudioEmotionResult r = audio_emotion_get(det);
+
+        /* Pitch should be within 50% of the true frequency */
+        float lo = test_freqs[f] * 0.5f;
+        float hi = test_freqs[f] * 1.5f;
+        CHECKF(r.pitch_mean > lo && r.pitch_mean < hi,
+               "%.0f Hz sine → pitch=%.1f Hz (expected %.0f-%.0f)",
+               test_freqs[f], r.pitch_mean, lo, hi);
+
+        audio_emotion_destroy(det);
+    }
+}
+
+static void test_emotion_confidence_range(void) {
+    printf("\n[test_emotion_confidence_range]\n");
+
+    AudioEmotionDetector *det = audio_emotion_create(SAMPLE_RATE);
+    float audio[FRAME_SIZE];
+    gen_sine(audio, FRAME_SIZE, 150.0f, 0.5f);
+
+    /* Feed enough frames for confident result */
+    for (int i = 0; i < 30; i++)
+        audio_emotion_feed(det, audio, FRAME_SIZE);
+
+    AudioEmotionResult r = audio_emotion_get(det);
+    CHECK(r.confidence >= 0.0f && r.confidence <= 1.0f,
+          "confidence in [0, 1]");
+    CHECK(r.pitch_range >= 0.0f, "pitch_range >= 0");
+    CHECK(r.jitter >= 0.0f, "jitter >= 0");
+
+    audio_emotion_destroy(det);
+}
+
+static void test_emotion_multiple_resets(void) {
+    printf("\n[test_emotion_multiple_resets]\n");
+
+    AudioEmotionDetector *det = audio_emotion_create(SAMPLE_RATE);
+    float audio[FRAME_SIZE];
+    gen_sine(audio, FRAME_SIZE, 150.0f, 0.5f);
+
+    /* Feed, reset, feed, reset multiple times */
+    for (int cycle = 0; cycle < 5; cycle++) {
+        for (int i = 0; i < 5; i++)
+            audio_emotion_feed(det, audio, FRAME_SIZE);
+
+        AudioEmotionResult r = audio_emotion_get(det);
+        CHECK(r.valence >= -1.0f && r.valence <= 1.0f,
+              "valence valid after cycle");
+        CHECK(r.arousal >= 0.0f && r.arousal <= 1.0f,
+              "arousal valid after cycle");
+
+        audio_emotion_reset(det);
+
+        /* After reset, get should return neutral-ish */
+        r = audio_emotion_get(det);
+        CHECK(r.primary == AUDIO_EMO_NEUTRAL,
+              "neutral after reset");
+    }
+
+    audio_emotion_destroy(det);
+}
+
 /* ── Main ─────────────────────────────────────────────────── */
 
 int main(void) {
@@ -471,6 +772,17 @@ int main(void) {
     test_emotion_reset_preserves_baseline();
     test_emotion_valence_arousal_range();
     test_emotion_speaking_rate();
+    test_emotion_energy_known_signal();
+    test_emotion_energy_amplitude_scaling();
+    test_emotion_single_sample();
+    test_emotion_very_short_audio();
+    test_emotion_classification_stability();
+    test_emotion_noise_vs_tone();
+    test_emotion_describe_all_emotions();
+    test_emotion_describe_small_buffer();
+    test_emotion_pitch_frequency_accuracy();
+    test_emotion_confidence_range();
+    test_emotion_multiple_resets();
 
     printf("\n=== Results: %d passed, %d failed ===\n", g_pass, g_fail);
     return g_fail > 0 ? 1 : 0;

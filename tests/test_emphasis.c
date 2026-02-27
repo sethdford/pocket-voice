@@ -226,6 +226,206 @@ static void test_alpha_clamping(void) {
     TEST(fabsf(clamped - 0.3f) < 0.01f, "valid alpha preserved");
 }
 
+/* ── Smart Quotes and Advanced Quote Detection ────────────────────────────── */
+
+static void test_quotes_smart_utf8(void) {
+    printf("\n=== Quotes: Smart/Curly Quotes (UTF-8) ===\n");
+
+    char out[4096];
+
+    /* Smart double quotes: \xe2\x80\x9c = left, \xe2\x80\x9d = right */
+    int n = emphasis_detect_quotes(
+        "She said, \xe2\x80\x9chello there friend\xe2\x80\x9d and walked away.",
+        out, sizeof(out));
+    /* Smart quotes may or may not be supported — don't crash either way */
+    TEST(n >= 0, "smart quotes don't crash");
+    printf("    (smart quote segments found: %d)\n", n);
+
+    /* Single straight quotes: not typically speech markers */
+    n = emphasis_detect_quotes(
+        "It's a nice day to say 'hello' isn't it?",
+        out, sizeof(out));
+    TEST(n >= 0, "single quotes handled without crash");
+}
+
+static void test_quotes_unmatched(void) {
+    printf("\n=== Quotes: Unmatched/Edge Cases ===\n");
+
+    char out[4096];
+
+    /* Unmatched opening quote */
+    int n = emphasis_detect_quotes(
+        "She said \"hello but never finished", out, sizeof(out));
+    TEST(n == 0, "unmatched quote → 0 segments");
+
+    /* Empty quotes */
+    n = emphasis_detect_quotes(
+        "She said \"\" and nothing more.", out, sizeof(out));
+    TEST(n == 0, "empty quotes → 0 segments");
+
+    /* Quote at very start */
+    n = emphasis_detect_quotes(
+        "\"Hello world\" she announced.", out, sizeof(out));
+    TEST(n >= 0, "quote at start doesn't crash");
+
+    /* Quote at very end */
+    n = emphasis_detect_quotes(
+        "She said \"goodbye world\"", out, sizeof(out));
+    TEST(n >= 0, "quote at end doesn't crash");
+}
+
+/* ── ALL_CAPS Detection via Emphasis ──────────────────────────────────────── */
+
+static void test_emphasis_all_caps(void) {
+    printf("\n=== Emphasis: ALL_CAPS Words ===\n");
+
+    char out[4096];
+
+    /* Single ALL_CAPS word in sentence */
+    int n = emphasis_predict("This is AMAZING work.", out, sizeof(out));
+    TEST(n >= 0, "ALL_CAPS word processed");
+    TEST(strstr(out, "AMAZING") != NULL, "AMAZING preserved in output");
+
+    /* Multiple ALL_CAPS words */
+    n = emphasis_predict("I am VERY VERY HAPPY today.", out, sizeof(out));
+    TEST(strstr(out, "VERY") != NULL, "VERY preserved");
+    TEST(strstr(out, "HAPPY") != NULL, "HAPPY preserved");
+
+    /* Mixed case: only fully uppercase words count */
+    n = emphasis_predict("Hello WORLD and Goodbye.", out, sizeof(out));
+    TEST(strstr(out, "WORLD") != NULL, "WORLD preserved in output");
+
+    /* All caps sentence: emphasis shouldn't over-mark */
+    n = emphasis_predict("EVERYTHING IS IN CAPS HERE.", out, sizeof(out));
+    int count = 0;
+    const char *p = out;
+    while ((p = strstr(p, "<emphasis")) != NULL) { count++; p++; }
+    TEST(count <= 3, "all-caps sentence capped at 3 emphasis");
+}
+
+/* ── Semantic Emphasis: Important Words and Stress ─────────────────────────── */
+
+static void test_emphasis_semantic(void) {
+    printf("\n=== Emphasis: Semantic Patterns ===\n");
+
+    char out[4096];
+
+    /* "however" is a contrast marker like "but" */
+    int n = emphasis_predict(
+        "The plan was solid. However, the execution was poor.", out, sizeof(out));
+    TEST(strstr(out, "<emphasis") != NULL, "however triggers emphasis");
+
+    /* "actually" is a contrast/correction marker */
+    n = emphasis_predict(
+        "I actually disagree with that assessment.", out, sizeof(out));
+    TEST(strstr(out, "<emphasis") != NULL, "actually triggers emphasis");
+
+    /* "instead" contrast marker */
+    n = emphasis_predict(
+        "Don't run. Instead, walk slowly.", out, sizeof(out));
+    TEST(strstr(out, "<emphasis") != NULL, "instead triggers emphasis");
+
+    /* "extremely" is an intensifier */
+    n = emphasis_predict(
+        "That was extremely difficult to solve.", out, sizeof(out));
+    TEST(strstr(out, "difficult") != NULL, "extremely boosts next word");
+
+    /* "not" negation emphasis */
+    n = emphasis_predict(
+        "I do not agree with this at all.", out, sizeof(out));
+    TEST(strstr(out, "<emphasis") != NULL, "negation 'not' triggers emphasis");
+}
+
+/* ── SSML Bypass Extended ─────────────────────────────────────────────────── */
+
+static void test_emphasis_ssml_bypass_extended(void) {
+    printf("\n=== Emphasis: SSML Bypass Extended ===\n");
+
+    char out[4096];
+
+    /* Multiple existing SSML tags */
+    const char *input = "<emphasis level=\"strong\">really</emphasis> and "
+                        "<emphasis level=\"moderate\">truly</emphasis>.";
+    int n = emphasis_predict(input, out, sizeof(out));
+    TEST(n == 0, "no emphasis added when multiple SSML tags present");
+    TEST(strcmp(out, input) == 0, "multi-tag SSML preserved");
+
+    /* Prosody tag (not emphasis, but still SSML) — should still predict */
+    input = "I <prosody rate=\"fast\">really</prosody> mean it.";
+    n = emphasis_predict(input, out, sizeof(out));
+    /* prosody tags may or may not trigger bypass — test that it doesn't crash */
+    TEST(n >= 0, "prosody tag input doesn't crash");
+
+    /* Break tag */
+    input = "Hello.<break time=\"500ms\"/> How are you?";
+    n = emphasis_predict(input, out, sizeof(out));
+    TEST(n >= 0, "break tag input doesn't crash");
+}
+
+/* ── Edge Cases Extended ──────────────────────────────────────────────────── */
+
+static void test_emphasis_edge_extended(void) {
+    printf("\n=== Emphasis: Edge Cases Extended ===\n");
+
+    char out[4096];
+
+    /* Single character */
+    int n = emphasis_predict("A", out, sizeof(out));
+    TEST(n >= 0, "single char 'A' doesn't crash");
+
+    /* All punctuation */
+    n = emphasis_predict("... !!! ???", out, sizeof(out));
+    TEST(n >= 0, "all punctuation doesn't crash");
+
+    /* Very small output buffer */
+    char tiny[16];
+    n = emphasis_predict("This is a test with emphasis.", tiny, sizeof(tiny));
+    TEST(n >= 0, "small buffer doesn't crash");
+
+    /* Whitespace only */
+    n = emphasis_predict("   \t\n  ", out, sizeof(out));
+    TEST(n >= 0, "whitespace-only doesn't crash");
+
+    /* Numbers only */
+    n = emphasis_predict("12345 67890", out, sizeof(out));
+    TEST(n >= 0, "numbers-only doesn't crash");
+
+    /* Long sentence to stress-test */
+    char long_text[4096];
+    memset(long_text, 0, sizeof(long_text));
+    for (int i = 0; i < 80; i++) {
+        strcat(long_text, "word ");
+    }
+    n = emphasis_predict(long_text, out, sizeof(out));
+    TEST(n >= 0, "very long sentence doesn't crash");
+    int count = 0;
+    const char *p = out;
+    while ((p = strstr(p, "<emphasis")) != NULL) { count++; p++; }
+    TEST(count <= 3, "long sentence emphasis capped at 3");
+}
+
+/* ── Quotes NULL Buffer ───────────────────────────────────────────────────── */
+
+static void test_quotes_null_buffer(void) {
+    printf("\n=== Quotes: NULL/Edge Buffer ===\n");
+
+    /* NULL output buffer */
+    int n = emphasis_detect_quotes("She said \"hello\" to me.", NULL, 0);
+    TEST(n == 0, "NULL output buffer → 0");
+
+    /* Very small output buffer */
+    char tiny[8];
+    n = emphasis_detect_quotes("She said \"hello world my friend\" today.",
+                                tiny, sizeof(tiny));
+    TEST(n >= 0, "tiny buffer doesn't crash");
+
+    /* Empty string */
+    char out[4096];
+    n = emphasis_detect_quotes("", out, sizeof(out));
+    TEST(n == 0, "empty string → 0 quotes");
+    TEST(out[0] == '\0', "empty output for empty input");
+}
+
 /* ── Main ─────────────────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -245,6 +445,15 @@ int main(void) {
     test_quotes_empty();
     test_prosody_feedback();
     test_alpha_clamping();
+
+    /* Extended tests */
+    test_quotes_smart_utf8();
+    test_quotes_unmatched();
+    test_emphasis_all_caps();
+    test_emphasis_semantic();
+    test_emphasis_ssml_bypass_extended();
+    test_emphasis_edge_extended();
+    test_quotes_null_buffer();
 
     printf("\n════════════════════════════════════════════\n");
     printf("  Results: %d passed, %d failed\n", pass_count, fail_count);

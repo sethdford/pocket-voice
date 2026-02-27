@@ -435,6 +435,288 @@ static void test_softmax_sizes(void)
     PASS("Softmax correct for all tested sizes");
 }
 
+/* ── Timing Accuracy Tests ──────────────────────────────────────────────── */
+
+static void test_timing_accuracy(void)
+{
+    fprintf(stderr, "\n=== Timing Accuracy ===\n");
+
+    /* Measure a known delay and verify it's in the right ballpark */
+    uint64_t t0 = mach_absolute_time();
+    /* Busy-wait spin for ~1ms by doing computation */
+    volatile float x = 1.0f;
+    for (int i = 0; i < 100000; i++) x *= 1.000001f;
+    uint64_t t1 = mach_absolute_time();
+
+    double elapsed_ns = ns_elapsed(t0, t1);
+    ASSERT(elapsed_ns > 0, "elapsed time should be positive");
+    ASSERT(elapsed_ns < 1e9, "elapsed time should be < 1 second for busy loop");
+    fprintf(stderr, "  busy-wait elapsed: %.0f ns\n", elapsed_ns);
+    PASS("Timing measurement returns positive, reasonable values");
+}
+
+static void test_timing_nested(void)
+{
+    fprintf(stderr, "\n=== Nested Timing Measurements ===\n");
+
+    uint64_t outer_start = mach_absolute_time();
+
+    /* Inner measurement 1 */
+    uint64_t inner1_start = mach_absolute_time();
+    volatile float x = 1.0f;
+    for (int i = 0; i < 50000; i++) x *= 1.000001f;
+    uint64_t inner1_end = mach_absolute_time();
+    double inner1_ns = ns_elapsed(inner1_start, inner1_end);
+
+    /* Inner measurement 2 */
+    uint64_t inner2_start = mach_absolute_time();
+    for (int i = 0; i < 50000; i++) x *= 1.000001f;
+    uint64_t inner2_end = mach_absolute_time();
+    double inner2_ns = ns_elapsed(inner2_start, inner2_end);
+
+    uint64_t outer_end = mach_absolute_time();
+    double outer_ns = ns_elapsed(outer_start, outer_end);
+
+    ASSERT(inner1_ns > 0, "inner1 elapsed should be positive");
+    ASSERT(inner2_ns > 0, "inner2 elapsed should be positive");
+    ASSERT(outer_ns >= inner1_ns, "outer should be >= inner1");
+    ASSERT(outer_ns >= inner2_ns, "outer should be >= inner2");
+    fprintf(stderr, "  inner1=%.0f ns, inner2=%.0f ns, outer=%.0f ns\n",
+            inner1_ns, inner2_ns, outer_ns);
+    PASS("Nested timing measurements are consistent");
+}
+
+static void test_timing_reset_reuse(void)
+{
+    fprintf(stderr, "\n=== Timing Reset and Reuse ===\n");
+
+    /* Take multiple independent measurements and verify they're all reasonable */
+    double measurements[10];
+    for (int m = 0; m < 10; m++) {
+        uint64_t t0 = mach_absolute_time();
+        volatile float x = 1.0f;
+        for (int i = 0; i < 10000; i++) x *= 1.000001f;
+        uint64_t t1 = mach_absolute_time();
+        measurements[m] = ns_elapsed(t0, t1);
+    }
+
+    /* All should be positive and within 100x of each other */
+    double min_m = measurements[0], max_m = measurements[0];
+    for (int i = 1; i < 10; i++) {
+        if (measurements[i] < min_m) min_m = measurements[i];
+        if (measurements[i] > max_m) max_m = measurements[i];
+    }
+    ASSERT(min_m > 0, "all measurements should be positive");
+    ASSERT(max_m / min_m < 100.0, "measurement variance should be < 100x");
+    fprintf(stderr, "  min=%.0f ns, max=%.0f ns, ratio=%.1f\n",
+            min_m, max_m, max_m / min_m);
+    PASS("Repeated independent measurements are stable");
+}
+
+/* ── AMX Alignment Extended Tests ──────────────────────────────────────── */
+
+static void test_amx_alignment_extended(void)
+{
+    fprintf(stderr, "\n=== AMX Alignment Extended ===\n");
+
+    /* Edge cases */
+    ASSERT(ap_amx_align(0) == 0, "align(0) == 0");
+    ASSERT(ap_amx_align(1) == 32, "align(1) == 32");
+    ASSERT(ap_amx_align(31) == 32, "align(31) == 32");
+    ASSERT(ap_amx_align(32) == 32, "align(32) == 32");
+    ASSERT(ap_amx_align(33) == 64, "align(33) == 64");
+    ASSERT(ap_amx_align(64) == 64, "align(64) == 64");
+    ASSERT(ap_amx_align(65) == 96, "align(65) == 96");
+    ASSERT(ap_amx_align(1024) == 1024, "align(1024) == 1024");
+    ASSERT(ap_amx_align(1025) == 1056, "align(1025) == 1056");
+    PASS("AMX alignment extended cases correct");
+
+    /* Alloc with various sizes */
+    int sizes[] = {1, 32, 64, 128, 256, 512, 1024};
+    int n_sizes = sizeof(sizes) / sizeof(sizes[0]);
+    for (int i = 0; i < n_sizes; i++) {
+        float *p = ap_amx_alloc(sizes[i]);
+        ASSERT(p != NULL, "AMX alloc should succeed");
+        ASSERT(((uintptr_t)p & 127) == 0, "should be 128-byte aligned");
+        /* Write and read back */
+        for (int j = 0; j < sizes[i]; j++) p[j] = (float)j;
+        float check = p[sizes[i] - 1];
+        ASSERT(check == (float)(sizes[i] - 1), "read-back should match");
+        free(p);
+    }
+    PASS("AMX-aligned allocations all correct for various sizes");
+}
+
+/* ── IOSurface Extended Tests ──────────────────────────────────────────── */
+
+static void test_zerocopy_sizes(void)
+{
+    fprintf(stderr, "\n=== IOSurface Zero-Copy Buffer Sizes ===\n");
+
+    /* Test various buffer sizes */
+    size_t sizes[] = {4096, 16 * 1024, 64 * 1024, 256 * 1024};
+    int n_sizes = sizeof(sizes) / sizeof(sizes[0]);
+
+    for (int i = 0; i < n_sizes; i++) {
+        APZeroCopyBuffer buf = ap_zerocopy_create(sizes[i]);
+        ASSERT(buf.cpu_ptr != NULL, "buffer created");
+        ASSERT(buf.size >= sizes[i], "buffer size >= requested");
+
+        /* Write pattern and verify */
+        unsigned char *p = (unsigned char *)buf.cpu_ptr;
+        for (size_t j = 0; j < sizes[i] && j < 256; j++)
+            p[j] = (unsigned char)(j & 0xFF);
+        for (size_t j = 0; j < 256 && j < sizes[i]; j++)
+            ASSERT(p[j] == (unsigned char)(j & 0xFF), "pattern mismatch");
+
+        ap_zerocopy_destroy(&buf);
+        ASSERT(buf.cpu_ptr == NULL, "destroyed cleanly");
+    }
+    PASS("IOSurface buffers work at various sizes");
+}
+
+static void test_zerocopy_lifecycle(void)
+{
+    fprintf(stderr, "\n=== IOSurface Lifecycle ===\n");
+
+    for (int i = 0; i < 20; i++) {
+        APZeroCopyBuffer buf = ap_zerocopy_create(4096);
+        ASSERT(buf.cpu_ptr != NULL, "buffer created in cycle");
+        ap_zerocopy_destroy(&buf);
+    }
+    PASS("20x IOSurface create/destroy cycles stable");
+}
+
+/* ── NEON Edge Cases ───────────────────────────────────────────────────── */
+
+static void test_neon_single_element(void)
+{
+    fprintf(stderr, "\n=== NEON Single Element ===\n");
+
+    float in = 1.0f, out = 0.0f;
+
+    /* Softmax of single element should be 1.0 */
+    ap_neon_softmax(&in, &out, 1);
+    ASSERT(fabsf(out - 1.0f) < 1e-5f, "softmax(single) == 1.0");
+
+    /* GELU of 0 should be 0 */
+    float zero = 0.0f, gelu_out = 999.0f;
+    ap_neon_gelu(&zero, &gelu_out, 1);
+    ASSERT(fabsf(gelu_out) < 1e-5f, "gelu(0) == 0");
+
+    /* SiLU of 0 should be 0 */
+    float silu_out = 999.0f;
+    ap_neon_silu(&zero, &silu_out, 1);
+    ASSERT(fabsf(silu_out) < 1e-5f, "silu(0) == 0");
+
+    PASS("NEON single-element edge cases correct");
+}
+
+static void test_neon_gelu_properties(void)
+{
+    fprintf(stderr, "\n=== NEON GELU Properties ===\n");
+
+    /* GELU should be monotonically increasing for large positive inputs */
+    float in[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float out[4];
+    ap_neon_gelu(in, out, 4);
+    for (int i = 1; i < 4; i++)
+        ASSERT(out[i] > out[i - 1], "GELU should be increasing for positive x");
+
+    /* GELU(x) ≈ x for large positive x */
+    float big_in = 10.0f, big_out = 0.0f;
+    ap_neon_gelu(&big_in, &big_out, 1);
+    ASSERT(fabsf(big_out - big_in) < 0.1f, "GELU(10) ≈ 10");
+
+    PASS("GELU properties verified");
+}
+
+static void test_neon_silu_properties(void)
+{
+    fprintf(stderr, "\n=== NEON SiLU Properties ===\n");
+
+    /* SiLU should be monotonically increasing for positive inputs */
+    float in[4] = {0.5f, 1.0f, 2.0f, 4.0f};
+    float out[4];
+    ap_neon_silu(in, out, 4);
+    for (int i = 1; i < 4; i++)
+        ASSERT(out[i] > out[i - 1], "SiLU should be increasing for positive x");
+
+    /* SiLU(x) ≈ x for large positive x */
+    float big_in = 10.0f, big_out = 0.0f;
+    ap_neon_silu(&big_in, &big_out, 1);
+    ASSERT(fabsf(big_out - big_in) < 0.1f, "SiLU(10) ≈ 10");
+
+    /* SiLU is negative for x < 0 but bounded */
+    float neg_in = -5.0f, neg_out = 0.0f;
+    ap_neon_silu(&neg_in, &neg_out, 1);
+    ASSERT(neg_out < 0.0f, "SiLU(-5) < 0");
+    ASSERT(neg_out > -1.0f, "SiLU(-5) > -1 (bounded)");
+
+    PASS("SiLU properties verified");
+}
+
+static void test_neon_layernorm_constant(void)
+{
+    fprintf(stderr, "\n=== NEON LayerNorm Constant Input ===\n");
+
+    const int N = 64;
+    float in[64], out[64], g[64], b[64];
+
+    /* Constant input: layernorm should produce gamma * 0 + beta = beta
+     * because (x - mean) = 0 for all elements */
+    for (int i = 0; i < N; i++) {
+        in[i] = 5.0f;  /* constant */
+        g[i] = 2.0f;
+        b[i] = 3.0f;
+    }
+    ap_neon_layernorm(in, out, g, b, N, 1e-5f);
+
+    /* With constant input, var=0, so (x-mean)/sqrt(var+eps) ≈ 0 */
+    /* out[i] ≈ 0 * gamma + beta = beta = 3.0 */
+    for (int i = 0; i < N; i++)
+        ASSERT(fabsf(out[i] - 3.0f) < 0.1f, "layernorm of constant should be ~beta");
+
+    PASS("LayerNorm with constant input produces beta");
+}
+
+static void test_neon_rmsnorm_unit(void)
+{
+    fprintf(stderr, "\n=== NEON RMSNorm Unit Vector ===\n");
+
+    const int N = 64;
+    float in[64], out[64], g[64];
+
+    /* Input: uniform 1/sqrt(N) so RMS = 1/sqrt(N), sqrt(mean(x^2)) = 1/sqrt(N)
+     * rmsnorm = x / rms * gamma. For gamma=1, out = x * sqrt(N) */
+    float val = 1.0f / sqrtf((float)N);
+    for (int i = 0; i < N; i++) {
+        in[i] = val;
+        g[i] = 1.0f;
+    }
+    ap_neon_rmsnorm(in, out, g, N, 1e-5f);
+
+    /* out[i] should be ≈ 1.0 (x / rms(x) = 1 when all elements equal) */
+    for (int i = 0; i < N; i++)
+        ASSERT(fabsf(out[i] - 1.0f) < 0.01f, "rmsnorm of uniform should be ~1.0");
+
+    PASS("RMSNorm with uniform input produces ~1.0");
+}
+
+/* ── Model Mmap Tests ──────────────────────────────────────────────────── */
+
+static void test_model_mmap_nonexistent(void)
+{
+    fprintf(stderr, "\n=== Model Mmap Nonexistent File ===\n");
+
+    APModelMap m = ap_model_mmap("/nonexistent/file.bin");
+    ASSERT(m.base == NULL, "mmap of nonexistent file returns NULL base");
+    ASSERT(m.size == 0, "mmap of nonexistent file has size 0");
+    /* Cleanup should be safe even on failed mmap */
+    ap_model_munmap(&m);
+    PASS("Model mmap handles nonexistent file safely");
+}
+
 static void bench_comparison(void)
 {
     fprintf(stderr, "\n=== Throughput Summary (1024 elements, 10K iterations) ===\n");
@@ -509,6 +791,21 @@ int main(void)
     test_amx_alignment();
     test_prefetch();
     test_softmax_sizes();
+
+    /* New tests */
+    test_timing_accuracy();
+    test_timing_nested();
+    test_timing_reset_reuse();
+    test_amx_alignment_extended();
+    test_zerocopy_sizes();
+    test_zerocopy_lifecycle();
+    test_neon_single_element();
+    test_neon_gelu_properties();
+    test_neon_silu_properties();
+    test_neon_layernorm_constant();
+    test_neon_rmsnorm_unit();
+    test_model_mmap_nonexistent();
+
     bench_comparison();
 
     fprintf(stderr, "\n══════════════════════════════════════════════\n");

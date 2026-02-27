@@ -232,6 +232,266 @@ static void test_max_tokens_cap(void) {
     unlink(TEMP_PATH);
 }
 
+static void test_alternating_roles(void) {
+    printf("\n=== Alternating Roles ===\n");
+    unlink(TEMP_PATH);
+
+    ConversationMemory *mem = memory_create(TEMP_PATH, 50, 4000);
+
+    /* Add alternating user/assistant turns */
+    for (int i = 0; i < 10; i++) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "user msg %d", i);
+        int r = memory_add_turn(mem, "user", buf);
+        TEST(r == 0, "add user turn ok");
+        snprintf(buf, sizeof(buf), "asst reply %d", i);
+        r = memory_add_turn(mem, "assistant", buf);
+        TEST(r == 0, "add assistant turn ok");
+    }
+    TEST(memory_turn_count(mem) == 20, "20 turns stored after 10 exchanges");
+
+    /* Verify roles alternate correctly in context */
+    MemoryTurn turns[20];
+    int n = memory_get_context(mem, turns, 20);
+    TEST(n == 20, "get_context returns all 20");
+
+    /* Most recent first: turns[0] = assistant reply 9, turns[1] = user msg 9, etc. */
+    for (int i = 0; i < n - 1; i += 2) {
+        TEST(strcmp(turns[i].role, "assistant") == 0, "even idx is assistant");
+        TEST(strcmp(turns[i + 1].role, "user") == 0, "odd idx is user");
+    }
+
+    memory_destroy(mem);
+    unlink(TEMP_PATH);
+}
+
+static void test_context_ordering(void) {
+    printf("\n=== Context Ordering in Formatted Output ===\n");
+    unlink(TEMP_PATH);
+
+    ConversationMemory *mem = memory_create(TEMP_PATH, 50, 4000);
+    memory_add_turn(mem, "user", "First");
+    memory_add_turn(mem, "assistant", "Second");
+    memory_add_turn(mem, "user", "Third");
+
+    char *formatted = memory_format_context(mem);
+    TEST(formatted != NULL, "format_context non-NULL");
+
+    /* Verify chronological order: First before Second before Third */
+    char *p_first = strstr(formatted, "First");
+    char *p_second = strstr(formatted, "Second");
+    char *p_third = strstr(formatted, "Third");
+    TEST(p_first != NULL && p_second != NULL && p_third != NULL,
+         "all turns present in formatted output");
+    TEST(p_first < p_second && p_second < p_third,
+         "turns in chronological order");
+
+    free(formatted);
+    memory_destroy(mem);
+    unlink(TEMP_PATH);
+}
+
+static void test_empty_content(void) {
+    printf("\n=== Empty Content ===\n");
+    unlink(TEMP_PATH);
+
+    ConversationMemory *mem = memory_create(TEMP_PATH, 50, 4000);
+
+    /* Empty string is valid content (not NULL) */
+    int r = memory_add_turn(mem, "user", "");
+    TEST(r == 0, "add turn with empty content succeeds");
+    TEST(memory_turn_count(mem) == 1, "count is 1 after empty content");
+
+    MemoryTurn turns[4];
+    int n = memory_get_context(mem, turns, 4);
+    TEST(n == 1, "get_context returns 1 for empty content turn");
+    TEST(turns[0].content != NULL, "empty content turn has non-NULL content");
+    TEST(strlen(turns[0].content) == 0, "empty content is empty string");
+
+    /* Format should still work */
+    char *formatted = memory_format_context(mem);
+    TEST(formatted != NULL, "format_context with empty content ok");
+    free(formatted);
+
+    memory_destroy(mem);
+    unlink(TEMP_PATH);
+}
+
+static void test_very_long_content(void) {
+    printf("\n=== Very Long Content ===\n");
+    unlink(TEMP_PATH);
+
+    ConversationMemory *mem = memory_create(TEMP_PATH, 50, 100000);
+
+    /* Create a 10KB message */
+    size_t big_len = 10000;
+    char *big = (char *)malloc(big_len + 1);
+    memset(big, 'X', big_len);
+    big[big_len] = '\0';
+
+    int r = memory_add_turn(mem, "user", big);
+    TEST(r == 0, "add turn with 10KB content succeeds");
+    TEST(memory_turn_count(mem) == 1, "count is 1");
+
+    MemoryTurn turns[4];
+    int n = memory_get_context(mem, turns, 4);
+    TEST(n == 1, "get_context returns 1 for long turn");
+    TEST(strlen(turns[0].content) == big_len, "long content preserved in full");
+
+    /* Persist and reload */
+    memory_destroy(mem);
+    mem = memory_create(TEMP_PATH, 50, 100000);
+    TEST(memory_turn_count(mem) == 1, "long content survives reload");
+
+    n = memory_get_context(mem, turns, 4);
+    TEST(n == 1, "get_context after reload returns 1");
+    TEST(strlen(turns[0].content) == big_len, "long content intact after reload");
+
+    free(big);
+    memory_destroy(mem);
+    unlink(TEMP_PATH);
+}
+
+static void test_multi_cycle_persistence(void) {
+    printf("\n=== Multi-Cycle Persistence ===\n");
+    unlink(TEMP_PATH);
+
+    /* Cycle 1: add 2 turns, close */
+    ConversationMemory *mem = memory_create(TEMP_PATH, 50, 4000);
+    memory_add_turn(mem, "user", "cycle1 hello");
+    memory_add_turn(mem, "assistant", "cycle1 reply");
+    memory_destroy(mem);
+
+    /* Cycle 2: reopen, add 2 more, close */
+    mem = memory_create(TEMP_PATH, 50, 4000);
+    TEST(memory_turn_count(mem) == 2, "cycle2 reopens with 2 turns");
+    memory_add_turn(mem, "user", "cycle2 hello");
+    memory_add_turn(mem, "assistant", "cycle2 reply");
+    TEST(memory_turn_count(mem) == 4, "cycle2 has 4 turns total");
+    memory_destroy(mem);
+
+    /* Cycle 3: reopen, verify all 4 */
+    mem = memory_create(TEMP_PATH, 50, 4000);
+    TEST(memory_turn_count(mem) == 4, "cycle3 reopens with 4 turns");
+
+    MemoryTurn turns[8];
+    int n = memory_get_context(mem, turns, 8);
+    TEST(n == 4, "get_context returns 4 across cycles");
+
+    /* Search across cycles */
+    MemoryTurn hits[8];
+    n = memory_search(mem, "cycle1", hits, 8);
+    TEST(n == 2, "search cycle1 finds 2 turns");
+    n = memory_search(mem, "cycle2", hits, 8);
+    TEST(n == 2, "search cycle2 finds 2 turns");
+
+    memory_destroy(mem);
+    unlink(TEMP_PATH);
+}
+
+static void test_clear_and_re_add(void) {
+    printf("\n=== Clear and Re-Add ===\n");
+    unlink(TEMP_PATH);
+
+    ConversationMemory *mem = memory_create(TEMP_PATH, 50, 4000);
+    memory_add_turn(mem, "user", "before clear");
+    memory_add_turn(mem, "assistant", "reply before");
+    TEST(memory_turn_count(mem) == 2, "2 turns before clear");
+
+    memory_clear(mem);
+    TEST(memory_turn_count(mem) == 0, "0 turns after clear");
+
+    /* Re-add after clear */
+    memory_add_turn(mem, "user", "after clear");
+    TEST(memory_turn_count(mem) == 1, "1 turn after re-add");
+
+    MemoryTurn turns[4];
+    int n = memory_get_context(mem, turns, 4);
+    TEST(n == 1, "get_context returns 1 after clear+add");
+    TEST(strstr(turns[0].content, "after clear"), "new content present");
+
+    /* Old content should not appear */
+    MemoryTurn hits[4];
+    n = memory_search(mem, "before clear", hits, 4);
+    TEST(n == 0, "old content gone after clear");
+
+    /* Persist after clear+add and reload */
+    memory_destroy(mem);
+    mem = memory_create(TEMP_PATH, 50, 4000);
+    TEST(memory_turn_count(mem) == 1, "reload after clear+add has 1 turn");
+
+    memory_destroy(mem);
+    unlink(TEMP_PATH);
+}
+
+static void test_eviction_preserves_newest(void) {
+    printf("\n=== Eviction Preserves Newest ===\n");
+    unlink(TEMP_PATH);
+
+    /* Capacity of 3 turns */
+    ConversationMemory *mem = memory_create(TEMP_PATH, 3, 4000);
+    memory_add_turn(mem, "user", "msg_A");
+    memory_add_turn(mem, "assistant", "reply_A");
+    memory_add_turn(mem, "user", "msg_B");
+    /* At capacity (3). Next add should evict oldest. */
+    memory_add_turn(mem, "assistant", "reply_B");
+    TEST(memory_turn_count(mem) == 3, "capped at 3 after 4 adds");
+
+    /* Oldest (msg_A) should be evicted */
+    MemoryTurn hits[4];
+    int n = memory_search(mem, "msg_A", hits, 4);
+    TEST(n == 0, "oldest turn evicted");
+
+    /* Newest should remain */
+    n = memory_search(mem, "reply_B", hits, 4);
+    TEST(n == 1, "newest turn preserved");
+
+    memory_destroy(mem);
+    unlink(TEMP_PATH);
+}
+
+static void test_single_turn_capacity(void) {
+    printf("\n=== Single Turn Capacity ===\n");
+    unlink(TEMP_PATH);
+
+    /* Edge case: capacity of 1 */
+    ConversationMemory *mem = memory_create(TEMP_PATH, 1, 4000);
+    memory_add_turn(mem, "user", "first");
+    TEST(memory_turn_count(mem) == 1, "1 turn stored");
+
+    memory_add_turn(mem, "assistant", "second");
+    TEST(memory_turn_count(mem) == 1, "still 1 after second add");
+
+    MemoryTurn turns[4];
+    int n = memory_get_context(mem, turns, 4);
+    TEST(n == 1, "get_context returns 1");
+    TEST(strstr(turns[0].content, "second"), "most recent turn kept");
+
+    memory_destroy(mem);
+    unlink(TEMP_PATH);
+}
+
+static void test_get_context_limited_output(void) {
+    printf("\n=== Get Context Limited Output ===\n");
+    unlink(TEMP_PATH);
+
+    ConversationMemory *mem = memory_create(TEMP_PATH, 50, 4000);
+    for (int i = 0; i < 10; i++) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "turn %d", i);
+        memory_add_turn(mem, (i % 2 == 0) ? "user" : "assistant", buf);
+    }
+
+    /* Request only 3 turns even though 10 exist */
+    MemoryTurn turns[3];
+    int n = memory_get_context(mem, turns, 3);
+    TEST(n == 3, "get_context respects max_out=3");
+    TEST(strstr(turns[0].content, "9"), "most recent (turn 9) is first");
+
+    memory_destroy(mem);
+    unlink(TEMP_PATH);
+}
+
 int main(void) {
     printf("\n═══ Conversation Memory Tests ═══\n");
 
@@ -244,6 +504,15 @@ int main(void) {
     test_null_handling();
     test_max_turns_eviction();
     test_max_tokens_cap();
+    test_alternating_roles();
+    test_context_ordering();
+    test_empty_content();
+    test_very_long_content();
+    test_multi_cycle_persistence();
+    test_clear_and_re_add();
+    test_eviction_preserves_newest();
+    test_single_turn_capacity();
+    test_get_context_limited_output();
 
     printf("\n═══ Results: %d pass, %d fail ═══\n", pass_count, fail_count);
     return fail_count ? 1 : 0;
