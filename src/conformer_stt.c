@@ -110,6 +110,18 @@ typedef struct {
     const __fp16 *attn_linear_pos_w_h;
     const __fp16 *conv_pw1_w_h, *conv_pw2_w_h;
     const __fp16 *ff2_up_w_h, *ff2_down_w_h;
+
+    /* Raw INT8 quantized weights + per-channel scales (NULL when not int8) */
+    const int8_t *ff1_up_w_q, *ff1_down_w_q;
+    const int8_t *attn_q_w_q, *attn_k_w_q, *attn_v_w_q, *attn_out_w_q;
+    const int8_t *attn_linear_pos_w_q;
+    const int8_t *conv_pw1_w_q, *conv_pw2_w_q;
+    const int8_t *ff2_up_w_q, *ff2_down_w_q;
+    const float *ff1_up_w_qs, *ff1_down_w_qs;
+    const float *attn_q_w_qs, *attn_k_w_qs, *attn_v_w_qs, *attn_out_w_qs;
+    const float *attn_linear_pos_w_qs;
+    const float *conv_pw1_w_qs, *conv_pw2_w_qs;
+    const float *ff2_up_w_qs, *ff2_down_w_qs;
 } ConformerBlockWeights;
 
 /* Subsampling weight pointers: supports both Conv1D and NeMo dw_striding */
@@ -130,7 +142,10 @@ typedef struct {
     const float *ctc_w, *ctc_b;
     const __fp16 *ctc_w_h;          /* Raw fp16 CTC weight (NULL for fp32) */
     const __fp16 *sub_proj_w_h;     /* Raw fp16 subsampling projection */
+    const int8_t *ctc_w_q;          /* Raw INT8 CTC weight (NULL for non-int8) */
+    const float  *ctc_w_qs;         /* Per-channel scales for INT8 CTC weight */
     int use_fp16_gemm;               /* 1 = use cblas_hgemm for large matmuls */
+    int use_int8_gemm;               /* 1 = use int8 dequant+sgemm for matmuls */
 } ModelWeights;
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -176,6 +191,9 @@ typedef struct {
     /* fp16 mixed-precision scratch buffers */
     __fp16 *fp16_in;       /* [MAX_SEQ_LEN * max(D, ff_dim)] activation input (fp32→fp16) */
     __fp16 *fp16_out;      /* [MAX_SEQ_LEN * max(D, ff_dim)] GEMM output (fp16→fp32) */
+
+    /* INT8 dequantize tile scratch — reuses fp16_in memory when dtype==int8 */
+    float *int8_tile;      /* [INT8_TILE_N * max(D, ff_dim)] for tiled dequant GEMM */
 } Workspace;
 
 typedef struct {
@@ -460,11 +478,14 @@ static void linear_int8(float *out, const float *in, const int8_t *W_q,
     }
 }
 
-/* Dispatch: native hgemm > fp16 fallback > int8 dequant > fp32 */
+/* Dispatch: INT8 dequant > native hgemm > fp16 fallback > fp32 */
 static void linear_dispatch(float *out, const float *in, const float *W,
                             const __fp16 *W_h, const float *bias,
-                            int M, int K, int N, Workspace *ws) {
-    if (W_h) {
+                            int M, int K, int N, Workspace *ws,
+                            const int8_t *W_q, const float *scales) {
+    if (W_q && scales && ws->int8_tile) {
+        linear_int8(out, in, W_q, scales, bias, M, K, N, ws->int8_tile);
+    } else if (W_h) {
         if (ws->fp16_in && ws->fp16_out && get_cblas_hgemm() != NULL) {
             linear_fp16_native(out, in, W_h, bias, M, K, N, ws->fp16_in, ws->fp16_out);
         } else {
@@ -961,9 +982,12 @@ static void mhsa_forward(float *out, const float *in,
     float *K = ws->qkv + T * D;
     float *V = ws->qkv + T * 2 * D;
 
-    linear_dispatch(Q, in, bw->attn_q_w, bw->attn_q_w_h, bw->attn_q_b, T, D, D, ws);
-    linear_dispatch(K, in, bw->attn_k_w, bw->attn_k_w_h, bw->attn_k_b, T, D, D, ws);
-    linear_dispatch(V, in, bw->attn_v_w, bw->attn_v_w_h, bw->attn_v_b, T, D, D, ws);
+    linear_dispatch(Q, in, bw->attn_q_w, bw->attn_q_w_h, bw->attn_q_b, T, D, D, ws,
+                    bw->attn_q_w_q, bw->attn_q_w_qs);
+    linear_dispatch(K, in, bw->attn_k_w, bw->attn_k_w_h, bw->attn_k_b, T, D, D, ws,
+                    bw->attn_k_w_q, bw->attn_k_w_qs);
+    linear_dispatch(V, in, bw->attn_v_w, bw->attn_v_w_h, bw->attn_v_b, T, D, D, ws,
+                    bw->attn_v_w_q, bw->attn_v_w_qs);
 
     float scale = 1.0f / sqrtf((float)d_head);
     float *attn_out = ws->buf_b;
@@ -1060,7 +1084,8 @@ static void mhsa_forward(float *out, const float *in,
     }
 
     linear_dispatch(out, attn_out, bw->attn_out_w, bw->attn_out_w_h,
-                    bw->attn_out_b, T, D, D, ws);
+                    bw->attn_out_b, T, D, D, ws,
+                    bw->attn_out_w_q, bw->attn_out_w_qs);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1073,7 +1098,8 @@ static void conv_module_forward(float *out, const float *in,
     float *normed = ws->buf_b;
     layer_norm(normed, in, bw->conv_norm_w, bw->conv_norm_b, T, D);
     linear_dispatch(ws->conv_mid, normed, bw->conv_pw1_w, bw->conv_pw1_w_h,
-                    bw->conv_pw1_b, T, D, 2 * D, ws);
+                    bw->conv_pw1_b, T, D, 2 * D, ws,
+                    bw->conv_pw1_w_q, bw->conv_pw1_w_qs);
     glu(normed, ws->conv_mid, T, D);
     depthwise_conv1d(out, normed, bw->conv_dw_w, bw->conv_dw_b, T, D, K, 0);
     batch_norm_ws(normed, out, bw->conv_bn_gamma, bw->conv_bn_beta,
@@ -1081,7 +1107,8 @@ static void conv_module_forward(float *out, const float *in,
                   ws->bn_scale, ws->bn_shift);
     silu_inplace_ws(normed, T * D, ws->silu_tmp);
     linear_dispatch(out, normed, bw->conv_pw2_w, bw->conv_pw2_w_h,
-                    bw->conv_pw2_b, T, D, D, ws);
+                    bw->conv_pw2_b, T, D, D, ws,
+                    bw->conv_pw2_w_q, bw->conv_pw2_w_qs);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1093,12 +1120,16 @@ static void ffn_forward(float *out, const float *in,
                         const float *up_w, const float *up_b,
                         const float *down_w, const float *down_b,
                         const __fp16 *up_w_h, const __fp16 *down_w_h,
+                        const int8_t *up_w_q, const float *up_w_qs,
+                        const int8_t *down_w_q, const float *down_w_qs,
                         Workspace *ws, int T, int D, int ff_dim) {
     float *normed = ws->buf_b;
     layer_norm(normed, in, norm_w, norm_b, T, D);
-    linear_dispatch(ws->ff_mid, normed, up_w, up_w_h, up_b, T, D, ff_dim, ws);
+    linear_dispatch(ws->ff_mid, normed, up_w, up_w_h, up_b, T, D, ff_dim, ws,
+                    up_w_q, up_w_qs);
     silu_inplace_ws(ws->ff_mid, T * ff_dim, ws->silu_tmp);
-    linear_dispatch(out, ws->ff_mid, down_w, down_w_h, down_b, T, ff_dim, D, ws);
+    linear_dispatch(out, ws->ff_mid, down_w, down_w_h, down_b, T, ff_dim, D, ws,
+                    down_w_q, down_w_qs);
     float half = 0.5f;
     vDSP_vsmul(out, 1, &half, out, 1, T * D);
 }
@@ -1118,6 +1149,8 @@ static void conformer_block_forward(float *x, const ConformerBlockWeights *bw,
                 bw->ff1_up_w, bw->ff1_up_b,
                 bw->ff1_down_w, bw->ff1_down_b,
                 bw->ff1_up_w_h, bw->ff1_down_w_h,
+                bw->ff1_up_w_q, bw->ff1_up_w_qs,
+                bw->ff1_down_w_q, bw->ff1_down_w_qs,
                 ws, T, D, ff_dim);
     vDSP_vadd(x, 1, tmp, 1, x, 1, T * D);
 
@@ -1133,6 +1166,8 @@ static void conformer_block_forward(float *x, const ConformerBlockWeights *bw,
                 bw->ff2_up_w, bw->ff2_up_b,
                 bw->ff2_down_w, bw->ff2_down_b,
                 bw->ff2_up_w_h, bw->ff2_down_w_h,
+                bw->ff2_up_w_q, bw->ff2_up_w_qs,
+                bw->ff2_down_w_q, bw->ff2_down_w_qs,
                 ws, T, D, ff_dim);
     vDSP_vadd(x, 1, tmp, 1, x, 1, T * D);
 
@@ -1298,9 +1333,12 @@ static void mhsa_forward_cached(float *out, const float *in,
     float *K_new = ws->qkv + T * D;
     float *V_new = ws->qkv + T * 2 * D;
 
-    linear_dispatch(Q_new, in, bw->attn_q_w, bw->attn_q_w_h, bw->attn_q_b, T, D, D, ws);
-    linear_dispatch(K_new, in, bw->attn_k_w, bw->attn_k_w_h, bw->attn_k_b, T, D, D, ws);
-    linear_dispatch(V_new, in, bw->attn_v_w, bw->attn_v_w_h, bw->attn_v_b, T, D, D, ws);
+    linear_dispatch(Q_new, in, bw->attn_q_w, bw->attn_q_w_h, bw->attn_q_b, T, D, D, ws,
+                    bw->attn_q_w_q, bw->attn_q_w_qs);
+    linear_dispatch(K_new, in, bw->attn_k_w, bw->attn_k_w_h, bw->attn_k_b, T, D, D, ws,
+                    bw->attn_k_w_q, bw->attn_k_w_qs);
+    linear_dispatch(V_new, in, bw->attn_v_w, bw->attn_v_w_h, bw->attn_v_b, T, D, D, ws,
+                    bw->attn_v_w_q, bw->attn_v_w_qs);
 
     float *K_full = ws->cache_k_full;
     float *V_full = ws->cache_v_full;
@@ -1420,7 +1458,8 @@ static void mhsa_forward_cached(float *out, const float *in,
     }
 
     linear_dispatch(out, attn_out, bw->attn_out_w, bw->attn_out_w_h,
-                    bw->attn_out_b, T, D, D, ws);
+                    bw->attn_out_b, T, D, D, ws,
+                    bw->attn_out_w_q, bw->attn_out_w_qs);
 
     /* Update cache: keep the most recent CACHE_MAX_CONTEXT frames of K/V */
     if (T >= CACHE_MAX_CONTEXT) {
@@ -1469,6 +1508,8 @@ static void conformer_block_forward_cached(float *x, const ConformerBlockWeights
                 bw->ff1_up_w, bw->ff1_up_b,
                 bw->ff1_down_w, bw->ff1_down_b,
                 bw->ff1_up_w_h, bw->ff1_down_w_h,
+                bw->ff1_up_w_q, bw->ff1_up_w_qs,
+                bw->ff1_down_w_q, bw->ff1_down_w_qs,
                 ws, T, D, ff_dim);
     vDSP_vadd(x, 1, tmp, 1, x, 1, T * D);
 
@@ -1481,7 +1522,8 @@ static void conformer_block_forward_cached(float *x, const ConformerBlockWeights
     float *conv_normed = ws->buf_b;
     layer_norm(conv_normed, x, bw->conv_norm_w, bw->conv_norm_b, T, D);
     linear_dispatch(ws->conv_mid, conv_normed, bw->conv_pw1_w, bw->conv_pw1_w_h,
-                    bw->conv_pw1_b, T, D, 2 * D, ws);
+                    bw->conv_pw1_b, T, D, 2 * D, ws,
+                    bw->conv_pw1_w_q, bw->conv_pw1_w_qs);
     glu(conv_normed, ws->conv_mid, T, D);
     depthwise_conv1d_cached(tmp, conv_normed, bw->conv_dw_w, bw->conv_dw_b,
                              T, D, conv_kernel, cache, ws);
@@ -1490,13 +1532,16 @@ static void conformer_block_forward_cached(float *x, const ConformerBlockWeights
                   ws->bn_scale, ws->bn_shift);
     silu_inplace_ws(conv_normed, T * D, ws->silu_tmp);
     linear_dispatch(tmp, conv_normed, bw->conv_pw2_w, bw->conv_pw2_w_h,
-                    bw->conv_pw2_b, T, D, D, ws);
+                    bw->conv_pw2_b, T, D, D, ws,
+                    bw->conv_pw2_w_q, bw->conv_pw2_w_qs);
     vDSP_vadd(x, 1, tmp, 1, x, 1, T * D);
 
     ffn_forward(tmp, x, bw->ff2_norm_w, bw->ff2_norm_b,
                 bw->ff2_up_w, bw->ff2_up_b,
                 bw->ff2_down_w, bw->ff2_down_b,
                 bw->ff2_up_w_h, bw->ff2_down_w_h,
+                bw->ff2_up_w_q, bw->ff2_up_w_qs,
+                bw->ff2_down_w_q, bw->ff2_down_w_qs,
                 ws, T, D, ff_dim);
     vDSP_vadd(x, 1, tmp, 1, x, 1, T * D);
 
@@ -1585,7 +1630,8 @@ static int full_forward(ConformerSTT *stt, const float *mel_in, int T) {
     }
 
     linear_dispatch(ws->logits, ws->buf_a, w->ctc_w, w->ctc_w_h,
-                    w->ctc_b, T_sub, D, vocab, ws);
+                    w->ctc_b, T_sub, D, vocab, ws,
+                    w->ctc_w_q, w->ctc_w_qs);
     stt->total_frames_processed += T_sub;
     return T_sub;
 }
@@ -1786,10 +1832,14 @@ static int load_block_weights(ConformerBlockWeights *bw, WeightReader *r,
     r->current_n_rows = ff_dim;
     bw->ff1_up_w      = read_weight(r, D * ff_dim);
     bw->ff1_up_w_h    = r->last_fp16;
+    bw->ff1_up_w_q    = r->last_int8;
+    bw->ff1_up_w_qs   = r->last_int8_scales;
     bw->ff1_up_b      = read_bias(r, ff_dim);
     r->current_n_rows = D;
     bw->ff1_down_w    = read_weight(r, ff_dim * D);
     bw->ff1_down_w_h  = r->last_fp16;
+    bw->ff1_down_w_q  = r->last_int8;
+    bw->ff1_down_w_qs = r->last_int8_scales;
     bw->ff1_down_b    = read_bias(r, D);
 
     bw->attn_norm_w   = read_bias(r, D);
@@ -1797,29 +1847,41 @@ static int load_block_weights(ConformerBlockWeights *bw, WeightReader *r,
     r->current_n_rows = D;
     bw->attn_q_w      = read_weight(r, D * D);
     bw->attn_q_w_h    = r->last_fp16;
+    bw->attn_q_w_q    = r->last_int8;
+    bw->attn_q_w_qs   = r->last_int8_scales;
     bw->attn_q_b      = read_bias(r, D);
     r->current_n_rows = D;
     bw->attn_k_w      = read_weight(r, D * D);
     bw->attn_k_w_h    = r->last_fp16;
+    bw->attn_k_w_q    = r->last_int8;
+    bw->attn_k_w_qs   = r->last_int8_scales;
     bw->attn_k_b      = read_bias(r, D);
     r->current_n_rows = D;
     bw->attn_v_w      = read_weight(r, D * D);
     bw->attn_v_w_h    = r->last_fp16;
+    bw->attn_v_w_q    = r->last_int8;
+    bw->attn_v_w_qs   = r->last_int8_scales;
     bw->attn_v_b      = read_bias(r, D);
     r->current_n_rows = D;
     bw->attn_out_w    = read_weight(r, D * D);
     bw->attn_out_w_h  = r->last_fp16;
+    bw->attn_out_w_q  = r->last_int8;
+    bw->attn_out_w_qs = r->last_int8_scales;
     bw->attn_out_b    = read_bias(r, D);
 
     if (has_rel_pe) {
         r->current_n_rows = D;
         bw->attn_linear_pos_w = read_weight(r, D * D);
         bw->attn_linear_pos_w_h = r->last_fp16;
+        bw->attn_linear_pos_w_q = r->last_int8;
+        bw->attn_linear_pos_w_qs = r->last_int8_scales;
         bw->attn_pos_bias_u = read_bias(r, n_heads * (D / n_heads));
         bw->attn_pos_bias_v = read_bias(r, n_heads * (D / n_heads));
     } else {
         bw->attn_linear_pos_w = NULL;
         bw->attn_linear_pos_w_h = NULL;
+        bw->attn_linear_pos_w_q = NULL;
+        bw->attn_linear_pos_w_qs = NULL;
         bw->attn_pos_bias_u = NULL;
         bw->attn_pos_bias_v = NULL;
     }
@@ -1829,6 +1891,8 @@ static int load_block_weights(ConformerBlockWeights *bw, WeightReader *r,
     r->current_n_rows = 2 * D;
     bw->conv_pw1_w    = read_weight(r, 2 * D * D);
     bw->conv_pw1_w_h  = r->last_fp16;
+    bw->conv_pw1_w_q  = r->last_int8;
+    bw->conv_pw1_w_qs = r->last_int8_scales;
     bw->conv_pw1_b    = read_bias(r, 2 * D);
     bw->conv_dw_w     = read_bias(r, D * K);  /* Depthwise conv: small, kept as fp32 */
     bw->conv_dw_b     = read_bias(r, D);
@@ -1839,6 +1903,8 @@ static int load_block_weights(ConformerBlockWeights *bw, WeightReader *r,
     r->current_n_rows = D;
     bw->conv_pw2_w    = read_weight(r, D * D);
     bw->conv_pw2_w_h  = r->last_fp16;
+    bw->conv_pw2_w_q  = r->last_int8;
+    bw->conv_pw2_w_qs = r->last_int8_scales;
     bw->conv_pw2_b    = read_bias(r, D);
 
     bw->ff2_norm_w    = read_bias(r, D);
@@ -1846,10 +1912,14 @@ static int load_block_weights(ConformerBlockWeights *bw, WeightReader *r,
     r->current_n_rows = ff_dim;
     bw->ff2_up_w      = read_weight(r, D * ff_dim);
     bw->ff2_up_w_h    = r->last_fp16;
+    bw->ff2_up_w_q    = r->last_int8;
+    bw->ff2_up_w_qs   = r->last_int8_scales;
     bw->ff2_up_b      = read_bias(r, ff_dim);
     r->current_n_rows = D;
     bw->ff2_down_w    = read_weight(r, ff_dim * D);
     bw->ff2_down_w_h  = r->last_fp16;
+    bw->ff2_down_w_q  = r->last_int8;
+    bw->ff2_down_w_qs = r->last_int8_scales;
     bw->ff2_down_b    = read_bias(r, D);
 
     bw->final_norm_w  = read_bias(r, D);
@@ -2011,10 +2081,14 @@ static int load_weights(ConformerSTT *stt) {
             return -1;
     }
 
+    reader.current_n_rows = vocab;
     w->ctc_w = read_weight(&reader, D * vocab);
     w->ctc_w_h = reader.last_fp16;
+    w->ctc_w_q = reader.last_int8;
+    w->ctc_w_qs = reader.last_int8_scales;
     w->ctc_b = read_weight(&reader, vocab);
     w->use_fp16_gemm = is_fp16;
+    w->use_int8_gemm = is_int8;
 
     /* TDT transducer decoder weights */
     if (h->flags & CSTT_FLAG_TDT) {
@@ -2193,9 +2267,19 @@ static int workspace_alloc(Workspace *ws, const CSTTHeader *h) {
         if ((size_t)D > max_out_dim) max_out_dim = (size_t)D;
         ws->fp16_in  = (__fp16 *)calloc((size_t)MAX_SEQ_LEN * max_in_dim, sizeof(__fp16));
         ws->fp16_out = (__fp16 *)calloc((size_t)MAX_SEQ_LEN * max_out_dim, sizeof(__fp16));
+        ws->int8_tile = NULL;
+    } else if (h->dtype == 2) {
+        /* INT8 mode: allocate tile scratch for on-the-fly dequantization.
+         * Tile size = INT8_TILE_N rows * max(K dimension). The largest K is
+         * ff_dim (for FFN down projection) or D (for attention/CTC). */
+        size_t max_k = (size_t)(ff_dim > D ? ff_dim : D);
+        ws->int8_tile = (float *)calloc((size_t)INT8_TILE_N * max_k, sizeof(float));
+        ws->fp16_in = NULL;
+        ws->fp16_out = NULL;
     } else {
         ws->fp16_in = NULL;
         ws->fp16_out = NULL;
+        ws->int8_tile = NULL;
     }
 
     if (!ws->buf_a || !ws->buf_b || !ws->residual || !ws->qkv ||
@@ -2206,7 +2290,8 @@ static int workspace_alloc(Workspace *ws, const CSTTHeader *h) {
         !ws->cache_conv_merged || !ws->cache_conv_out ||
         !ws->bn_scale || !ws->bn_shift || !ws->lsp_tmp || !ws->mel_norm_buf ||
         ((h->flags & CSTT_FLAG_REL_PE) && (!ws->rel_pe || !ws->rel_pe_proj)) ||
-        (h->dtype == 1 && (!ws->fp16_in || !ws->fp16_out)))
+        (h->dtype == 1 && (!ws->fp16_in || !ws->fp16_out)) ||
+        (h->dtype == 2 && !ws->int8_tile))
         return -1;
 
     return 0;
@@ -2241,6 +2326,7 @@ static void workspace_free(Workspace *ws) {
     free(ws->feat_col);
     free(ws->fp16_in);
     free(ws->fp16_out);
+    free(ws->int8_tile);
     memset(ws, 0, sizeof(Workspace));
 }
 
@@ -2312,6 +2398,15 @@ ConformerSTT *conformer_stt_create(const char *model_path) {
         goto fail;
     }
 
+    if (stt->weights.use_int8_gemm) {
+        fprintf(stderr, "[conformer_stt] INT8 GEMM dispatch active "
+                "(per-channel symmetric, tile=%d)\n", INT8_TILE_N);
+    } else if (stt->weights.use_fp16_gemm && get_cblas_hgemm()) {
+        fprintf(stderr, "[conformer_stt] Native fp16 GEMM (cblas_hgemm) active\n");
+    } else if (stt->weights.use_fp16_gemm) {
+        fprintf(stderr, "[conformer_stt] fp16 fallback GEMM (tiled dequant→sgemm) active\n");
+    }
+
     MelConfig mel_cfg;
     mel_config_default(&mel_cfg);
     mel_cfg.sample_rate = (int)stt->header.sample_rate;
@@ -2334,8 +2429,14 @@ ConformerSTT *conformer_stt_create(const char *model_path) {
     char vocab_path[4096];
     snprintf(vocab_path, sizeof(vocab_path), "%s", model_path);
     char *dot = strrchr(vocab_path, '.');
-    if (dot) strcpy(dot, ".vocab");
-    else strcat(vocab_path, ".vocab");
+    if (dot) {
+        size_t remaining = sizeof(vocab_path) - (size_t)(dot - vocab_path);
+        snprintf(dot, remaining, ".vocab");
+    } else {
+        size_t len = strlen(vocab_path);
+        if (len + 6 < sizeof(vocab_path))
+            memcpy(vocab_path + len, ".vocab", 7);  /* includes NUL */
+    }
 
     int eou_id = -1;
     if (vocab_load(&stt->vocab, vocab_path, (int)stt->header.vocab_size, &eou_id) <= 0) {

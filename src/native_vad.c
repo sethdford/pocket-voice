@@ -318,7 +318,12 @@ static int load_weights(NativeVad *vad, const char *path) {
         size_t b_sz = (size_t)ENC_OUT_CH[i];
         vad->enc_w[i] = (float *)malloc(w_sz * sizeof(float));
         vad->enc_b[i] = (float *)malloc(b_sz * sizeof(float));
-        if (!vad->enc_w[i] || !vad->enc_b[i]) { fclose(f); return -1; }
+        if (!vad->enc_w[i] || !vad->enc_b[i]) {
+            /* Free partially allocated encoder layers */
+            for (int j = 0; j <= i; j++) { free(vad->enc_w[j]); free(vad->enc_b[j]); }
+            fclose(f);
+            return -1;
+        }
         READ_WEIGHTS(vad->enc_w[i], w_sz);
         READ_WEIGHTS(vad->enc_b[i], b_sz);
     }

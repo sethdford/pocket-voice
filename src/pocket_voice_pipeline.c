@@ -294,6 +294,10 @@ static SttInterface stt_create_rust(const char *repo, const char *model, int ena
     SttInterface iface = {0};
     iface.type = STT_ENGINE_RUST;
     iface.engine = pocket_stt_create(repo, model, enable_vad);
+    if (!iface.engine) {
+        fprintf(stderr, "[stt] pocket_stt_create failed\n");
+        return iface;
+    }
     iface.sample_rate = pocket_stt_sample_rate();
     iface.frame_size = pocket_stt_frame_size();
     iface.process_frame = rstt_process_frame;
@@ -310,9 +314,13 @@ static SttInterface stt_create_conformer(const char *model_path) {
     SttInterface iface = {0};
     iface.type = STT_ENGINE_CONFORMER;
     ConformerSTT *cstt = conformer_stt_create(model_path);
+    if (!cstt) {
+        fprintf(stderr, "[stt] conformer_stt_create failed\n");
+        return iface;
+    }
     iface.engine = cstt;
-    iface.sample_rate = cstt ? conformer_stt_sample_rate(cstt) : 16000;
-    iface.frame_size = cstt ? (iface.sample_rate / 1000) * 80 : 1280; /* 80ms */
+    iface.sample_rate = conformer_stt_sample_rate(cstt);
+    iface.frame_size = (iface.sample_rate / 1000) * 80; /* 80ms */
     iface.process_frame = cstt_process_frame;
     iface.flush = cstt_flush;
     iface.get_text = cstt_get_text;
@@ -643,6 +651,9 @@ typedef struct {
     int           synthesized;  /* 1 = mel converted to audio and ready */
     float        *phase_accum_buf;  /* per-bin phase accumulation for iSTFT continuity */
     float        *mel_buf;          /* pre-allocated mel buffer to avoid malloc on hot path */
+    float        *mag_buf;          /* pre-allocated iSTFT magnitude buffer */
+    float        *phase_buf;        /* pre-allocated iSTFT phase buffer */
+    int           istft_buf_cap;    /* capacity in frames for mag/phase buffers */
 } SonataV2Engine;
 
 /* Convert one frame of 80-bin log-mel to 513-bin magnitude + phase for iSTFT.
@@ -704,12 +715,15 @@ static int sonatav2_set_text_done(void *e) {
     }
 
     int n_bins = SONATA_N_BINS;
-    float *mag = malloc((size_t)n_frames * n_bins * sizeof(float));
-    float *phase = malloc((size_t)n_frames * n_bins * sizeof(float));
-    if (!mag || !phase) {
-        free(mag);
-        free(phase);
-        return -1;
+
+    /* Grow pre-allocated mag/phase buffers if needed */
+    if (n_frames > ev->istft_buf_cap) {
+        free(ev->mag_buf);
+        free(ev->phase_buf);
+        ev->istft_buf_cap = n_frames + 64;
+        ev->mag_buf = (float *)malloc((size_t)ev->istft_buf_cap * n_bins * sizeof(float));
+        ev->phase_buf = (float *)malloc((size_t)ev->istft_buf_cap * n_bins * sizeof(float));
+        if (!ev->mag_buf || !ev->phase_buf) return -1;
     }
 
     /* Reset phase accumulator for this utterance */
@@ -717,26 +731,20 @@ static int sonatav2_set_text_done(void *e) {
         memset(ev->phase_accum_buf, 0, (size_t)n_bins * sizeof(float));
     for (int f = 0; f < n_frames; f++) {
         mel_frame_to_mag_phase(ev->mel_buf + f * SONATA_V2_MEL_DIM, SONATA_V2_MEL_DIM,
-                              mag + f * n_bins, phase + f * n_bins, n_bins,
+                              ev->mag_buf + f * n_bins, ev->phase_buf + f * n_bins, n_bins,
                               ev->phase_accum_buf, SONATA_HOP, SONATA_N_FFT);
     }
 
     int total_samples = n_frames * SONATA_HOP;
     if (total_samples > ev->audio_cap) {
         float *narrow = realloc(ev->audio_buf, (size_t)total_samples * sizeof(float));
-        if (!narrow) {
-            free(mag);
-            free(phase);
-            return -1;
-        }
+        if (!narrow) return -1;
         ev->audio_buf = narrow;
         ev->audio_cap = total_samples;
     }
 
     sonata_istft_reset(ev->istft);
-    int written = sonata_istft_decode_batch(ev->istft, mag, phase, n_frames, ev->audio_buf);
-    free(mag);
-    free(phase);
+    int written = sonata_istft_decode_batch(ev->istft, ev->mag_buf, ev->phase_buf, n_frames, ev->audio_buf);
 
     ev->audio_len = written;
     ev->audio_pos = 0;

@@ -72,6 +72,7 @@ SonataISTFT *sonata_istft_create(int n_fft, int hop_length) {
     int tmp = n_fft;
     while (tmp > 1) { dec->log2n++; tmp >>= 1; }
     dec->fft_setup = vDSP_create_fftsetup(dec->log2n, FFT_RADIX2);
+    if (!dec->fft_setup) { free(dec); return NULL; }
 
     /* Hann window */
     dec->window = calloc(n_fft, sizeof(float));

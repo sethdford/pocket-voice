@@ -135,6 +135,7 @@ int phonemizer_load_phoneme_map(Phonemizer *ph, const char *json_path) {
     }
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
+    if (fsize <= 0) { fclose(f); return -1; }
     fseek(f, 0, SEEK_SET);
 
     char *json_str = (char *)malloc((size_t)fsize + 1);
@@ -302,6 +303,7 @@ PronunciationDict *pronunciation_dict_load(const char *json_path) {
     }
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
+    if (fsize <= 0) { fclose(f); return NULL; }
     fseek(f, 0, SEEK_SET);
 
     char *json_str = (char *)malloc((size_t)fsize + 1);

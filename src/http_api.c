@@ -15,6 +15,14 @@
 #include <dlfcn.h>
 #include <mach/mach_time.h>
 
+#ifdef SONATA_TLS
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#include <Security/Security.h>
+#include <Security/SecureTransport.h>
+#pragma clang diagnostic pop
+#endif
+
 /* Opus codec FFI — libpocket_opus provides create/destroy, encode/decode */
 typedef struct PocketOpus PocketOpus;
 extern PocketOpus *pocket_opus_create(int sample_rate, int channels, int bitrate,
@@ -159,7 +167,202 @@ struct HttpApi {
     pthread_mutex_t  voice_mutex;
     pthread_mutex_t  tts_mutex;
     RateLimiter      rate_limiter;
+#ifdef SONATA_TLS
+    bool            tls_enabled;
+    SecIdentityRef  tls_identity;
+    SecKeychainRef  tls_keychain;
+#endif
 };
+
+/* ─── TLS / Connection Abstraction ─────────────────────────────────────── */
+
+#ifdef SONATA_TLS
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
+static __thread SSLContextRef tls_current_ssl = NULL;
+
+/* SSLSetIOFuncs callbacks — delegate to raw fd I/O */
+static OSStatus tls_io_read(SSLConnectionRef connection, void *data,
+                             size_t *len) {
+    int fd = (int)(intptr_t)connection;
+    ssize_t n = read(fd, data, *len);
+    if (n > 0) {
+        size_t requested = *len;
+        *len = (size_t)n;
+        return ((size_t)n < requested) ? errSSLWouldBlock : noErr;
+    }
+    *len = 0;
+    return (n == 0) ? errSSLClosedGraceful : errSSLClosedAbort;
+}
+
+static OSStatus tls_io_write(SSLConnectionRef connection, const void *data,
+                              size_t *len) {
+    int fd = (int)(intptr_t)connection;
+    ssize_t n = write(fd, data, *len);
+    if (n > 0) {
+        size_t requested = *len;
+        *len = (size_t)n;
+        return ((size_t)n < requested) ? errSSLWouldBlock : noErr;
+    }
+    *len = 0;
+    return errSSLClosedAbort;
+}
+
+/* Read a file into CFData */
+static CFDataRef tls_load_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long flen = ftell(f);
+    if (flen <= 0 || flen > 1024 * 1024) { fclose(f); return NULL; }
+    fseek(f, 0, SEEK_SET);
+    uint8_t *buf = malloc((size_t)flen);
+    if (!buf) { fclose(f); return NULL; }
+    size_t rd = fread(buf, 1, (size_t)flen, f);
+    fclose(f);
+    CFDataRef data = CFDataCreate(kCFAllocatorDefault, buf, (CFIndex)rd);
+    free(buf);
+    return data;
+}
+
+/* Load PEM cert + key via temporary keychain → SecIdentityRef */
+static int tls_load_pem(const char *cert_path, const char *key_path,
+                         SecIdentityRef *out_id, SecKeychainRef *out_kc) {
+    char kc_path[256];
+    snprintf(kc_path, sizeof(kc_path), "/tmp/sonata-tls-%d.keychain", getpid());
+    unlink(kc_path);
+
+    SecKeychainRef kc = NULL;
+    OSStatus st = SecKeychainCreate(kc_path, 8, "sonata00", FALSE, NULL, &kc);
+    if (st != errSecSuccess) {
+        fprintf(stderr, "[tls] Keychain create failed: %d\n", (int)st);
+        return -1;
+    }
+
+    /* Import certificate */
+    CFDataRef cd = tls_load_file(cert_path);
+    if (!cd) {
+        fprintf(stderr, "[tls] Failed to read cert: %s\n", cert_path);
+        SecKeychainDelete(kc); CFRelease(kc);
+        return -1;
+    }
+    SecExternalFormat fmt = kSecFormatPEMSequence;
+    SecExternalItemType itype = kSecItemTypeCertificate;
+    CFArrayRef items = NULL;
+    st = SecItemImport(cd, NULL, &fmt, &itype, 0, NULL, kc, &items);
+    CFRelease(cd);
+    if (st != errSecSuccess || !items || CFArrayGetCount(items) == 0) {
+        fprintf(stderr, "[tls] Cert import failed: %d\n", (int)st);
+        if (items) CFRelease(items);
+        SecKeychainDelete(kc); CFRelease(kc);
+        return -1;
+    }
+    SecCertificateRef cert = (SecCertificateRef)CFArrayGetValueAtIndex(items, 0);
+    CFRetain(cert);
+    CFRelease(items);
+
+    /* Import private key */
+    CFDataRef kd = tls_load_file(key_path);
+    if (!kd) {
+        fprintf(stderr, "[tls] Failed to read key: %s\n", key_path);
+        CFRelease(cert); SecKeychainDelete(kc); CFRelease(kc);
+        return -1;
+    }
+    fmt = kSecFormatPEMSequence;
+    itype = kSecItemTypePrivateKey;
+    items = NULL;
+    SecItemImportExportKeyParameters kparams = {
+        .version = SEC_KEY_IMPORT_EXPORT_PARAMS_VERSION,
+    };
+    st = SecItemImport(kd, NULL, &fmt, &itype, 0, &kparams, kc, &items);
+    CFRelease(kd);
+    if (st != errSecSuccess) {
+        fprintf(stderr, "[tls] Key import failed: %d\n", (int)st);
+        if (items) CFRelease(items);
+        CFRelease(cert); SecKeychainDelete(kc); CFRelease(kc);
+        return -1;
+    }
+    if (items) CFRelease(items);
+
+    /* Create identity from cert + key in keychain */
+    st = SecIdentityCreateWithCertificate(kc, cert, out_id);
+    CFRelease(cert);
+    if (st != errSecSuccess) {
+        fprintf(stderr, "[tls] Identity creation failed: %d\n", (int)st);
+        SecKeychainDelete(kc); CFRelease(kc);
+        return -1;
+    }
+
+    *out_kc = kc;
+    return 0;
+}
+
+/* Wrap accepted fd with TLS; returns SSLContextRef or NULL */
+static SSLContextRef tls_wrap_fd(int fd, SecIdentityRef identity) {
+    SSLContextRef ssl = SSLCreateContext(kCFAllocatorDefault,
+                                         kSSLServerSide, kSSLStreamType);
+    if (!ssl) return NULL;
+
+    SSLSetIOFuncs(ssl, tls_io_read, tls_io_write);
+    SSLSetConnection(ssl, (SSLConnectionRef)(intptr_t)fd);
+
+    CFArrayRef certs = CFArrayCreate(kCFAllocatorDefault,
+                                      (const void **)&identity, 1,
+                                      &kCFTypeArrayCallBacks);
+    SSLSetCertificate(ssl, certs);
+    CFRelease(certs);
+
+    OSStatus st;
+    do { st = SSLHandshake(ssl); } while (st == errSSLWouldBlock);
+
+    if (st != noErr) {
+        fprintf(stderr, "[tls] Handshake failed: %d\n", (int)st);
+        CFRelease(ssl);
+        return NULL;
+    }
+
+    return ssl;
+}
+
+#pragma clang diagnostic pop
+#endif /* SONATA_TLS */
+
+/* Socket I/O wrappers — dispatch to TLS or plain sockets */
+
+static ssize_t sonata_read(int fd, void *buf, size_t len) {
+#ifdef SONATA_TLS
+    if (tls_current_ssl) {
+        size_t processed = 0;
+        OSStatus st;
+        #pragma clang diagnostic push
+        #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        st = SSLRead(tls_current_ssl, buf, len, &processed);
+        #pragma clang diagnostic pop
+        if (st == noErr || st == errSSLWouldBlock) return (ssize_t)processed;
+        if (st == errSSLClosedGraceful) return 0;
+        return -1;
+    }
+#endif
+    return read(fd, buf, len);
+}
+
+static ssize_t sonata_write(int fd, const void *buf, size_t len) {
+#ifdef SONATA_TLS
+    if (tls_current_ssl) {
+        size_t processed = 0;
+        OSStatus st;
+        #pragma clang diagnostic push
+        #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        st = SSLWrite(tls_current_ssl, buf, len, &processed);
+        #pragma clang diagnostic pop
+        if (st == noErr || st == errSSLWouldBlock) return (ssize_t)processed;
+        return -1;
+    }
+#endif
+    return write(fd, buf, len);
+}
 
 typedef struct {
     char method[8];
@@ -195,13 +398,13 @@ static void send_response(int fd, int status, const char *content_type,
         "Connection: close\r\n"
         "\r\n",
         status, status_text, content_type, body_len);
-    ssize_t wr = write(fd, header, (size_t)hlen);
+    ssize_t wr = sonata_write(fd, header, (size_t)hlen);
     if (wr < 0) return;
     if (body && body_len > 0) {
         const uint8_t *p = (const uint8_t *)body;
         int remaining = body_len;
         while (remaining > 0) {
-            wr = write(fd, p, (size_t)remaining);
+            wr = sonata_write(fd, p, (size_t)remaining);
             if (wr <= 0) break;
             p += wr;
             remaining -= (int)wr;
@@ -220,7 +423,7 @@ static int parse_request(int fd, HttpRequest *req) {
     ssize_t n;
 
     while (total < (ssize_t)sizeof(buf) - 1) {
-        n = read(fd, buf + total, (size_t)(sizeof(buf) - 1 - (size_t)total));
+        n = sonata_read(fd, buf + total, (size_t)(sizeof(buf) - 1 - (size_t)total));
         if (n <= 0) return -1;
         total += n;
         buf[total] = '\0';
@@ -309,7 +512,7 @@ static int parse_request(int fd, HttpRequest *req) {
             memcpy(req->body, body_start, (size_t)body_received);
         }
         while (body_received < req->content_length) {
-            n = read(fd, req->body + body_received,
+            n = sonata_read(fd, req->body + body_received,
                      (size_t)(req->content_length - body_received));
             if (n <= 0) { free(req->body); req->body = NULL; return -1; }
             body_received += (int)n;
@@ -1076,20 +1279,20 @@ static void send_chunked_header(int fd, const char *content_type) {
         "Access-Control-Allow-Origin: *\r\n"
         "Connection: close\r\n"
         "\r\n", content_type);
-    write(fd, header, (size_t)hlen);
+    sonata_write(fd, header, (size_t)hlen);
 }
 
 static int send_chunk(int fd, const void *data, int len) {
     char size_line[32];
     int slen = snprintf(size_line, sizeof(size_line), "%x\r\n", len);
-    if (write(fd, size_line, (size_t)slen) < 0) return -1;
-    if (len > 0 && write(fd, data, (size_t)len) < 0) return -1;
-    if (write(fd, "\r\n", 2) < 0) return -1;
+    if (sonata_write(fd, size_line, (size_t)slen) < 0) return -1;
+    if (len > 0 && sonata_write(fd, data, (size_t)len) < 0) return -1;
+    if (sonata_write(fd, "\r\n", 2) < 0) return -1;
     return 0;
 }
 
 static void send_chunk_end(int fd) {
-    write(fd, "0\r\n\r\n", 5);
+    sonata_write(fd, "0\r\n\r\n", 5);
 }
 
 /* Build pronunciation override arrays from TtsRequest for process_text */
@@ -1424,8 +1627,8 @@ static void handle_tts(int fd, HttpRequest *req, HttpApi *api) {
                 "Connection: close\r\n"
                 "\r\n",
                 jpos, wav_size);
-            write(fd, header, (size_t)hlen);
-            write(fd, json_buf, (size_t)jpos);
+            sonata_write(fd, header, (size_t)hlen);
+            sonata_write(fd, json_buf, (size_t)jpos);
             free(wav_buf);
         } else {
             send_json(fd, 200, json_buf);
@@ -1837,12 +2040,26 @@ static int check_auth(int fd, HttpApi *api, HttpRequest *req) {
 }
 
 static void handle_client(int fd, HttpApi *api) {
+#ifdef SONATA_TLS
+    SSLContextRef ssl = NULL;
+    if (api->tls_enabled) {
+        #pragma clang diagnostic push
+        #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        ssl = tls_wrap_fd(fd, api->tls_identity);
+        #pragma clang diagnostic pop
+        if (!ssl) {
+            close(fd);
+            return;
+        }
+        tls_current_ssl = ssl;
+    }
+#endif
+
     HttpApiEngines *eng = &api->eng;
     HttpRequest req;
     if (parse_request(fd, &req) != 0) {
         send_json(fd, 400, "{\"error\":\"Bad request\"}");
-        close(fd);
-        return;
+        goto cleanup;
     }
 
     if (strcmp(req.method, "OPTIONS") == 0) {
@@ -1855,8 +2072,19 @@ static void handle_client(int fd, HttpApi *api) {
         send_json(fd, 429, "{\"error\":\"Rate limit exceeded. Try again shortly.\"}");
     } else if (strcmp(req.path, "/v1/stream") == 0 && strcmp(req.method, "GET") == 0 &&
                req.ws_upgrade && req.ws_key[0] != '\0') {
+        /* NOTE: WebSocket uses raw fd — TLS not yet supported for /v1/stream */
         handle_websocket_stream(fd, req.ws_key, eng);
         free(req.body);
+#ifdef SONATA_TLS
+        if (ssl) {
+            #pragma clang diagnostic push
+            #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            SSLClose(ssl);
+            CFRelease(ssl);
+            #pragma clang diagnostic pop
+            tls_current_ssl = NULL;
+        }
+#endif
         return;
     } else if (strcmp(req.path, "/v1/stream") == 0 && strcmp(req.method, "GET") == 0) {
         send_json(fd, 400, "{\"error\":\"WebSocket upgrade required\"}");
@@ -1875,6 +2103,17 @@ static void handle_client(int fd, HttpApi *api) {
     }
 
     free(req.body);
+cleanup:
+#ifdef SONATA_TLS
+    if (ssl) {
+        #pragma clang diagnostic push
+        #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        SSLClose(ssl);
+        CFRelease(ssl);
+        #pragma clang diagnostic pop
+        tls_current_ssl = NULL;
+    }
+#endif
     close(fd);
 }
 
@@ -1929,6 +2168,24 @@ HttpApi *http_api_create(int port, HttpApiEngines engines) {
     const char *env_key = getenv("SONATA_API_KEY");
     if (env_key && *env_key)
         snprintf(api->api_key, sizeof(api->api_key), "%s", env_key);
+
+#ifdef SONATA_TLS
+    /* Load TLS certificate and key from environment */
+    const char *tls_cert = getenv("SONATA_TLS_CERT");
+    const char *tls_key  = getenv("SONATA_TLS_KEY");
+    if (tls_cert && *tls_cert && tls_key && *tls_key) {
+        #pragma clang diagnostic push
+        #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        if (tls_load_pem(tls_cert, tls_key,
+                         &api->tls_identity, &api->tls_keychain) == 0) {
+            api->tls_enabled = true;
+            fprintf(stderr, "[tls] Loaded cert=%s key=%s\n", tls_cert, tls_key);
+        } else {
+            fprintf(stderr, "[tls] Failed to load TLS credentials — running plain HTTP\n");
+        }
+        #pragma clang diagnostic pop
+    }
+#endif
 
     return api;
 }
@@ -1993,10 +2250,18 @@ int http_api_start(HttpApi *api) {
     }
     api->accept_thread_started = 1;
 
-    fprintf(stderr, "[http] API server listening on http://0.0.0.0:%d (%d workers)\n",
-            api->port, THREAD_POOL_SIZE);
+    const char *proto = "http";
+#ifdef SONATA_TLS
+    if (api->tls_enabled) proto = "https";
+#endif
+    fprintf(stderr, "[http] API server listening on %s://0.0.0.0:%d (%d workers)\n",
+            proto, api->port, THREAD_POOL_SIZE);
     if (api->api_key[0])
         fprintf(stderr, "[http] API key authentication enabled (SONATA_API_KEY)\n");
+#ifdef SONATA_TLS
+    if (api->tls_enabled)
+        fprintf(stderr, "[http] TLS enabled (Security.framework SecureTransport)\n");
+#endif
     fprintf(stderr, "[http] Endpoints:\n");
     fprintf(stderr, "[http]   GET  /health                   - Health check\n");
     fprintf(stderr, "[http]   GET  /v1/stream                - WebSocket audio streaming\n");
@@ -2034,5 +2299,16 @@ void http_api_destroy(HttpApi *api) {
     pthread_mutex_destroy(&api->voice_mutex);
     pthread_mutex_destroy(&api->tts_mutex);
     rl_destroy(&api->rate_limiter);
+#ifdef SONATA_TLS
+    if (api->tls_identity) { CFRelease(api->tls_identity); api->tls_identity = NULL; }
+    if (api->tls_keychain) {
+        #pragma clang diagnostic push
+        #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        SecKeychainDelete(api->tls_keychain);
+        #pragma clang diagnostic pop
+        CFRelease(api->tls_keychain);
+        api->tls_keychain = NULL;
+    }
+#endif
     free(api);
 }

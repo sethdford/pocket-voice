@@ -46,8 +46,12 @@ static char *expand_path(const char *path) {
         size_t rest = (path[1] == '/') ? strlen(path + 1) : 0;
         char *out = malloc(home_len + rest + 2);
         if (!out) return NULL;
-        memcpy(out, home, home_len + 1);
-        if (path[1] == '/') strcat(out, path + 1);
+        memcpy(out, home, home_len);
+        if (path[1] == '/') {
+            memcpy(out + home_len, path + 1, rest + 1);
+        } else {
+            out[home_len] = '\0';
+        }
         return out;
     }
     return strdup(path);
@@ -294,8 +298,8 @@ char *memory_format_context(ConversationMemory *mem) {
     MemoryTurn tmp[64];
     int n = memory_get_context(mem, tmp, 64);
     if (n == 0) {
-        char *s = malloc(22);
-        if (s) strcpy(s, "Previous conversation:\n");
+        char *s = malloc(24);
+        if (s) memcpy(s, "Previous conversation:\n", 23);
         return s;
     }
 
@@ -309,15 +313,16 @@ char *memory_format_context(ConversationMemory *mem) {
 
     char *out = malloc(total + 1);
     if (!out) return NULL;
-    char *p = out;
-    p += sprintf(p, "Previous conversation:\n");
+    int off = 0;
+    off += snprintf(out + off, total + 1 - off, "Previous conversation:\n");
     for (int i = n - 1; i >= 0; i--) {
         const char *role = tmp[i].role;
         const char *content = tmp[i].content ? tmp[i].content : "";
         const char *label = (role && strcmp(role, "user") == 0) ? "User" : "Assistant";
-        p += sprintf(p, "%s: %s\n", label, content);
+        int w = snprintf(out + off, total + 1 - off, "%s: %s\n", label, content);
+        if (w > 0) off += w;
     }
-    *p = '\0';
+    out[off] = '\0';
     return out;
 }
 

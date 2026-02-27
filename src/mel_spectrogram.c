@@ -41,10 +41,12 @@ struct MelSpectrogram {
     float *fft_real;        /* [n_fft / 2] */
     float *fft_imag;        /* [n_fft / 2] */
 
-    /* Streaming PCM accumulator */
+    /* Streaming PCM ring buffer accumulator */
     float *pcm_buf;
-    int    pcm_len;
+    int    ring_head;       /* Write position in ring */
+    int    ring_count;      /* Number of valid samples in ring */
     int    pcm_cap;
+    float *frame_buf;       /* Temp buffer [win_length] for wrapped ring reads */
 
     /* Working buffers */
     float *windowed;        /* [n_fft] */
@@ -171,9 +173,19 @@ MelSpectrogram *mel_create(const MelConfig *cfg) {
     mel->window = (float *)malloc(cfg->win_length * sizeof(float));
     if (!mel->window) goto fail;
     {
-        float denom = cfg->periodic_window ? (float)cfg->win_length : (float)(cfg->win_length - 1);
-        for (int i = 0; i < cfg->win_length; i++)
-            mel->window[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / denom));
+        int wlen = cfg->win_length;
+        float denom = cfg->periodic_window ? (float)wlen : (float)(wlen - 1);
+        /* Vectorized Hann window via vDSP batch ops */
+        float zero = 0.0f, one = 1.0f;
+        vDSP_vramp(&zero, &one, mel->window, 1, wlen);        /* [0, 1, ..., wlen-1] */
+        float scale = 2.0f * (float)M_PI / denom;
+        vDSP_vsmul(mel->window, 1, &scale, mel->window, 1, wlen);  /* 2*pi*i/denom */
+        int n = wlen;
+        vvcosf(mel->window, mel->window, &n);                  /* cos(2*pi*i/denom) */
+        float neg = -0.5f;
+        vDSP_vsmul(mel->window, 1, &neg, mel->window, 1, wlen);   /* -0.5 * cos */
+        float half = 0.5f;
+        vDSP_vsadd(mel->window, 1, &half, mel->window, 1, wlen);  /* 0.5 - 0.5*cos */
     }
 
     /* Mel filterbank */
@@ -195,11 +207,16 @@ MelSpectrogram *mel_create(const MelConfig *cfg) {
     mel->fft_split.realp = mel->fft_real;
     mel->fft_split.imagp = mel->fft_imag;
 
-    /* PCM accumulator — hold up to 4 seconds of audio */
+    /* PCM ring buffer accumulator — hold up to 4 seconds of audio */
     mel->pcm_cap = mel->cfg.sample_rate * 4;
     mel->pcm_buf = (float *)calloc(mel->pcm_cap, sizeof(float));
     if (!mel->pcm_buf) goto fail;
-    mel->pcm_len = 0;
+    mel->ring_head = 0;
+    mel->ring_count = 0;
+
+    /* Temp buffer for ring reads that wrap around the boundary */
+    mel->frame_buf = (float *)malloc(cfg->win_length * sizeof(float));
+    if (!mel->frame_buf) goto fail;
 
     /* Working buffers */
     mel->windowed   = (float *)calloc(n_fft, sizeof(float));
@@ -222,6 +239,7 @@ void mel_destroy(MelSpectrogram *mel) {
     free(mel->fft_real);
     free(mel->fft_imag);
     free(mel->pcm_buf);
+    free(mel->frame_buf);
     free(mel->windowed);
     free(mel->power_spec);
     free(mel->mel_frame);
@@ -291,6 +309,57 @@ static void extract_one_frame(MelSpectrogram *mel, const float *pcm_frame) {
     vvlogf(mel->mel_frame, mel->mel_frame, &n);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Ring buffer helpers — eliminate memmove by using circular indices
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static void ring_write(MelSpectrogram *mel, const float *data, int n) {
+    int cap = mel->pcm_cap;
+    int head = mel->ring_head;
+    int first = cap - head;
+    if (first >= n) {
+        memcpy(mel->pcm_buf + head, data, (size_t)n * sizeof(float));
+    } else {
+        memcpy(mel->pcm_buf + head, data, (size_t)first * sizeof(float));
+        memcpy(mel->pcm_buf, data + first, (size_t)(n - first) * sizeof(float));
+    }
+    mel->ring_head = (head + n) % cap;
+    mel->ring_count += n;
+}
+
+static void ring_write_zeros(MelSpectrogram *mel, int n) {
+    int cap = mel->pcm_cap;
+    int head = mel->ring_head;
+    int first = cap - head;
+    if (first >= n) {
+        memset(mel->pcm_buf + head, 0, (size_t)n * sizeof(float));
+    } else {
+        memset(mel->pcm_buf + head, 0, (size_t)first * sizeof(float));
+        memset(mel->pcm_buf, 0, (size_t)(n - first) * sizeof(float));
+    }
+    mel->ring_head = (head + n) % cap;
+    mel->ring_count += n;
+}
+
+/* Read `n` samples starting at ring offset `start_off` from tail */
+static const float *ring_read(MelSpectrogram *mel, int start_off, int n) {
+    int cap = mel->pcm_cap;
+    int tail = (mel->ring_head - mel->ring_count + cap) % cap;
+    int pos = (tail + start_off) % cap;
+    /* Contiguous case — no wrap */
+    if (pos + n <= cap)
+        return mel->pcm_buf + pos;
+    /* Wraps around — copy into frame_buf */
+    int first = cap - pos;
+    memcpy(mel->frame_buf, mel->pcm_buf + pos, (size_t)first * sizeof(float));
+    memcpy(mel->frame_buf + first, mel->pcm_buf, (size_t)(n - first) * sizeof(float));
+    return mel->frame_buf;
+}
+
+static void ring_consume(MelSpectrogram *mel, int n) {
+    mel->ring_count -= n;
+}
+
 int mel_process(MelSpectrogram *mel, const float *pcm, int n_samples,
                 float *out, int max_frames) {
     if (!mel || !pcm || !out || n_samples <= 0 || max_frames <= 0)
@@ -323,48 +392,62 @@ int mel_process(MelSpectrogram *mel, const float *pcm, int n_samples,
 
     /* Center padding: on first call, prepend n_fft/2 zeros (matches torch.stft center=True) */
     int center_pad = 0;
-    if (mel->pcm_len == 0)
+    if (mel->ring_count == 0)
         center_pad = mel->cfg.n_fft / 2;
 
+    /* Ensure ring has capacity */
     int total_new = center_pad + n_samples;
-    int space = mel->pcm_cap - mel->pcm_len;
+    int space = mel->pcm_cap - mel->ring_count;
     if (total_new > space) {
-        int new_cap = mel->pcm_len + total_new + mel->cfg.sample_rate;
-        float *new_buf = (float *)realloc(mel->pcm_buf, new_cap * sizeof(float));
+        /* Grow the ring buffer — linearize, realloc, reset head */
+        int new_cap = mel->ring_count + total_new + mel->cfg.sample_rate;
+        float *new_buf = (float *)malloc((size_t)new_cap * sizeof(float));
         if (!new_buf) return -1;
+        /* Copy ring contents linearly into new buffer */
+        int tail = (mel->ring_head - mel->ring_count + mel->pcm_cap) % mel->pcm_cap;
+        if (tail + mel->ring_count <= mel->pcm_cap) {
+            memcpy(new_buf, mel->pcm_buf + tail, (size_t)mel->ring_count * sizeof(float));
+        } else {
+            int first = mel->pcm_cap - tail;
+            memcpy(new_buf, mel->pcm_buf + tail, (size_t)first * sizeof(float));
+            memcpy(new_buf + first, mel->pcm_buf, (size_t)(mel->ring_count - first) * sizeof(float));
+        }
+        free(mel->pcm_buf);
         mel->pcm_buf = new_buf;
         mel->pcm_cap = new_cap;
+        mel->ring_head = mel->ring_count;
+        /* Also resize frame_buf if needed */
+        if (win > mel->cfg.win_length) {
+            free(mel->frame_buf);
+            mel->frame_buf = (float *)malloc((size_t)win * sizeof(float));
+        }
     }
-    if (center_pad > 0) {
-        memset(mel->pcm_buf + mel->pcm_len, 0, center_pad * sizeof(float));
-        mel->pcm_len += center_pad;
-    }
-    memcpy(mel->pcm_buf + mel->pcm_len, src, n_samples * sizeof(float));
-    mel->pcm_len += n_samples;
+
+    if (center_pad > 0)
+        ring_write_zeros(mel, center_pad);
+    ring_write(mel, src, n_samples);
 
     /* Extract frames: need at least win_length samples per frame */
-    int pos = 0;
-    while (pos + win <= mel->pcm_len && frames_out < max_frames) {
-        extract_one_frame(mel, mel->pcm_buf + pos);
+    int consumed = 0;
+    while (mel->ring_count - consumed >= win && frames_out < max_frames) {
+        const float *frame = ring_read(mel, consumed, win);
+        extract_one_frame(mel, frame);
         memcpy(out + frames_out * n_mels, mel->mel_frame, n_mels * sizeof(float));
         frames_out++;
-        pos += hop;
+        consumed += hop;
     }
 
-    /* Shift unconsumed samples to front of accumulator */
-    if (pos > 0) {
-        int remaining = mel->pcm_len - pos;
-        if (remaining > 0)
-            memmove(mel->pcm_buf, mel->pcm_buf + pos, remaining * sizeof(float));
-        mel->pcm_len = remaining;
-    }
+    /* Advance ring tail by consumed samples (no memmove needed!) */
+    if (consumed > 0)
+        ring_consume(mel, consumed);
 
     return frames_out;
 }
 
 void mel_reset(MelSpectrogram *mel) {
     if (!mel) return;
-    mel->pcm_len = 0;
+    mel->ring_head = 0;
+    mel->ring_count = 0;
     mel->preemph_last = 0.0f;
     mel->preemph_init = 0;
 }

@@ -5,11 +5,14 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <poll.h>
 
 #include <CommonCrypto/CommonDigest.h>
 
 #define WS_RECV_BUF_SIZE (64 * 1024)
 #define WS_GUID "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+#define WS_MAX_FRAME_SIZE (16 * 1024 * 1024)  /* 16 MB max frame */
+#define WS_READ_TIMEOUT_MS 30000               /* 30s read timeout */
 
 struct WebSocket {
     int      fd;
@@ -115,6 +118,9 @@ void ws_destroy(WebSocket *ws) {
 static ssize_t ws_read_full(WebSocket *ws, void *buf, size_t len) {
     size_t total = 0;
     while (total < len) {
+        struct pollfd pfd = { .fd = ws->fd, .events = POLLIN };
+        int pr = poll(&pfd, 1, WS_READ_TIMEOUT_MS);
+        if (pr <= 0) return -1;  /* timeout or error */
         ssize_t n = read(ws->fd, (char *)buf + total, len - total);
         if (n <= 0) return n;
         total += (size_t)n;
@@ -194,6 +200,7 @@ int ws_recv(WebSocket *ws, WsOpcode *type_out, uint8_t *buf, int buf_size) {
                 payload_len = (payload_len << 8) | ext[i];
         }
 
+        if (payload_len > WS_MAX_FRAME_SIZE) return -1;  /* frame too large */
         if (payload_len > (uint64_t)buf_size) return -1;
 
         uint8_t mask[4];

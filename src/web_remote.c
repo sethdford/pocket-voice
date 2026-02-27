@@ -254,6 +254,17 @@ static int handle_request(WebRemote *wr, int fd)
     /* Check if this is a WebSocket upgrade request */
     char *ws_key = find_header(buf, "Sec-WebSocket-Key");
     if (ws_key && strstr(buf, "GET /ws")) {
+        /* Validate Origin header — only allow same-host connections */
+        char *origin = find_header(buf, "Origin");
+        if (origin) {
+            char *host = find_header(buf, "Host");
+            if (host && !strstr(origin, host)) {
+                const char *forbidden = "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n";
+                send_all(fd, forbidden, strlen(forbidden));
+                close(fd);
+                return 0;
+            }
+        }
         /* WebSocket upgrade handshake */
         char accept[64];
         compute_ws_accept(ws_key, accept, sizeof(accept));
@@ -313,6 +324,7 @@ static int ws_read_frame(int fd, uint8_t *payload, int max_len, int *opcode)
         if (recv(fd, mask_key, 4, MSG_WAITALL) != 4) return -1;
     }
 
+    if (len > (16 * 1024 * 1024)) return -1;  /* 16 MB frame limit */
     if ((int64_t)len > max_len) return -1;
 
     int to_read = (int)len;
