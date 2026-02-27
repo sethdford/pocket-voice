@@ -8,24 +8,25 @@
 # Optional: Set SONATA_API_KEY for authenticated access.
 
 BASE_URL="${SONATA_URL:-http://localhost:8080}"
-AUTH_HEADER=""
+
+auth_args=()
 if [ -n "$SONATA_API_KEY" ]; then
-    AUTH_HEADER="-H \"Authorization: Bearer $SONATA_API_KEY\""
+    auth_args=(-H "Authorization: Bearer $SONATA_API_KEY")
 fi
 
 echo "=== Health Check ==="
-curl -s "$BASE_URL/health" | python3 -m json.tool
+curl -s "${auth_args[@]}" "$BASE_URL/health" | python3 -m json.tool
 echo
 
 echo "=== Basic TTS (plain text → WAV) ==="
-curl -s -X POST "$BASE_URL/v1/audio/speech" \
+curl -s -X POST "${auth_args[@]}" "$BASE_URL/v1/audio/speech" \
   -d "Hello, this is Sonata speaking." \
   -o basic_output.wav
 echo "Saved: basic_output.wav"
 echo
 
 echo "=== OpenAI-Compatible TTS (JSON → Opus) ==="
-curl -s -X POST "$BASE_URL/v1/audio/speech" \
+curl -s -X POST "${auth_args[@]}" "$BASE_URL/v1/audio/speech" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "tts-1",
@@ -38,7 +39,7 @@ echo "Saved: openai_compat.opus"
 echo
 
 echo "=== TTS with Emotion ==="
-curl -s -X POST "$BASE_URL/v1/audio/speech" \
+curl -s -X POST "${auth_args[@]}" "$BASE_URL/v1/audio/speech" \
   -H "Content-Type: application/json" \
   -d '{
     "text": "I am so excited to show you what Sonata can do!",
@@ -50,7 +51,7 @@ echo "Saved: excited_output.wav"
 echo
 
 echo "=== TTS with Word Timestamps ==="
-curl -s -X POST "$BASE_URL/v1/audio/speech" \
+curl -s -X POST "${auth_args[@]}" "$BASE_URL/v1/audio/speech" \
   -H "Content-Type: application/json" \
   -d '{
     "text": "Each word gets a timestamp.",
@@ -59,7 +60,7 @@ curl -s -X POST "$BASE_URL/v1/audio/speech" \
 echo
 
 echo "=== TTS with Custom Output Format ==="
-curl -s -X POST "$BASE_URL/v1/audio/speech" \
+curl -s -X POST "${auth_args[@]}" "$BASE_URL/v1/audio/speech" \
   -H "Content-Type: application/json" \
   -d '{
     "text": "High quality 48kHz output.",
@@ -75,7 +76,7 @@ echo
 
 echo "=== STT (WAV → Text) ==="
 if [ -f "basic_output.wav" ]; then
-    curl -s -X POST "$BASE_URL/v1/audio/transcriptions" \
+    curl -s -X POST "${auth_args[@]}" "$BASE_URL/v1/audio/transcriptions" \
       -H "Content-Type: audio/wav" \
       --data-binary @basic_output.wav | python3 -m json.tool
 else

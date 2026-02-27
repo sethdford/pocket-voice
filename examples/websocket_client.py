@@ -86,10 +86,18 @@ async def receive_events(ws):
                     print("\n[server] Listening...")
                 elif event_type == "transcript":
                     print(f"\n[stt] {event.get('text', '')}")
+                elif event_type == "processing":
+                    print("\n[server] Processing...")
                 elif event_type == "llm_token":
                     print(event.get("text", ""), end="", flush=True)
                 elif event_type == "speaking":
                     print("\n[server] Speaking...")
+                elif event_type == "error":
+                    print(f"\n[error] {event.get('message', 'unknown error')}")
+                elif event_type == "config_ack":
+                    codec = event.get("codec", "?")
+                    sr = event.get("sample_rate", "?")
+                    print(f"\n[config] Codec: {codec}, Sample rate: {sr}")
                 else:
                     print(f"\n[server] {event}")
 

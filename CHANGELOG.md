@@ -4,7 +4,7 @@ All notable changes to Sonata are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0] — 2025-02-26
+## [0.1.0] — 2026-02-26
 
 Initial public release of Sonata.
 
@@ -17,7 +17,7 @@ Initial public release of Sonata.
   - FP16 Metal GPU inference
   - Speculative decoding support
 - **25+ native C modules**: conformer_stt, mel_spectrogram, fused_eou, vdsp_prosody, breath_synthesis, lufs, noise_gate, native_vad, speech_detector, ssml_parser, text_normalize, sentence_buffer, prosody_predict, emphasis_predict, voice_onboard, phonemizer, speaker_encoder, speaker_diarizer, audio_emotion, backchannel, conversation_memory, spatial_audio, opus_codec, vm_ring, and more
-- **3-signal fused EOU detection**: Energy VAD + LSTM endpointer + ASR-inline EOU token with speculative prefill
+- **3-signal fused EOU detection**: Energy VAD + LSTM endpointer + ASR-inline EOU token
 - **Pure C STT engines**: FastConformer CTC with RoPE, beam search + KenLM, Sonata STT + Refiner
 - **Rust cdylib crates**: pocket_stt (Kyutai/candle), pocket_llm (Llama-3.2/candle), sonata_lm, sonata_flow, sonata_storm
 - **HTTP API server**: OpenAI-compatible REST endpoints for STT, TTS, chat, and voice cloning

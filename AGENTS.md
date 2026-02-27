@@ -20,7 +20,7 @@ Supports Claude, Gemini, and on-device Llama 3.2 as LLM backends.
 ## Code Structure
 
 ```
-pocket-voice/
+sonata/
 ├── Makefile                        # Top-level build (C libs + Rust cdylibs + binary + tests)
 ├── README.md                       # User-facing documentation
 ├── AGENTS.md                       # This file — AI agent guidance
@@ -212,7 +212,7 @@ pocket-voice/
 make
 
 # Build just the binary
-make pocket-voice
+make sonata
 
 # Build just the C shared libraries (no Rust)
 make libs
@@ -221,22 +221,22 @@ make libs
 make clean
 
 # Run with Claude (default)
-ANTHROPIC_API_KEY=sk-ant-... ./pocket-voice
+ANTHROPIC_API_KEY=sk-ant-... ./sonata
 
 # Run with Gemini
-GEMINI_API_KEY=... ./pocket-voice --llm gemini
+GEMINI_API_KEY=... ./sonata --llm gemini
 
 # Run with Gemini Flash Lite + prosody enhancement
-GEMINI_API_KEY=... ./pocket-voice --llm gemini --llm-model gemini-2.5-flash-lite --prosody
+GEMINI_API_KEY=... ./sonata --llm gemini --llm-model gemini-2.5-flash-lite --prosody
 
 # Run with Claude + prosody-aware SSML annotations
-ANTHROPIC_API_KEY=sk-ant-... ./pocket-voice --prosody
+ANTHROPIC_API_KEY=sk-ant-... ./sonata --prosody
 
 # Run with options
-./pocket-voice --pitch 1.15 --volume 3.0 --spatial 30
+./sonata --pitch 1.15 --volume 3.0 --spatial 30
 
 # Run with local LLM (Llama-3.2-3B on Metal)
-./pocket-voice --llm local
+./sonata --llm local
 
 # Run ALL tests (30 suites via `make test`)
 make test
@@ -290,10 +290,10 @@ make bench-industry            # Industry benchmark comparison
 make bench                     # Run comprehensive benchmark suite (scripts/benchmark.sh)
 
 # Run with JSON config file
-./pocket-voice --config config.json
+./sonata --config config.json
 
 # Run as HTTP API server
-./pocket-voice --server --server-port 8080
+./sonata --server --server-port 8080
 
 # HTTP API endpoints (when in server mode)
 curl http://localhost:8080/health
@@ -320,7 +320,7 @@ curl -X POST http://localhost:8080/v1/audio/speech \
   -d '{"text":"Hello","voice":"voice_0"}' -o output.wav
 
 # API key authentication
-SONATA_API_KEY=my-secret ./pocket-voice --server
+SONATA_API_KEY=my-secret ./sonata --server
 curl -H "Authorization: Bearer my-secret" http://localhost:8080/v1/voices
 ```
 
@@ -1021,7 +1021,7 @@ The `Makefile` builds in three stages:
 
 1. **C shared libraries** → `build/*.dylib` (43 dylibs + 1 metallib, each `.c` compiles independently)
 2. **Rust cdylibs** → `src/{stt,llm,sonata_lm,sonata_flow,sonata_storm}/target/release/*.dylib` (via `cargo build --release`)
-3. **Pipeline binary** → `pocket-voice` (links all of the above)
+3. **Pipeline binary** → `sonata` (links all of the above)
 
 Frameworks linked: Accelerate, CoreAudio, AudioToolbox, Security, Metal, Foundation, IOSurface, libcurl. Homebrew deps: curl, opus, onnxruntime, espeak-ng.
 
@@ -1036,7 +1036,7 @@ Frameworks linked: Accelerate, CoreAudio, AudioToolbox, Security, Metal, Foundat
    ```
 3. Add to `libs:` dependencies
 4. Add FFI declarations in `pocket_voice_pipeline.c`
-5. Link via `-lmy_lib` in the `pocket-voice` target
+5. Link via `-lmy_lib` in the `sonata` target
 
 ### Adding Tests
 
@@ -1052,7 +1052,7 @@ Frameworks linked: Accelerate, CoreAudio, AudioToolbox, Security, Metal, Foundat
 
 ### Test Binary rpath
 
-Test binaries are compiled into `build/`, so rpath is `@executable_path` (not `@executable_path/build`). The main `pocket-voice` binary lives in the project root, so its rpath is `@executable_path/build`.
+Test binaries are compiled into `build/`, so rpath is `@executable_path` (not `@executable_path/build`). The main `sonata` binary lives in the project root, so its rpath is `@executable_path/build`.
 
 ## Common Gotchas
 
@@ -1309,54 +1309,54 @@ Quality targets (when models are trained):
 
 ```bash
 # Native C VAD (recommended — no ONNX dependency, AMX-accelerated)
-./pocket-voice --vad models/silero_vad.nvad
+./sonata --vad models/silero_vad.nvad
 
 # Extract native VAD weights from Silero ONNX model (one-time)
 python scripts/extract_silero_weights.py models/silero_vad.onnx models/silero_vad.nvad
 
 # WebSocket streaming (start server, connect via ws://host:port/v1/stream)
-./pocket-voice --server --server-port 8080
+./sonata --server --server-port 8080
 # Then: wscat -c ws://localhost:8080/v1/stream
 
 # Sonata TTS (default)
-./pocket-voice --tts-engine sonata
+./sonata --tts-engine sonata
 
 # Flow v3 TTS (text → mel → waveform)
-./pocket-voice --tts-engine sonata-v3 --flow-v3-weights models/sonata/flow_v3.safetensors \
+./sonata --tts-engine sonata-v3 --flow-v3-weights models/sonata/flow_v3.safetensors \
   --flow-v3-config models/sonata/flow_v3_config.json \
   --vocoder-weights models/sonata/vocoder.safetensors \
   --vocoder-config models/sonata/vocoder_config.json
 
 # Flow v3 with phonemes
-./pocket-voice --tts-engine sonata-v3 --phonemize --phoneme-map models/sonata/phoneme_map.json
+./sonata --tts-engine sonata-v3 --phonemize --phoneme-map models/sonata/phoneme_map.json
 
 # Piper TTS (removed — source files no longer in codebase)
-# ./pocket-voice --tts-engine piper --piper-model models/piper/en_US-amy-medium.onnx
+# ./sonata --tts-engine piper --piper-model models/piper/en_US-amy-medium.onnx
 
 # Supertonic-2 TTS (removed — source files no longer in codebase)
-# ./pocket-voice --tts-engine supertonic --flow-steps 10 --supertonic-voice models/supertonic-2/voice_styles/F1.json
+# ./sonata --tts-engine supertonic --flow-steps 10 --supertonic-voice models/supertonic-2/voice_styles/F1.json
 
 # Conformer STT with beam search + KenLM
-./pocket-voice --stt-engine conformer --cstt-model models/parakeet-ctc-1.1b-fp16.cstt \
+./sonata --stt-engine conformer --cstt-model models/parakeet-ctc-1.1b-fp16.cstt \
   --beam-size 16 --lm-path models/3-gram.pruned.1e-7.bin --lm-weight 1.5
 
 # Local LLM (no API key needed)
-./pocket-voice --llm-engine local --llm-model meta-llama/Llama-3.2-3B-Instruct
+./sonata --llm-engine local --llm-model meta-llama/Llama-3.2-3B-Instruct
 
 # Moonshine STT (removed — source files no longer in codebase)
-# ./pocket-voice --stt-engine moonshine --moonshine-model models/moonshine/
+# ./sonata --stt-engine moonshine --moonshine-model models/moonshine/
 
 # Voice cloning from reference audio
-./pocket-voice --speaker-encoder models/ecapa_tdnn.onnx --ref-wav voice.wav
+./sonata --speaker-encoder models/ecapa_tdnn.onnx --ref-wav voice.wav
 
 # Phonemization for improved pronunciation
-./pocket-voice --phonemize --phoneme-map models/sonata/phoneme_map.json
+./sonata --phonemize --phoneme-map models/sonata/phoneme_map.json
 
 # EmoSteer emotion direction vectors (training-free emotion control)
-./pocket-voice --emosteer models/sonata/emosteer_directions.json
+./sonata --emosteer models/sonata/emosteer_directions.json
 
 # Prosody logging for dashboard visualization
-./pocket-voice --prosody-log prosody.jsonl
+./sonata --prosody-log prosody.jsonl
 # Then open tools/prosody_dashboard.html and drop the JSONL file
 
 # Compute EmoSteer direction vectors from labeled data
@@ -1375,7 +1375,7 @@ cd train/sonata && python eval_prosody_ab.py \
   --sentences sentences.txt --output report.json
 
 # One-stop voice cloning (auto-detects speaker encoder)
-./pocket-voice --clone-voice reference_voice.wav
+./sonata --clone-voice reference_voice.wav
 
 # Benchmark against commercial TTS APIs (requires API keys in env)
 python train/sonata/eval_prosody_ab.py --benchmark \

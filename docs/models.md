@@ -83,7 +83,8 @@ Sonata models can be downloaded using the HuggingFace CLI:
 pip install huggingface-hub
 
 # Download Sonata model files
-huggingface-cli download <repo-id> --local-dir models/sonata/
+# Replace with the actual HuggingFace repo once models are published
+# huggingface-cli download your-org/sonata-tts --local-dir models/sonata/
 ```
 
 The Rust crates support auto-download: if you pass a HuggingFace repo ID as the weights path, models are fetched automatically via the `hf-hub` crate.

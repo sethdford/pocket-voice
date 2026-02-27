@@ -1,16 +1,51 @@
 # Sonata
 
-Real-time voice intelligence for Apple Silicon. Fully native C and Rust — zero Python, zero compromise.
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Apple%20Silicon-black?logo=apple)]()
+[![Language](https://img.shields.io/badge/C%20%2B%20Rust-native-orange)]()
+
+Real-time voice intelligence for Apple Silicon. Native C + Rust. Full-duplex conversation.
+
+## Quick Start
+
+```bash
+brew install curl opus onnxruntime espeak-ng
+make
+ANTHROPIC_API_KEY=sk-ant-... ./sonata
+```
+
+## Why Sonata?
+
+Most voice pipelines are Python glue connecting cloud APIs. Sonata is different — every audio processing component from speech recognition to text-to-speech runs natively on Apple Silicon, using all four hardware compute units simultaneously (GPU + AMX + ANE + NEON). The result: low-latency full-duplex conversation with barge-in support, entirely on your Mac.
 
 ```
 Mic → STT → LLM → TTS → Speaker
 ```
 
-Sonata is a conversational AI voice pipeline that runs entirely in C and Rust on Apple Silicon. It captures audio from the microphone, transcribes speech in real-time, sends the transcript to an LLM (Claude, Gemini, or on-device Llama), synthesizes the response with state-of-the-art TTS, and plays it back through the speaker — all with sub-200ms latency and full-duplex barge-in support.
+> **Note:** The default LLM backend is Claude (cloud API). Use `--llm local` for fully on-device inference with Llama 3.2.
 
-## Sonata TTS Architecture
+## Key Features
 
-Sonata includes a novel from-scratch TTS system designed for phenomenal quality AND speed:
+- **100% native audio pipeline**: C + Rust. Single `make` builds 43 shared libraries, 5 Rust crates, custom Metal kernels, and one binary.
+- **Full-duplex barge-in**: CoreAudio VoiceProcessingIO with hardware AEC. Speak while the assistant is talking — playback interrupts immediately.
+- **Fused 3-signal end-of-utterance**: Energy VAD + LSTM endpointer + ASR-inline EOU token, weighted and fused for <240ms turn detection.
+- **Speculative prefill**: LLM request fires at 70% EOU confidence. Saves 100-300ms when the prediction is correct.
+- **Multi-engine STT**: Conformer CTC (0.9% WER on LibriSpeech), Kyutai Rust 1B, BNNS/ANE-accelerated. Switch with `--stt-engine`.
+- **Apple Silicon optimized**: Every stage runs on the right compute unit — Metal GPU for transformers, AMX for DSP, ANE for power-efficient inference, NEON for SIMD.
+
+## TTS Status
+
+Sonata currently ships with two **production-ready** TTS engines and one **in-development** custom TTS:
+
+| Engine                           | Quality                                             | Speed                       | Status               |
+| -------------------------------- | --------------------------------------------------- | --------------------------- | -------------------- |
+| **Piper VITS** (60M, ONNX)       | 100% intelligibility (Whisper-verified)             | 67x realtime, 51ms/sentence | **Production ready** |
+| **Supertonic-2** (250M, ONNX)    | 70-90% (voice-dependent), 10 voices                 | 48x realtime                | **Production ready** |
+| **Sonata TTS** (294M, Metal GPU) | In training — not yet producing intelligible speech | Pipeline functional         | **In development**   |
+
+The default pipeline uses Piper for TTS. Sonata TTS is a custom from-scratch system designed for Apple Silicon — the inference pipeline is complete and mechanically correct, but the models require training on paired speech data before producing quality output.
+
+### Sonata TTS Architecture (In Development)
 
 ```
 Text → Semantic LM (241M, Metal GPU) → Semantic Tokens (50 Hz)
@@ -18,50 +53,44 @@ Text → Semantic LM (241M, Metal GPU) → Semantic Tokens (50 Hz)
      → iSTFT Decoder (5M, vDSP/AMX)  → Waveform (24kHz)
 ```
 
-| Component                       | Params     | Hardware  | Speed             |
-| ------------------------------- | ---------- | --------- | ----------------- |
-| Sonata Codec (encode/decode)    | 16.8M      | AMX/vDSP  | 5,373x realtime   |
-| Sonata LM (text→semantic)       | 241.7M     | Metal GPU | Streaming 50 Hz   |
-| Sonata Flow (semantic→acoustic) | 35.7M      | Metal/ANE | Parallel (non-AR) |
-| **Total**                       | **294.2M** |           |                   |
+| Component                       | Params     | Hardware  | Notes                         |
+| ------------------------------- | ---------- | --------- | ----------------------------- |
+| Sonata Codec (encode/decode)    | 16.8M      | AMX/vDSP  | 5,373x realtime (iSTFT stage) |
+| Sonata LM (text→semantic)       | 241.7M     | Metal GPU | 43 tok/s (target: 50 Hz)      |
+| Sonata Flow (semantic→acoustic) | 35.7M      | Metal/ANE | Parallel (non-autoregressive) |
+| **Total**                       | **294.2M** |           |                               |
 
-**Key innovations:**
+**Design innovations:**
 
 - **Single LM pass per frame** — no sequential codebook prediction (unlike Mimi's DepFormer)
 - **FSQ quantization** — 4096-entry codebook with zero codebook collapse
 - **Conditional Flow Matching** — continuous acoustic latents, zero quantization error
 - **iSTFT decoder** — 100x faster than ConvTranspose, AMX-native
 
-## Key Features
+## Performance (Measured)
 
-- **100% native**: C + Rust. No Python, no Node, no JVM. Single `make` builds everything.
-- **Full-duplex audio**: CoreAudio VoiceProcessingIO with hardware AEC (Acoustic Echo Cancellation). Speak while the assistant is talking — barge-in immediately interrupts playback.
-- **Fused 3-signal end-of-utterance**: Energy VAD + LSTM endpointer + ASR-inline EOU token detection, weighted and fused for <240ms turn detection.
-- **Speculative prefill**: Sends the LLM API request at 70% EOU confidence. If the user resumes speaking, it cancels. If they stop, response starts streaming before the final silence timeout — shaving 100-300ms off perceived latency.
-- **Multi-LLM backend**: Supports Claude (SSE), Gemini, and on-device Llama 3.2 (1B-3B) via a pluggable LLM interface. Switch with `--llm claude|gemini|local`.
-- **Multi-STT backend**: Kyutai Rust (1B), pure C Conformer CTC (fp32/fp16/int8), Sonata CTC (RoPE conformer), and BNNS/ANE-accelerated Conformer. Switch with `--stt-engine rust|conformer|bnns`.
-- **INT8 quantization**: Per-channel symmetric INT8 weights with NEON-vectorized dequantization. ~4x smaller models with <1% accuracy loss.
-- **Apple Neural Engine**: BNNS Graph-accelerated Conformer encoder and ConvNeXt decoder dispatch to the ANE on macOS 15+ for power-efficient inference.
-- **Custom Metal kernels**: Flash Attention v2, fused SiLU+gate, layer norm, and fp16 GEMM compiled as .metallib and loaded at runtime.
-- **Per-turn latency profiling**: `--profiler` flag enables nanosecond-precision breakdown of every pipeline stage (STT, LLM TTFT, TTS TTFS, E2E) with P50/P95/P99 statistics.
-- **Voice quality metrics**: PESQ-lite, STOI-lite, Log-Spectral Distance, and MOS prediction for automated TTS quality evaluation.
-- **Speaker diarization**: ONNX-based speaker embedding extraction with cosine similarity tracking for multi-speaker conversations.
-- **Active listening**: Backchannel generation ("mhm", "yeah") from acoustic cues at ~50ms latency — no LLM round-trip required.
-- **Web remote**: Phone browser captures mic via Web Audio API → streams PCM over WebSocket → pipeline processes and streams audio back.
-- **REST API**: HTTP server with WebSocket streaming for integration with external applications.
-- **Apple Silicon optimized**: Every audio processing stage runs on the AMX coprocessor (via Apple Accelerate), while ML inference runs on the Metal GPU. ARM NEON SIMD for PCM conversion. All four hardware units (GPU + AMX + ANE + NEON) run concurrently without contention.
-- **30 automated test suites**: Comprehensive coverage across quality metrics, EOU detection, STT, TTS, prosody, diarization, threading, and regression tests.
+| Metric                           | Value                     | Engine             | Source                               |
+| -------------------------------- | ------------------------- | ------------------ | ------------------------------------ |
+| STT WER (LibriSpeech test-clean) | 0.9%                      | Conformer CTC 0.6B | bench_output/TTS_BENCHMARK_REPORT.md |
+| STT Real-Time Factor             | 0.075x (13x realtime)     | Conformer CTC 0.6B | bench_output/TTS_BENCHMARK_REPORT.md |
+| TTS Intelligibility              | 100% (Whisper round-trip) | Piper VITS         | bench_output/TTS_BENCHMARK_REPORT.md |
+| TTS Real-Time Factor             | 0.015x (67x realtime)     | Piper VITS         | bench_output/TTS_BENCHMARK_REPORT.md |
+| TTS→STT Round-Trip WER           | 1.62%                     | Piper → Conformer  | bench_output/BENCHMARK_REPORT.md     |
+| Full Round-Trip Latency          | ~320ms                    | Piper + Conformer  | bench_output/TTS_BENCHMARK_REPORT.md |
+| EOU Turn Detection               | <240ms                    | Fused 3-signal     | README (design target)               |
+
+> **Note:** Latency numbers are for audio processing stages. End-to-end latency including LLM response time depends on backend (Claude API ~300ms TTFT, on-device Llama ~100ms TTFT).
 
 ## Architecture
 
 ```
 ┌───────────────────────────────────────────────────────────────────────────┐
-│                          pocket-voice binary                              │
+│                              sonata                                       │
 │                                                                           │
 │  ┌──────────────┐   ┌────────────┐   ┌────────────┐   ┌───────────────┐ │
 │  │ CoreAudio     │   │ STT Engine │   │ LLM Engine │   │ TTS Engine    │ │
-│  │ VoiceProc IO  │──▶│ Rust/C/ANE│──▶│Claude/Gemini──▶│ Sonata/Storm │ │
-│  │ (48kHz, AEC)  │   │ fp32/16/8 │   │  /Local    │   │ 294M params  │ │
+│  │ VoiceProc IO  │──▶│ Rust/C/ANE│──▶│Claude/Gemini──▶│ Piper/Sonata │ │
+│  │ (48kHz, AEC)  │   │ fp32/16/8 │   │  /Local    │   │              │ │
 │  └──────┬────────┘   └─────┬──────┘   └────────────┘   └──────┬────────┘ │
 │         │                  │                                    │         │
 │         │           ┌──────▼─────────────────────────┐         │         │
@@ -102,14 +131,14 @@ Listening → Recording → Processing → Streaming → Speaking → Listening
                  └───────────┘  Barge-in (any state) ──→ Listening
 ```
 
-| State          | Description                                                                        |
-| -------------- | ---------------------------------------------------------------------------------- |
-| **Listening**  | Energy VAD monitors mic for speech onset                                           |
-| **Recording**  | Captures audio, feeds STT frame-by-frame, runs fused EOU detection                 |
-| **Processing** | Sends transcript to Claude API (or skips if speculative prefill already in-flight) |
-| **Streaming**  | Receives Claude tokens via SSE, feeds sentence buffer → TTS incrementally          |
-| **Speaking**   | Drains remaining TTS audio to speaker                                              |
-| **Barge-in**   | User speaks during playback → immediate interrupt, back to Listening               |
+| State          | Description                                                                 |
+| -------------- | --------------------------------------------------------------------------- |
+| **Listening**  | Energy VAD monitors mic for speech onset                                    |
+| **Recording**  | Captures audio, feeds STT frame-by-frame, runs fused EOU detection          |
+| **Processing** | Sends transcript to LLM (or skips if speculative prefill already in-flight) |
+| **Streaming**  | Receives LLM tokens via SSE, feeds sentence buffer → TTS incrementally      |
+| **Speaking**   | Drains remaining TTS audio to speaker                                       |
+| **Barge-in**   | User speaks during playback → immediate interrupt, back to Listening        |
 
 ## Native Libraries (43 C shared libraries + 5 Rust cdylibs + 1 metallib)
 
@@ -134,7 +163,7 @@ Listening → Recording → Processing → Streaming → Speaking → Listening
 | `tdt_decoder.c`        | Token Duration Transducer decoder (LSTM prediction + joint network)                          | AMX (Accelerate)    |
 | `spm_tokenizer.c`      | SentencePiece unigram tokenizer (pure C, Viterbi decode)                                     | CPU                 |
 
-### Speech Synthesis (Sonata TTS)
+### Speech Synthesis
 
 | Library                   | Purpose                                                                              | Hardware            |
 | ------------------------- | ------------------------------------------------------------------------------------ | ------------------- |
@@ -233,7 +262,7 @@ Listening → Recording → Processing → Streaming → Speaking → Listening
 
 ### Hardware Utilization
 
-pocket-voice runs on **all four Apple Silicon compute units simultaneously**:
+Sonata runs on **all four Apple Silicon compute units simultaneously**:
 
 | Unit                | What Runs                                                             | Why                                |
 | ------------------- | --------------------------------------------------------------------- | ---------------------------------- |
@@ -258,7 +287,7 @@ pocket-voice runs on **all four Apple Silicon compute units simultaneously**:
 
 ## Quality Assurance Framework
 
-pocket-voice includes a comprehensive native C quality benchmark suite for proving STT and TTS quality.
+Sonata includes a comprehensive native C quality benchmark suite for proving STT and TTS quality.
 
 ### Metrics Implemented
 
@@ -283,10 +312,6 @@ make bench-quality    # Run benchmark self-tests
 make test-quality     # Run all quality metric tests
 make test-roundtrip   # Round-trip with mock TTS/STT callbacks
 ```
-
-### Latency Measurement
-
-Uses `mach_absolute_time` for nanosecond-precision hardware timestamps. Tracks P50/P95/P99 percentiles via quickselect.
 
 ## Test Suite
 
@@ -342,13 +367,27 @@ make bench-live              # Live model benchmark with real audio
 make bench-industry          # Industry-standard quality benchmarks
 ```
 
+## Additional Features
+
+- **INT8 quantization**: Per-channel symmetric INT8 weights with NEON-vectorized dequantization. ~4x smaller models with <1% accuracy loss.
+- **Apple Neural Engine**: BNNS Graph-accelerated Conformer encoder and ConvNeXt decoder dispatch to the ANE on macOS 15+ for power-efficient inference.
+- **Custom Metal kernels**: Flash Attention v2, fused SiLU+gate, layer norm, and fp16 GEMM compiled as .metallib and loaded at runtime.
+- **Per-turn latency profiling**: `--profiler` flag enables nanosecond-precision breakdown of every pipeline stage (STT, LLM TTFT, TTS TTFS, E2E) with P50/P95/P99 statistics.
+- **Voice quality metrics**: PESQ-lite, STOI-lite, Log-Spectral Distance, and MOS prediction for automated TTS quality evaluation.
+- **Speaker diarization**: ONNX-based speaker embedding extraction with cosine similarity tracking for multi-speaker conversations.
+- **Active listening**: Backchannel generation ("mhm", "yeah") from acoustic cues at ~50ms latency — no LLM round-trip required.
+- **Web remote**: Phone browser captures mic via Web Audio API → streams PCM over WebSocket → pipeline processes and streams audio back.
+- **REST API**: HTTP server with WebSocket streaming for integration with external applications.
+- **Multi-LLM backend**: Supports Claude (SSE), Gemini, and on-device Llama 3.2 (1B-3B). Switch with `--llm claude|gemini|local`.
+- **Multi-STT backend**: Kyutai Rust (1B), pure C Conformer CTC (fp32/fp16/int8), Sonata CTC (RoPE conformer), and BNNS/ANE-accelerated Conformer. Switch with `--stt-engine rust|conformer|bnns`.
+
 ## Requirements
 
 - macOS 14+ on Apple Silicon (M1/M2/M3/M4)
 - Xcode Command Line Tools (`xcode-select --install`)
 - Rust (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
 - Homebrew dependencies: `brew install curl opus onnxruntime espeak-ng`
-- Anthropic API key (`ANTHROPIC_API_KEY`) for Claude backend
+- Anthropic API key (`ANTHROPIC_API_KEY`) for Claude backend (or use `--llm local` for on-device)
 
 ## Build
 
@@ -367,20 +406,20 @@ Build output:
 5. `src/sonata_lm/target/release/libsonata_lm.dylib` — Rust Sonata LM cdylib (241M semantic model)
 6. `src/sonata_flow/target/release/libsonata_flow.dylib` — Rust Sonata Flow cdylib (35.7M flow matching)
 7. `src/sonata_storm/target/release/libsonata_storm.dylib` — Rust Sonata Storm cdylib (parallel TTS)
-8. `pocket-voice` — Pipeline binary linking everything
+8. `sonata` — Pipeline binary linking everything
 
 ## Run
 
 ```bash
-ANTHROPIC_API_KEY=sk-ant-... ./pocket-voice
+ANTHROPIC_API_KEY=sk-ant-... ./sonata
 ```
 
-Speak naturally. The pipeline detects speech onset, transcribes in real-time, sends to Claude, and streams TTS audio back — all with full-duplex barge-in support.
+Speak naturally. The pipeline detects speech onset, transcribes in real-time, sends to the LLM, and streams TTS audio back — all with full-duplex barge-in support.
 
 ### Options
 
 ```
-pocket-voice [OPTIONS]
+sonata [OPTIONS]
 
 Voice & Model:
   --voice PATH       Voice .wav or .safetensors path
@@ -421,142 +460,62 @@ Advanced:
 
 ```bash
 # Default — conversational voice assistant
-ANTHROPIC_API_KEY=sk-... ./pocket-voice
+ANTHROPIC_API_KEY=sk-... ./sonata
 
 # Custom voice with pitched-up output
-./pocket-voice --voice /path/to/voice.wav --pitch 1.15
+./sonata --voice /path/to/voice.wav --pitch 1.15
 
 # Spatial audio — voice positioned 30° to the right
-./pocket-voice --spatial 30
+./sonata --spatial 30
 
 # On-device LLM (no API key needed)
-./pocket-voice --llm local --llm-model meta-llama/Llama-3.2-1B-Instruct
+./sonata --llm local --llm-model meta-llama/Llama-3.2-1B-Instruct
 
 # Conformer STT with INT8 model
-./pocket-voice --stt-engine conformer --cstt-model models/parakeet_0.6b_int8.cstt
+./sonata --stt-engine conformer --cstt-model models/parakeet_0.6b_int8.cstt
 
 # BNNS/ANE accelerated STT (macOS 15+)
-./pocket-voice --stt-engine bnns --cstt-model models/parakeet_0.6b.cstt \
+./sonata --stt-engine bnns --cstt-model models/parakeet_0.6b.cstt \
   --bnns-model models/conformer_ctc_0.6b.mlmodelc
 
 # Latency profiling
-./pocket-voice --profiler
+./sonata --profiler
 
 # Custom Metal kernels
-./pocket-voice --metallib build/tensor_ops.metallib
+./sonata --metallib build/tensor_ops.metallib
 
 # Custom Claude model with system prompt
-./pocket-voice --llm-model claude-sonnet-4-20250514 \
+./sonata --llm-model claude-sonnet-4-20250514 \
   --system "You are a helpful coding assistant."
 ```
 
 ## Project Structure
 
 ```
-pocket-voice/
-├── Makefile                        # Build system (C libs + Rust + binary + tests)
-├── README.md                       # This file
-├── AGENTS.md                       # AI agent guidance
-├── LICENSE                         # MIT
-├── src/
-│   ├── pocket_voice_pipeline.c     # Main orchestrator: CLI, state machine, LLM SSE
-│   ├── pocket_voice.c              # CoreAudio VoiceProcessingIO engine
-│   │
-│   │── # ─── Speech Recognition ───
-│   ├── conformer_stt.c             # Pure C Conformer CTC STT (fp32/fp16/int8)
-│   ├── sonata_stt.c                # CTC streaming ASR with RoPE conformer
-│   ├── sonata_refiner.c            # Semantic → text encoder-decoder transformer
-│   ├── bnns_conformer.c            # BNNS Graph Conformer for ANE (macOS 15+)
-│   ├── mel_spectrogram.c           # Streaming log-mel spectrogram (vDSP FFT)
-│   ├── ctc_beam_decoder.cpp        # CTC beam search with optional KenLM
-│   ├── tdt_decoder.c               # Token Duration Transducer decoder
-│   ├── spm_tokenizer.c             # SentencePiece unigram tokenizer (pure C)
-│   │
-│   │── # ─── Speech Synthesis ───
-│   ├── sonata_istft.c              # iSTFT decoder (mag+phase → waveform, vDSP)
-│   ├── bnns_convnext_decoder.c     # ANE-accelerated ConvNeXt decoder
-│   ├── phonemizer.c                # espeak-ng IPA phonemizer
-│   │
-│   │── # ─── VAD & EOU Detection ───
-│   ├── native_vad.c                # Pure C VAD (STFT+Conv+LSTM from Silero)
-│   ├── speech_detector.c           # Unified VAD+EOU wrapper
-│   ├── mimi_endpointer.c           # LSTM end-of-utterance on mel features
-│   ├── fused_eou.c                 # 3-signal fused EOU detector
-│   │
-│   │── # ─── Audio Post-Processing ───
-│   ├── vdsp_prosody.c              # AMX prosody: pitch, volume, EQ, limiter
-│   ├── audio_converter.c           # Apple AudioConverter resampling
-│   ├── spatial_audio.c             # HRTF binaural 3D audio
-│   ├── breath_synthesis.c          # Pink noise breath synthesis (ADSR)
-│   ├── lufs.c                      # ITU-R BS.1770 LUFS loudness normalization
-│   ├── noise_gate.c                # Spectral noise gate (vDSP FFT)
-│   ├── opus_codec.c                # Real-time Opus encode/decode
-│   │
-│   │── # ─── Prosody & Expression ───
-│   ├── prosody_predict.c           # Text-based prosody prediction
-│   ├── prosody_log.c               # JSONL prosody logging for dashboard
-│   ├── emphasis_predict.c          # Linguistics-based emphasis prediction
-│   │
-│   │── # ─── Text Processing ───
-│   ├── text_normalize.c            # Number/date/currency text expansion
-│   ├── ssml_parser.c               # SSML parsing and prosody extraction
-│   ├── sentence_buffer.c           # LLM token → sentence boundary detection
-│   │
-│   │── # ─── Conversation Intelligence ───
-│   ├── audio_emotion.c             # Real-time emotion detection from audio
-│   ├── speaker_encoder.c           # ONNX speaker embedding extraction
-│   ├── speaker_diarizer.c          # Speaker diarization via embeddings
-│   ├── conversation_memory.c       # Conversation context persistence
-│   ├── backchannel.c               # Active listening backchannel generation
-│   ├── voice_onboard.c             # Voice onboarding + prosody profiling
-│   │
-│   │── # ─── Network & API ───
-│   ├── http_api.c                  # REST API server
-│   ├── websocket.c                 # RFC 6455 WebSocket
-│   ├── web_remote.c                # Web remote mic/speaker via WebSocket
-│   │
-│   │── # ─── Quality & Profiling ───
-│   ├── voice_quality.c             # PESQ-lite, STOI-lite, LSD, MOS prediction
-│   ├── latency_profiler.c          # Per-stage nanosecond latency measurement
-│   ├── apple_perf.c                # Apple Silicon performance primitives
-│   ├── metal_loader.c              # Runtime .metallib GPU kernel loader
-│   │
-│   │── # ─── Infrastructure ───
-│   ├── vm_ring.c                   # VM-mirrored ring buffer (mach_vm)
-│   ├── cJSON.c                     # Vendored JSON parser (MIT)
-│   │
-│   │── # ─── Header-Only Libraries ───
-│   ├── neon_audio.h                # ARM NEON SIMD PCM conversion
-│   ├── spmc_ring.h                 # Lock-free SPMC ring buffer
-│   ├── kv_cache.h                  # Interleaved KV cache [H][T][2][D]
-│   ├── triple_buffer.h             # Lock-free triple buffer
-│   ├── arena.h                     # Bump-pointer arena allocator
-│   ├── lstm_ops.h                  # LSTM cell operations
-│   │
-│   │── # ─── Metal GPU Kernels ───
-│   ├── tensor_ops.metal            # Flash Attention v2, fused SiLU+gate, layer norm
-│   │
-│   │── # ─── Rust Crates ───
-│   ├── stt/                        # Kyutai STT 1B (candle + Metal)
-│   ├── llm/                        # On-device Llama 3.2 (candle + Metal)
-│   ├── sonata_lm/                  # Sonata 241M semantic language model
-│   ├── sonata_flow/                # Sonata 35.7M conditional flow matching
-│   ├── sonata_storm/               # Sonata parallel (non-AR) TTS
-│   └── quality/                    # Quality benchmark suite (WER, MCD, STOI, etc.)
-├── scripts/
-│   ├── benchmark_sweep.sh          # fp32 vs fp16 vs int8 comparison
-│   ├── quantize_int8.py            # Convert fp32/fp16 .cstt to INT8
-│   ├── convert_nemo_coreml.py      # NeMo → CoreML conversion for BNNS
-│   └── ...                         # Model export, validation, and benchmarking scripts
-├── tests/                          # 30 test suites + additional benchmarks
-├── web/                            # Web dashboard and remote UI
-├── models/                         # Downloaded/compiled models (gitignored)
-└── build/                          # Compiled output (gitignored)
+sonata/
+├── Makefile              # Build system (C libs + Rust + binary + tests)
+├── README.md             # This file
+├── CONTRIBUTING.md       # Contributing guide
+├── AGENTS.md             # AI agent guidance
+├── LICENSE               # MIT
+├── src/                  # 43 C source files + 5 Rust crates + Metal kernels
+├── include/              # C header files
+├── tests/                # 30+ test suites
+├── scripts/              # Benchmarking, conversion, and export scripts
+├── web/                  # Web dashboard and remote UI
+├── docs/                 # API reference, architecture, troubleshooting
+├── examples/             # curl, WebSocket, and integration examples
+├── models/               # Downloaded/compiled models (gitignored)
+└── build/                # Compiled output (gitignored)
 ```
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, code style, and pull request process.
 
 ## Companion Project
 
-**[pocket-tts](https://github.com/sethdford/pocket-tts)** — Python/MLX text-to-speech library with custom Metal kernels, Apple AMX/Accelerate DSP, speculative decoding, and OpenAI-compatible API. pocket-voice uses Kyutai's Rust inference crates instead of MLX, but shares the same philosophy of deep Apple Silicon optimization.
+**[pocket-tts](https://github.com/sethdford/pocket-tts)** — Python/MLX text-to-speech library with custom Metal kernels, Apple AMX/Accelerate DSP, speculative decoding, and OpenAI-compatible API. Sonata uses Rust inference crates (candle + Metal) instead of MLX, but shares the same philosophy of deep Apple Silicon optimization.
 
 ## License
 

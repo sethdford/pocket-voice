@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Comprehensive benchmark suite for pocket-voice.
+# Comprehensive benchmark suite for Sonata.
 # Measures component-level and end-to-end performance.
 # Usage: ./scripts/benchmark.sh [--stt] [--tts] [--e2e] [--all] [--compare]
 
@@ -247,8 +247,8 @@ bench_e2e() {
     echo "    RTF  = Real-Time Factor (generation_time / audio_duration)"
     echo ""
 
-    if [ -f "$ROOT/pocket-voice" ]; then
-        echo "  Binary: $ROOT/pocket-voice ($(stat -f%z "$ROOT/pocket-voice" 2>/dev/null || echo '?') bytes)"
+    if [ -f "$ROOT/sonata" ]; then
+        echo "  Binary: $ROOT/sonata ($(stat -f%z "$ROOT/sonata" 2>/dev/null || echo '?') bytes)"
 
         local dylib_count=0
         for f in "$BUILD"/*.dylib; do
@@ -257,8 +257,8 @@ bench_e2e() {
         echo "  Shared libs: $dylib_count dylibs in $BUILD/"
 
         echo ""
-        echo "  Run pocket-voice with --profiler for live latency breakdown:"
-        echo "    ANTHROPIC_API_KEY=sk-... ./pocket-voice --profiler"
+        echo "  Run sonata with --profiler for live latency breakdown:"
+        echo "    ANTHROPIC_API_KEY=sk-... ./sonata --profiler"
         echo ""
         echo "  The profiler shows per-turn:"
         echo "    ┌─── Turn Latency Breakdown ───────────────────┐"
@@ -272,7 +272,7 @@ bench_e2e() {
         echo "    │ LLM throughput:      XXX.X tok/s            │"
         echo "    └───────────────────────────────────────────────┘"
     else
-        echo "  [SKIP] pocket-voice binary not found. Run 'make' first."
+        echo "  [SKIP] sonata binary not found. Run 'make' first."
     fi
 
     echo ""
@@ -284,7 +284,7 @@ bench_e2e() {
 bench_compare() {
     print_header "Competitor Comparison Framework"
 
-    echo "  This script compares pocket-voice against popular alternatives."
+    echo "  This script compares Sonata against popular alternatives."
     echo ""
 
     # Check for competitor installations
@@ -322,13 +322,13 @@ bench_compare() {
     echo "  ┌──────────────────┬──────────┬───────────┬────────────┐"
     echo "  │ System           │ STT WER  │ TTS RTF   │ VRL (ms)   │"
     echo "  ├──────────────────┼──────────┼───────────┼────────────┤"
-    echo "  │ pocket-voice     │  < 5%    │  < 0.2x   │  < 500     │"
+    echo "  │ sonata           │  < 5%    │  < 0.2x   │  < 500     │"
     echo "  │ whisper.cpp      │  ~5%     │    N/A    │    N/A     │"
     echo "  │ piper            │   N/A    │  ~0.05x   │    N/A     │"
     echo "  │ whisper+piper    │  ~5%     │  ~0.05x   │  ~2000+    │"
     echo "  └──────────────────┴──────────┴───────────┴────────────┘"
     echo ""
-    echo "  pocket-voice advantage: integrated pipeline with speculative"
+    echo "  Sonata advantage: integrated pipeline with speculative"
     echo "  prefill, streaming overlap, and sub-500ms voice response latency."
     echo ""
 
@@ -362,8 +362,8 @@ system_info() {
 
     # Build info
     print_metric "Compiler" "$(cc --version 2>/dev/null | head -1)"
-    if [ -f "$ROOT/pocket-voice" ]; then
-        print_metric "Binary size" "$(du -h "$ROOT/pocket-voice" | cut -f1)"
+    if [ -f "$ROOT/sonata" ]; then
+        print_metric "Binary size" "$(du -h "$ROOT/sonata" | cut -f1)"
     fi
 
     local total_dylib=0
@@ -379,7 +379,7 @@ generate_report() {
     local report="$BENCH_OUT/benchmark_report_$(date +%Y%m%d_%H%M%S).md"
 
     {
-        echo "# pocket-voice Benchmark Report"
+        echo "# Sonata Benchmark Report"
         echo ""
         echo "**Date:** $(date '+%Y-%m-%d %H:%M:%S')"
         echo "**Machine:** $(sysctl -n hw.model 2>/dev/null || echo 'unknown')"
@@ -449,7 +449,7 @@ main() {
 
     print_header "Benchmark Complete"
     echo "  Results saved to $BENCH_OUT/"
-    echo "  Run pocket-voice --profiler for live metrics."
+    echo "  Run sonata --profiler for live metrics."
     echo ""
 }
 

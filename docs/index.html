@@ -3,18 +3,18 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>pocket-voice — Zero-Python Voice Pipeline for Apple Silicon</title>
+    <title>Sonata — Real-time Voice AI for Apple Silicon</title>
     <meta
       name="description"
-      content="A fully native C and Rust real-time voice pipeline for Apple Silicon. Mic to speaker in under 200ms. No Python. No GIL. No compromises."
+      content="Real-time voice AI for Apple Silicon. Native C + Rust pipeline. Mic to speaker with sub-second latency."
     />
     <meta name="theme-color" content="#000000" />
 
     <!-- Open Graph -->
-    <meta property="og:title" content="pocket-voice" />
+    <meta property="og:title" content="Sonata" />
     <meta
       property="og:description"
-      content="Zero-Python real-time voice pipeline for Apple Silicon. 43 C libraries, 5 Rust crates, 1 metallib. 30 test suites. Under 200ms latency."
+      content="Real-time voice AI for Apple Silicon. Native C + Rust. 43 libraries, 5 Rust crates, 1 metallib. 30 test suites."
     />
     <meta property="og:type" content="website" />
     <meta
@@ -24,10 +24,10 @@
 
     <!-- Twitter Card -->
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="pocket-voice" />
+    <meta name="twitter:title" content="Sonata" />
     <meta
       name="twitter:description"
-      content="Zero-Python real-time voice pipeline for Apple Silicon. Mic → STT → Claude → TTS → Speaker in under 200ms."
+      content="Native voice AI pipeline for Apple Silicon. Mic → STT → LLM → TTS → Speaker. Native C + Rust."
     />
 
     <!-- Favicon -->
@@ -1202,7 +1202,7 @@
     <!-- NAV -->
     <nav class="nav" id="nav" role="navigation" aria-label="Main navigation">
       <div class="nav-inner">
-        <a href="#" class="nav-logo" aria-label="pocket-voice home">
+        <a href="#" class="nav-logo" aria-label="Sonata home">
           <svg
             viewBox="0 0 24 24"
             fill="none"
@@ -1215,7 +1215,7 @@
             <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
             <line x1="12" y1="19" x2="12" y2="22" />
           </svg>
-          pocket-voice
+          Sonata
         </a>
         <ul class="nav-links">
           <li><a href="#pipeline">Pipeline</a></li>
@@ -1253,11 +1253,13 @@
           </defs>
         </svg>
       </div>
-      <p class="hero-eyebrow">100% native C and Rust on Apple Silicon</p>
-      <h1>Voice that<br /><span class="grad">thinks different.</span></h1>
+      <p class="hero-eyebrow">Sonata &middot; Native Voice AI</p>
+      <h1>
+        Intelligence at the<br /><span class="grad">speed of speech.</span>
+      </h1>
       <p class="hero-sub">
-        A real-time conversational AI pipeline.<br />Mic to speaker in under
-        200ms.
+        A native C + Rust voice pipeline for Apple Silicon.<br />Mic to speaker.
+        No cloud required.
       </p>
       <div class="hero-cta">
         <a href="https://github.com/sethdford/pocket-voice" class="btn btn-p">
@@ -2161,11 +2163,11 @@
               <span class="t-pr">$</span>
               <span class="t-kw">ANTHROPIC_API_KEY</span
               ><span class="t-op">=</span><span class="t-str">sk-ant-...</span>
-              <span class="t-fn">./pocket-voice</span>
+              <span class="t-fn">./sonata</span>
 
               <span class="t-cm"># Custom voice with spatial audio</span>
               <span class="t-pr">$</span>
-              <span class="t-fn">./pocket-voice</span>
+              <span class="t-fn">./sonata</span>
               <span class="t-fl">--voice</span>
               <span class="t-str">voice.wav</span>
               <span class="t-fl">--pitch</span> <span class="t-str">1.15</span>
@@ -2430,8 +2432,8 @@
         </div>
 
         <p class="footer-copy">
-          Built with obsessive attention to detail on Apple Silicon. Copyright
-          &copy; 2026 Seth Ford.
+          Sonata &mdash; built with obsessive attention to detail on Apple
+          Silicon. Copyright &copy; 2026 Seth Ford.
         </p>
       </div>
     </footer>

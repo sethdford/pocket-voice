@@ -45,7 +45,7 @@ If no API key is configured, all endpoints are open access.
 
 ## Endpoints
 
-### `GET /health`
+### `GET /health` (alias: `/v1/health`)
 
 Health check. No authentication required.
 
@@ -241,7 +241,7 @@ curl -X POST http://localhost:8080/v1/voices \
 **Response:**
 
 ```json
-{ "voice_id": "voice_0", "status": "created" }
+{ "voice_id": "voice_0", "embedding_dim": 512 }
 ```
 
 The returned `voice_id` can be used in TTS requests:
@@ -297,19 +297,24 @@ Sec-WebSocket-Key: <key>
 
 #### Client → Server
 
-| Type   | Format        | Description                  |
-| ------ | ------------- | ---------------------------- |
-| Binary | Raw PCM audio | Audio frames from microphone |
+| Type   | Format        | Description                      |
+| ------ | ------------- | -------------------------------- |
+| Binary | Raw PCM audio | Audio frames from microphone     |
+| Text   | `flush`/`end` | Manually trigger STT flush       |
+| Text   | JSON config   | Negotiate Opus codec (see below) |
 
 #### Server → Client
 
-| Type        | Format                               | Description                 |
-| ----------- | ------------------------------------ | --------------------------- |
-| Text (JSON) | `{"type":"listening"}`               | Pipeline is ready for audio |
-| Text (JSON) | `{"type":"transcript","text":"..."}` | STT transcription result    |
-| Text (JSON) | `{"type":"llm_token","text":"..."}`  | Streaming LLM token         |
-| Text (JSON) | `{"type":"speaking"}`                | TTS audio playback started  |
-| Binary      | Raw PCM audio                        | TTS audio chunks            |
+| Type        | Format                                                     | Description                       |
+| ----------- | ---------------------------------------------------------- | --------------------------------- |
+| Text (JSON) | `{"type":"listening"}`                                     | Pipeline is ready for audio       |
+| Text (JSON) | `{"type":"transcript","text":"..."}`                       | STT transcription result          |
+| Text (JSON) | `{"type":"processing"}`                                    | Transcript received, calling LLM  |
+| Text (JSON) | `{"type":"llm_token","text":"..."}`                        | Streaming LLM token               |
+| Text (JSON) | `{"type":"speaking"}`                                      | TTS audio playback started        |
+| Text (JSON) | `{"type":"error","message":"..."}`                         | Engine unavailable or other error |
+| Text (JSON) | `{"type":"config_ack","codec":"opus","sample_rate":16000}` | Opus codec negotiation confirmed  |
+| Binary      | Raw PCM audio                                              | TTS audio chunks                  |
 
 ### Flow
 

@@ -23,7 +23,7 @@ OUTPUT="$OUTPUT_DIR/sweep_${TIMESTAMP}.json"
 mkdir -p "$OUTPUT_DIR"
 
 echo "╔══════════════════════════════════════════════╗"
-echo "║    pocket-voice — Benchmark Sweep            ║"
+echo "║    Sonata — Benchmark Sweep                  ║"
 echo "╠══════════════════════════════════════════════╣"
 echo "║  Date: $(date '+%Y-%m-%d %H:%M:%S')                   ║"
 echo "╚══════════════════════════════════════════════╝"

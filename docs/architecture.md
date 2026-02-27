@@ -14,15 +14,12 @@ The pipeline processes voice input through five stages, orchestrated by a state 
 
 ```
 Listening → Recording → Processing → Streaming → Speaking → Listening
-                │           │            ↑
-                │           │  (speculative prefill at 70% EOU)
-                │           │
-                └───────────┘  Barge-in (any state) → Listening
+                │
+                └───────────  Barge-in (any state) → Listening
 ```
 
 | State          | Description                                               |
 | -------------- | --------------------------------------------------------- |
-| **IDLE**       | Pipeline initialized, waiting for activation              |
 | **LISTENING**  | Mic active, VAD monitoring for speech onset               |
 | **RECORDING**  | Speech detected, audio being captured and streamed to STT |
 | **PROCESSING** | End-of-utterance detected, transcript sent to LLM         |
@@ -79,15 +76,11 @@ Sonata uses a 3-signal fused EOU system to determine when the user has finished 
 
 The three signals are combined in `fused_eou.c`:
 
-- **Weighted average**: 0.4 energy + 0.3 Mimi + 0.3 STT
-- **Solo thresholds**: Any signal > 0.95 triggers immediately
-- **EMA smoothing** on fused probability (alpha = 0.3)
+- **Weighted average**: 0.25 energy + 0.45 Mimi + 0.30 STT
+- **Solo thresholds**: energy > 0.95, Mimi > 0.90, STT > 0.85 trigger independently
+- **EMA smoothing** on fused probability (alpha = 0.4)
 - **Consecutive frame requirement**: 2 frames (160ms) to prevent false triggers
 - **Speech gate**: Won't trigger on initial silence
-
-### Speculative Prefill
-
-At 70% fused EOU confidence, Sonata speculatively sends the current transcript to the LLM. If the user keeps speaking (confidence drops below 30%), the request is cancelled. If EOU confirms, the LLM response is already in-flight — saving 100–300ms of perceived latency.
 
 ## Sonata TTS Pipeline
 
