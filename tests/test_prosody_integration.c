@@ -577,6 +577,198 @@ static void test_duration_prosody_combined(void) {
     printf("    combined: pitch=%.3f rate=%.3f\n", final_pitch, final_rate);
 }
 
+/* ── SSML + Emotion + Emphasis Triple Stack ─────────────────────────────── */
+
+static void test_triple_stack_ssml(void) {
+    printf("\n=== Triple Stack: SSML + Emotion + Emphasis ===\n");
+
+    SSMLSegment segs[SSML_MAX_SEGMENTS];
+
+    /* Prosody wrapping emotion wrapping emphasis */
+    int n = ssml_parse(
+        "<speak><prosody rate=\"85%\" pitch=\"+5%\">"
+        "<emotion type=\"sad\"><emphasis level=\"moderate\">I'm sorry</emphasis> "
+        "about your loss.</emotion></prosody></speak>",
+        segs, SSML_MAX_SEGMENTS);
+    TEST(n >= 1, "triple-stack SSML parsed");
+
+    int found_sorry = 0;
+    for (int i = 0; i < n; i++) {
+        if (strstr(segs[i].text, "sorry")) {
+            found_sorry = 1;
+            /* Rate should be prosody(0.85) * emphasis_moderate effect */
+            TEST(segs[i].rate < 1.0f, "rate below 1.0 from prosody+emphasis");
+            TEST(strcmp(segs[i].emotion, "sad") == 0, "emotion is sad");
+        }
+    }
+    TEST(found_sorry, "found sorry segment");
+
+    /* Excited emotion + strong emphasis + fast prosody */
+    n = ssml_parse(
+        "<speak><prosody rate=\"120%\"><emotion type=\"excited\">"
+        "<emphasis level=\"strong\">AMAZING!</emphasis></emotion></prosody></speak>",
+        segs, SSML_MAX_SEGMENTS);
+    TEST(n >= 1, "excited triple-stack parsed");
+
+    for (int i = 0; i < n; i++) {
+        if (strstr(segs[i].text, "AMAZING")) {
+            /* Excited rate=1.08, prosody rate=1.2, emphasis strong rate*=0.9 */
+            /* Combined: dependent on implementation priority */
+            TEST(segs[i].volume > 1.0f, "strong emphasis boosts volume");
+            TEST(strcmp(segs[i].emotion, "excited") == 0, "emotion preserved");
+        }
+    }
+}
+
+/* ── Prosody Reset Between Sentences ─────────────────────────────────────── */
+
+static void test_prosody_reset_between_sentences(void) {
+    printf("\n=== Prosody Reset Between Sentences ===\n");
+
+    /* Process first sentence: sad */
+    EmotionDetection det1 = prosody_detect_emotion(
+        "I am so sorry about the terrible news.");
+    MultiScaleProsody msp1 = prosody_analyze_text(
+        "I am so sorry about the terrible news.");
+
+    /* Process second sentence: happy */
+    EmotionDetection det2 = prosody_detect_emotion(
+        "But wait, something wonderful happened!");
+    MultiScaleProsody msp2 = prosody_analyze_text(
+        "But wait, something wonderful happened!");
+
+    /* Emotions should differ */
+    TEST(det1.emotion != det2.emotion || det1.confidence != det2.confidence,
+         "different sentences produce different emotion signals");
+
+    /* Contours should differ */
+    TEST(msp1.contour != msp2.contour || msp1.utterance.energy != msp2.utterance.energy,
+         "contour or energy differs between sad and happy sentences");
+
+    /* Process third sentence: neutral (reset) */
+    EmotionDetection det3 = prosody_detect_emotion("The weather is mild today.");
+    TEST(det3.emotion == EMOTION_NEUTRAL, "neutral sentence resets emotion");
+    TEST(det3.hint.pitch >= 0.95f && det3.hint.pitch <= 1.05f,
+         "neutral sentence has near-1.0 pitch hint");
+}
+
+/* ── Emphasis with Extreme Sentence Patterns ─────────────────────────────── */
+
+static void test_emphasis_extreme_patterns(void) {
+    printf("\n=== Emphasis: Extreme Sentence Patterns ===\n");
+
+    char out[8192];
+
+    /* Pattern: ALL CAPS sentence */
+    int n = emphasis_predict("STOP EVERYTHING RIGHT NOW", out, sizeof(out));
+    TEST(n >= 0, "ALL CAPS sentence processed");
+
+    /* Pattern: single word */
+    n = emphasis_predict("No.", out, sizeof(out));
+    TEST(n >= 0, "single-word sentence processed");
+
+    /* Pattern: very long sentence with many contrast markers */
+    n = emphasis_predict(
+        "However, the situation is complex, but actually it's simple, yet "
+        "instead of panicking, we should remain calm, but however we must "
+        "also stay alert and actually prepare for the worst.",
+        out, sizeof(out));
+    TEST(n >= 0, "many contrast markers processed");
+    /* Count emphasis tags - should be capped */
+    int count = 0;
+    const char *p = out;
+    while ((p = strstr(p, "<emphasis")) != NULL) { count++; p++; }
+    TEST(count <= 5, "emphasis count capped with many markers");
+
+    /* Pattern: empty input */
+    n = emphasis_predict("", out, sizeof(out));
+    TEST(n == 0, "empty input → 0 emphasis");
+
+    /* Pattern: NULL input */
+    n = emphasis_predict(NULL, out, sizeof(out));
+    TEST(n == 0, "NULL input → 0 emphasis");
+
+    /* Pattern: only punctuation */
+    n = emphasis_predict("... !!! ???", out, sizeof(out));
+    TEST(n >= 0, "punctuation-only doesn't crash");
+
+    /* Pattern: numbers and special chars */
+    n = emphasis_predict("There are 42 items at $19.99 each!", out, sizeof(out));
+    TEST(n >= 0, "text with numbers and currency processed");
+}
+
+/* ── End-to-End with Text Normalization ──────────────────────────────────── */
+
+static void test_normalize_then_prosody(void) {
+    printf("\n=== Normalize → Prosody End-to-End ===\n");
+
+    char normalized[4096];
+
+    /* Normalize text with numbers and abbreviations */
+    text_auto_normalize("Dr. Smith paid $42.50 on 1/15/2026.", normalized, sizeof(normalized));
+    TEST(strlen(normalized) > 0, "normalization produced output");
+
+    /* Run through emphasis prediction */
+    char emphasized[4096];
+    int n_emph = emphasis_predict(normalized, emphasized, sizeof(emphasized));
+    TEST(n_emph >= 0, "emphasis on normalized text");
+
+    /* Parse as SSML */
+    SSMLSegment segs[SSML_MAX_SEGMENTS];
+    int nseg = ssml_parse(emphasized, segs, SSML_MAX_SEGMENTS);
+    TEST(nseg >= 1, "SSML parse on normalized text");
+
+    /* Multi-scale prosody */
+    MultiScaleProsody msp = prosody_analyze_text(normalized);
+    TEST(msp.n_words > 0, "prosody analysis on normalized text");
+
+    /* Emotion detection */
+    EmotionDetection det = prosody_detect_emotion(normalized);
+    TEST(det.emotion >= 0 && det.emotion < EMOTION_COUNT, "valid emotion on normalized text");
+
+    printf("    Normalized: %s\n", normalized);
+    printf("    Emphasis: %d, Segments: %d, Words: %d, Emotion: %d\n",
+           n_emph, nseg, msp.n_words, det.emotion);
+}
+
+/* ── Quote Detection Edge Cases ──────────────────────────────────────────── */
+
+static void test_quote_detection_edge_cases(void) {
+    printf("\n=== Quote Detection: Edge Cases ===\n");
+
+    char out[4096];
+
+    /* Multiple quoted segments */
+    int n = emphasis_detect_quotes(
+        "He said \"hello\" and she said \"goodbye\" and they left.",
+        out, sizeof(out));
+    TEST(n == 2, "found 2 quoted segments");
+
+    /* No quotes */
+    n = emphasis_detect_quotes("There are no quotes here.", out, sizeof(out));
+    TEST(n == 0, "no quotes found");
+
+    /* Single unclosed quote */
+    n = emphasis_detect_quotes("He said \"hello and never finished", out, sizeof(out));
+    TEST(n >= 0, "unclosed quote handled gracefully");
+
+    /* Empty quotes */
+    n = emphasis_detect_quotes("She said \"\" nothing.", out, sizeof(out));
+    TEST(n >= 0, "empty quotes handled");
+
+    /* NULL input */
+    n = emphasis_detect_quotes(NULL, out, sizeof(out));
+    TEST(n == 0, "NULL input returns 0 quotes");
+
+    /* Empty input */
+    n = emphasis_detect_quotes("", out, sizeof(out));
+    TEST(n == 0, "empty input returns 0 quotes");
+
+    /* Quote at the very start and end */
+    n = emphasis_detect_quotes("\"Hello world\"", out, sizeof(out));
+    TEST(n == 1, "quote spanning entire text");
+}
+
 /* ── Main ─────────────────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -599,6 +791,13 @@ int main(void) {
     test_prosody_clamping();
     test_sentbuf_multi_sentence_pipeline();
     test_duration_prosody_combined();
+
+    /* Deepened tests */
+    test_triple_stack_ssml();
+    test_prosody_reset_between_sentences();
+    test_emphasis_extreme_patterns();
+    test_normalize_then_prosody();
+    test_quote_detection_edge_cases();
 
     printf("\n════════════════════════════════════════════\n");
     printf("  Results: %d passed, %d failed\n", pass_count, fail_count);

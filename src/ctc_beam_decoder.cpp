@@ -158,6 +158,8 @@ CTCBeamDecoder *ctc_beam_create(const char *lm_path,
                                  int vocab_size,
                                  int blank_id,
                                  const CTCBeamConfig *config) {
+    if (!vocab_arr || vocab_size <= 0) return nullptr;
+
     auto *dec = new (std::nothrow) CTCBeamDecoder;
     if (!dec) return nullptr;
 

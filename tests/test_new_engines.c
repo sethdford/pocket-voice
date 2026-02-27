@@ -162,6 +162,171 @@ int main(void) {
     speaker_encoder_destroy(NULL);
     CHECK(1, "destroy NULL is safe");
 
+    /* ═══ Additional Phonemizer Tests ═══ */
+    printf("\n═══ Additional Phonemizer Tests ═══\n");
+
+    /* Test 9: create/destroy lifecycle — repeated create+destroy */
+    {
+        int lifecycle_ok = 1;
+        for (int i = 0; i < 5; i++) {
+            Phonemizer *p = phonemizer_create("en-us");
+            if (!p) { lifecycle_ok = 0; break; }
+            char buf[128];
+            int len = phonemizer_text_to_ipa(p, "test", buf, sizeof(buf));
+            if (len <= 0) lifecycle_ok = 0;
+            phonemizer_destroy(p);
+        }
+        CHECK(lifecycle_ok, "phonemizer create/destroy lifecycle (5 cycles)");
+    }
+
+    /* Test 10: empty string input */
+    {
+        ph = phonemizer_create("en-us");
+        if (ph) {
+            char buf[128];
+            int len = phonemizer_text_to_ipa(ph, "", buf, sizeof(buf));
+            CHECK(len == 0 || len == -1, "text_to_ipa with empty string returns 0 or -1");
+            phonemizer_destroy(ph);
+        }
+    }
+
+    /* Test 11: very long text */
+    {
+        ph = phonemizer_create("en-us");
+        if (ph) {
+            /* Build a 2000+ char string */
+            char longtext[2048];
+            memset(longtext, 0, sizeof(longtext));
+            for (int i = 0; i < 200; i++) {
+                strcat(longtext, "hello ");
+            }
+            char ipa[4096];
+            int len = phonemizer_text_to_ipa(ph, longtext, ipa, sizeof(ipa));
+            CHECK(len > 0, "text_to_ipa with very long text produces output");
+            phonemizer_destroy(ph);
+        }
+    }
+
+    /* Test 12: text_to_ipa with small buffer truncates safely */
+    {
+        ph = phonemizer_create("en-us");
+        if (ph) {
+            char tiny[4];
+            int len = phonemizer_text_to_ipa(ph, "Hello world", tiny, sizeof(tiny));
+            /* Either truncates or returns error; should not overflow */
+            CHECK(len <= (int)sizeof(tiny) || len == -1,
+                  "text_to_ipa with tiny buffer does not overflow");
+            phonemizer_destroy(ph);
+        }
+    }
+
+    /* Test 13: text_to_ids with NULL ids_out returns -1 */
+    {
+        ph = phonemizer_create("en-us");
+        if (ph) {
+            CHECK(phonemizer_text_to_ids(ph, "hello", NULL, 32) == -1,
+                  "text_to_ids with NULL ids_out returns -1");
+            phonemizer_destroy(ph);
+        }
+    }
+
+    /* Test 14: text_to_ids with NULL text returns -1 */
+    {
+        ph = phonemizer_create("en-us");
+        if (ph) {
+            int ids[32];
+            CHECK(phonemizer_text_to_ids(ph, NULL, ids, 32) == -1,
+                  "text_to_ids with NULL text returns -1");
+            phonemizer_destroy(ph);
+        }
+    }
+
+    /* Test 15: ipa_to_ids with NULL phonemizer returns -1 */
+    {
+        int ids[32];
+        CHECK(phonemizer_ipa_to_ids(NULL, "hello", ids, 32) == -1,
+              "ipa_to_ids with NULL phonemizer returns -1");
+    }
+
+    /* Test 16: ipa_to_ids without phoneme map returns -1 */
+    {
+        ph = phonemizer_create("en-us");
+        if (ph) {
+            int ids[32];
+            CHECK(phonemizer_ipa_to_ids(ph, "hɛloʊ", ids, 32) == -1,
+                  "ipa_to_ids without phoneme map returns -1");
+            phonemizer_destroy(ph);
+        }
+    }
+
+    /* Test 17: load_phoneme_map with NULL path returns -1 */
+    {
+        ph = phonemizer_create("en-us");
+        if (ph) {
+            CHECK(phonemizer_load_phoneme_map(ph, NULL) == -1,
+                  "load_phoneme_map with NULL path returns -1");
+            phonemizer_destroy(ph);
+        }
+    }
+
+    /* Test 18: load_phoneme_map with nonexistent path returns -1 */
+    {
+        ph = phonemizer_create("en-us");
+        if (ph) {
+            CHECK(phonemizer_load_phoneme_map(ph, "/nonexistent/map.json") == -1,
+                  "load_phoneme_map with nonexistent path returns -1");
+            phonemizer_destroy(ph);
+        }
+    }
+
+    /* ═══ Additional Speaker Encoder Tests ═══ */
+    printf("\n═══ Additional Speaker Encoder Tests ═══\n");
+
+    /* Test 7: extract with NULL audio returns -1 */
+    {
+        float emb[256] = {0};
+        CHECK(speaker_encoder_extract(NULL, NULL, 16000, emb) == -1,
+              "extract with NULL encoder and NULL audio returns -1");
+    }
+
+    /* Test 8: extract with NULL embedding_out returns -1 */
+    {
+        float audio[16000] = {0};
+        CHECK(speaker_encoder_extract(NULL, audio, 16000, NULL) == -1,
+              "extract with NULL encoder and NULL output returns -1");
+    }
+
+    /* Test 9: extract with 0 samples returns -1 */
+    {
+        float audio[1] = {0};
+        float emb[256] = {0};
+        CHECK(speaker_encoder_extract(NULL, audio, 0, emb) == -1,
+              "extract with NULL encoder and 0 samples returns -1");
+    }
+
+    /* Test 10: embedding_dim with NULL returns -1 or 0 */
+    {
+        int dim = speaker_encoder_embedding_dim(NULL);
+        CHECK(dim == -1 || dim == 0,
+              "embedding_dim with NULL returns -1 or 0");
+    }
+
+    /* Test 11: extract_from_wav with nonexistent WAV returns -1 */
+    {
+        float emb[256] = {0};
+        SpeakerEncoder *dummy = (SpeakerEncoder *)1;
+        int rc = speaker_encoder_extract_from_wav(dummy, "/nonexistent/file.wav", emb);
+        /* Should return -1 (dummy is invalid but path check or load should fail) */
+        CHECK(rc == -1, "extract_from_wav with nonexistent WAV returns -1");
+    }
+
+    /* Test 12: create with empty string path returns NULL */
+    {
+        SpeakerEncoder *enc = speaker_encoder_create("");
+        CHECK(enc == NULL, "create with empty string path returns NULL");
+        if (enc) speaker_encoder_destroy(enc);
+    }
+
     printf("\n══════════════════════════════════════════\n");
     printf("Results: %d passed, %d failed\n", passed, failed);
     if (failed > 0) {

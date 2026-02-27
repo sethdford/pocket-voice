@@ -222,6 +222,257 @@ static void test_phonemizer_real(void) {
     phonemizer_destroy(ph);
 }
 
+/* ── Additional Tests ────────────────────────────────────────────── */
+
+static void test_model_path_validation(void) {
+    printf("\n═══ Model Path Validation ═══\n");
+
+    /* Empty string path */
+    SpeakerEncoder *enc = speaker_encoder_create("");
+    CHECK(enc == NULL, "speaker_encoder_create with empty path returns NULL");
+    if (enc) speaker_encoder_destroy(enc);
+
+    /* Path to a directory (not a file) */
+    enc = speaker_encoder_create("/tmp");
+    CHECK(enc == NULL, "speaker_encoder_create with directory path returns NULL");
+    if (enc) speaker_encoder_destroy(enc);
+
+    /* Path with wrong extension — should still fail gracefully */
+    enc = speaker_encoder_create("/tmp/notamodel.txt");
+    CHECK(enc == NULL, "speaker_encoder_create with non-ONNX file returns NULL");
+    if (enc) speaker_encoder_destroy(enc);
+}
+
+static void test_phoneme_map_loading(void) {
+    printf("\n═══ Phoneme Map Loading ═══\n");
+
+    const char *map_path = "models/sonata/phoneme_map.json";
+    if (!file_exists(map_path)) {
+        SKIP("phoneme_map.json not found");
+        return;
+    }
+
+    Phonemizer *ph = phonemizer_create("en-us");
+    CHECK(ph != NULL, "phonemizer creates for map loading test");
+    if (!ph) return;
+
+    /* Before loading: vocab_size should be 0 */
+    extern int phonemizer_vocab_size(const Phonemizer *ph);
+    int vs = phonemizer_vocab_size(ph);
+    CHECK(vs == 0, "vocab_size is 0 before loading map");
+
+    /* Load the map */
+    extern int phonemizer_load_phoneme_map(Phonemizer *ph, const char *json_path);
+    int rc = phonemizer_load_phoneme_map(ph, map_path);
+    CHECK(rc == 0, "phoneme_map.json loads successfully");
+
+    /* After loading: vocab_size > 0 */
+    vs = phonemizer_vocab_size(ph);
+    printf("    Vocab size: %d\n", vs);
+    CHECK(vs > 20, "vocab_size > 20 after loading map");
+
+    /* text_to_ids should now produce valid IDs */
+    extern int phonemizer_text_to_ids(Phonemizer *ph, const char *text, int *ids_out, int max_ids);
+    int ids[128];
+    int n = phonemizer_text_to_ids(ph, "Hello world", ids, 128);
+    CHECK(n > 0, "text_to_ids produces IDs after map loaded");
+    if (n > 0) {
+        CHECK(ids[0] == 1, "first ID is BOS token (1)");
+        CHECK(ids[n - 1] == 2, "last ID is EOS token (2)");
+
+        /* All IDs should be within vocab range */
+        int in_range = 1;
+        for (int i = 0; i < n; i++) {
+            if (ids[i] < 0 || ids[i] >= vs + 10) { in_range = 0; break; }
+        }
+        CHECK(in_range, "all IDs are in valid range");
+    }
+
+    phonemizer_destroy(ph);
+}
+
+static void test_wav_loading_edge_cases(void) {
+    printf("\n═══ WAV Loading Edge Cases ═══\n");
+
+    int n_samples = 0, sr = 0;
+
+    /* NULL path */
+    float *samples = load_wav(NULL, &n_samples, &sr);
+    CHECK(samples == NULL, "load_wav with NULL path returns NULL");
+
+    /* Nonexistent file */
+    samples = load_wav("/nonexistent/audio.wav", &n_samples, &sr);
+    CHECK(samples == NULL, "load_wav with nonexistent path returns NULL");
+
+    /* Empty string path */
+    samples = load_wav("", &n_samples, &sr);
+    CHECK(samples == NULL, "load_wav with empty path returns NULL");
+}
+
+static void test_resampling_identity(void) {
+    printf("\n═══ Resampling Identity Test ═══\n");
+
+    /* Same rate -> should get exact copy */
+    float input[100];
+    for (int i = 0; i < 100; i++) input[i] = sinf((float)i * 0.1f);
+
+    int out_samples = 0;
+    float *output = resample(input, 100, 16000, 16000, &out_samples);
+    CHECK(output != NULL, "identity resample returns non-NULL");
+    CHECK(out_samples == 100, "identity resample preserves sample count");
+
+    if (output) {
+        int match = 1;
+        for (int i = 0; i < 100; i++) {
+            if (fabsf(output[i] - input[i]) > 1e-6f) { match = 0; break; }
+        }
+        CHECK(match, "identity resample preserves exact values");
+        free(output);
+    }
+}
+
+static void test_resampling_rate_conversion(void) {
+    printf("\n═══ Resampling Rate Conversion ═══\n");
+
+    /* Upsample 16kHz -> 48kHz: output should have 3x samples */
+    float input[160];
+    for (int i = 0; i < 160; i++) input[i] = sinf((float)i * 0.05f);
+
+    int out_samples = 0;
+    float *output = resample(input, 160, 16000, 48000, &out_samples);
+    CHECK(output != NULL, "upsample 16kHz->48kHz returns non-NULL");
+    CHECK(out_samples == 480, "upsample 16kHz->48kHz produces 3x samples");
+
+    if (output) {
+        /* Verify interpolated values are reasonable (within input range) */
+        float min_in = input[0], max_in = input[0];
+        for (int i = 1; i < 160; i++) {
+            if (input[i] < min_in) min_in = input[i];
+            if (input[i] > max_in) max_in = input[i];
+        }
+        int in_range = 1;
+        for (int i = 0; i < out_samples; i++) {
+            if (output[i] < min_in - 0.01f || output[i] > max_in + 0.01f) {
+                in_range = 0; break;
+            }
+        }
+        CHECK(in_range, "upsampled values are within input range");
+        free(output);
+    }
+
+    /* Downsample 48kHz -> 16kHz: output should have 1/3 samples */
+    float input48[480];
+    for (int i = 0; i < 480; i++) input48[i] = sinf((float)i * 0.02f);
+
+    output = resample(input48, 480, 48000, 16000, &out_samples);
+    CHECK(output != NULL, "downsample 48kHz->16kHz returns non-NULL");
+    CHECK(out_samples == 160, "downsample 48kHz->16kHz produces 1/3 samples");
+    if (output) free(output);
+}
+
+static void test_phonemizer_consistency(void) {
+    printf("\n═══ Phonemizer Consistency ═══\n");
+
+    Phonemizer *ph = phonemizer_create("en-us");
+    CHECK(ph != NULL, "phonemizer creates for consistency test");
+    if (!ph) return;
+
+    /* Same input should always produce same output */
+    char ipa1[512], ipa2[512];
+    int len1 = phonemizer_text_to_ipa(ph, "Consistent output", ipa1, sizeof(ipa1));
+    int len2 = phonemizer_text_to_ipa(ph, "Consistent output", ipa2, sizeof(ipa2));
+    CHECK(len1 > 0 && len2 > 0, "consistency: both calls produce output");
+    CHECK(len1 == len2, "consistency: same input produces same length");
+    if (len1 > 0 && len2 > 0) {
+        CHECK(strcmp(ipa1, ipa2) == 0, "consistency: same input produces identical IPA");
+    }
+
+    phonemizer_destroy(ph);
+}
+
+static void test_phonemizer_special_characters(void) {
+    printf("\n═══ Phonemizer Special Characters ═══\n");
+
+    Phonemizer *ph = phonemizer_create("en-us");
+    CHECK(ph != NULL, "phonemizer creates for special chars test");
+    if (!ph) return;
+
+    char ipa[512];
+
+    /* Punctuation-heavy text */
+    int len = phonemizer_text_to_ipa(ph, "Hello! How are you?", ipa, sizeof(ipa));
+    CHECK(len > 0, "punctuation text produces IPA");
+
+    /* Text with numbers */
+    len = phonemizer_text_to_ipa(ph, "I have 42 cats and 7 dogs", ipa, sizeof(ipa));
+    CHECK(len > 0, "text with numbers produces IPA");
+
+    /* Single character */
+    len = phonemizer_text_to_ipa(ph, "A", ipa, sizeof(ipa));
+    CHECK(len > 0 || len == -1, "single character handled gracefully");
+
+    phonemizer_destroy(ph);
+}
+
+static void test_speaker_encoder_embedding_norms(void) {
+    printf("\n═══ Embedding Norm Validation ═══\n");
+
+    const char *model_path = "models/ecapa_tdnn.onnx";
+    if (!file_exists(model_path)) {
+        SKIP("ECAPA-TDNN model not found for norm validation");
+        return;
+    }
+
+    SpeakerEncoder *enc = speaker_encoder_create(model_path);
+    CHECK(enc != NULL, "encoder loads for norm validation");
+    if (!enc) return;
+
+    int dim = speaker_encoder_embedding_dim(enc);
+
+    /* Test with synthetic audio (silence) */
+    float *silence = calloc(16000, sizeof(float));
+    float emb[512] = {0};
+    int ret = speaker_encoder_extract(enc, silence, 16000, emb);
+
+    if (ret > 0) {
+        /* L2 norm should be ~1.0 (embeddings are normalized) */
+        float norm = 0.0f;
+        for (int i = 0; i < dim; i++) norm += emb[i] * emb[i];
+        norm = sqrtf(norm);
+        printf("    Silence embedding L2 norm: %.4f\n", norm);
+        CHECK(fabsf(norm - 1.0f) < 0.1f, "silence embedding is approximately L2-normalized");
+
+        /* No NaN or Inf values */
+        int has_nan = 0;
+        for (int i = 0; i < dim; i++) {
+            if (isnan(emb[i]) || isinf(emb[i])) { has_nan = 1; break; }
+        }
+        CHECK(!has_nan, "embedding has no NaN or Inf values");
+    } else {
+        SKIP("extract from silence failed (model may require non-silent audio)");
+    }
+
+    /* Test with noise audio */
+    float *noise = malloc(16000 * sizeof(float));
+    srand(42);
+    for (int i = 0; i < 16000; i++)
+        noise[i] = ((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f;
+
+    float emb_noise[512] = {0};
+    ret = speaker_encoder_extract(enc, noise, 16000, emb_noise);
+    if (ret > 0) {
+        float norm = 0.0f;
+        for (int i = 0; i < dim; i++) norm += emb_noise[i] * emb_noise[i];
+        norm = sqrtf(norm);
+        printf("    Noise embedding L2 norm: %.4f\n", norm);
+        CHECK(fabsf(norm - 1.0f) < 0.1f, "noise embedding is approximately L2-normalized");
+    }
+
+    free(silence);
+    free(noise);
+    speaker_encoder_destroy(enc);
+}
+
 int main(void) {
     printf("╔══════════════════════════════════════════════════════════╗\n");
     printf("║  Real Model Integration Tests                           ║\n");
@@ -230,6 +481,14 @@ int main(void) {
 
     test_speaker_encoder();
     test_phonemizer_real();
+    test_model_path_validation();
+    test_phoneme_map_loading();
+    test_wav_loading_edge_cases();
+    test_resampling_identity();
+    test_resampling_rate_conversion();
+    test_phonemizer_consistency();
+    test_phonemizer_special_characters();
+    test_speaker_encoder_embedding_norms();
 
     printf("\n══════════════════════════════════════════════════════════\n");
     printf("Results: %d passed, %d failed, %d skipped\n", passed, failed, skipped);

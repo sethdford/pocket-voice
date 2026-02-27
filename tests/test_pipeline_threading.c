@@ -617,6 +617,334 @@ static void test_spmc_create_destroy_edge_cases(void) {
     spmc_destroy(&ring);
 }
 
+/* ---------- 11. multi-reader race condition stress ---------- */
+
+typedef struct {
+    SPMCRing *ring;
+    int consumer_id;
+    uint32_t total_read;
+    int corrupt;
+} ReaderArgs;
+
+static void *race_reader(void *arg) {
+    ReaderArgs *a = (ReaderArgs *)arg;
+    float rbuf[480];
+    a->total_read = 0;
+    a->corrupt = 0;
+
+    while (a->total_read < 48000) {
+        uint32_t avail = spmc_available_read(a->ring, a->consumer_id);
+        if (avail == 0) {
+            /* Busy-wait briefly */
+            struct timespec sl = { .tv_sec = 0, .tv_nsec = 100000L };
+            nanosleep(&sl, NULL);
+            continue;
+        }
+        uint32_t to_read = avail < 480 ? avail : 480;
+        int rc = spmc_read(a->ring, a->consumer_id, rbuf, to_read);
+        if (rc != 0) { a->corrupt++; break; }
+
+        /* Verify data is sequential based on position */
+        for (uint32_t i = 0; i < to_read; i++) {
+            float expected = (float)(a->total_read + i);
+            if (rbuf[i] != expected) { a->corrupt++; break; }
+        }
+        a->total_read += to_read;
+    }
+    return NULL;
+}
+
+static void test_spmc_multi_reader_race(void) {
+    printf("\n[test_spmc_multi_reader_race]\n");
+
+    SPMCRing ring;
+    int rc = spmc_create(&ring, 8192, 3);
+    CHECK(rc == 0, "create 8192-float ring with 3 consumers");
+
+    /* Launch 3 reader threads */
+    pthread_t readers[3];
+    ReaderArgs rargs[3];
+    for (int i = 0; i < 3; i++) {
+        rargs[i].ring = &ring;
+        rargs[i].consumer_id = i;
+        pthread_create(&readers[i], NULL, race_reader, &rargs[i]);
+    }
+
+    /* Producer writes 48000 floats in 480-float chunks */
+    float wbuf[480];
+    uint32_t total_written = 0;
+    while (total_written < 48000) {
+        for (uint32_t i = 0; i < 480; i++)
+            wbuf[i] = (float)(total_written + i);
+
+        while (spmc_available_write(&ring) < 480) {
+            struct timespec sl = { .tv_sec = 0, .tv_nsec = 100000L };
+            nanosleep(&sl, NULL);
+        }
+        spmc_write(&ring, wbuf, 480);
+        total_written += 480;
+    }
+
+    for (int i = 0; i < 3; i++)
+        pthread_join(readers[i], NULL);
+
+    for (int i = 0; i < 3; i++) {
+        CHECKF(rargs[i].corrupt == 0,
+               "consumer %d: no corruption in race (%u read)", i, rargs[i].total_read);
+        CHECKF(rargs[i].total_read == 48000,
+               "consumer %d: read all 48000 floats (%u)", i, rargs[i].total_read);
+    }
+
+    spmc_destroy(&ring);
+}
+
+/* ---------- 12. full buffer behavior ---------- */
+
+static void test_spmc_full_buffer(void) {
+    printf("\n[test_spmc_full_buffer]\n");
+
+    SPMCRing ring;
+    int rc = spmc_create(&ring, 1024, 1);
+    CHECK(rc == 0, "create 1024-float ring with 1 consumer");
+
+    uint32_t cap = ring.size;
+
+    /* Fill ring to exactly capacity (write cap floats without reading) */
+    float *wbuf = calloc(cap, sizeof(float));
+    for (uint32_t i = 0; i < cap; i++) wbuf[i] = (float)i;
+
+    /* Write cap-1 first (should succeed — need 1 slot free in typical ring) */
+    rc = spmc_write(&ring, wbuf, cap - 1);
+    CHECK(rc == 0, "write cap-1 floats succeeds");
+
+    /* Check available write space */
+    uint32_t avail_w = spmc_available_write(&ring);
+    CHECKF(avail_w == 1, "1 slot remaining after writing cap-1 (%u available)", avail_w);
+
+    /* Write 1 more should succeed */
+    float one = 99.0f;
+    rc = spmc_write(&ring, &one, 1);
+    CHECK(rc == 0, "write 1 more to fill completely");
+
+    /* Now ring is full — further writes should fail */
+    rc = spmc_write(&ring, &one, 1);
+    CHECK(rc == -1, "write to full ring returns -1");
+
+    /* Read everything back to verify integrity */
+    float *rbuf = malloc(cap * sizeof(float));
+    rc = spmc_read(&ring, 0, rbuf, cap);
+    CHECK(rc == 0, "read full ring succeeds");
+
+    int data_ok = 1;
+    for (uint32_t i = 0; i < cap - 1; i++) {
+        if (rbuf[i] != (float)i) { data_ok = 0; break; }
+    }
+    if (rbuf[cap - 1] != 99.0f) data_ok = 0;
+    CHECK(data_ok, "data integrity after filling and draining");
+
+    /* After drain, writes should succeed again */
+    rc = spmc_write(&ring, wbuf, 480);
+    CHECK(rc == 0, "write succeeds after draining full ring");
+
+    free(wbuf);
+    free(rbuf);
+    spmc_destroy(&ring);
+}
+
+/* ---------- 13. zero-size write/read ---------- */
+
+static void test_spmc_zero_size(void) {
+    printf("\n[test_spmc_zero_size]\n");
+
+    SPMCRing ring;
+    int rc = spmc_create(&ring, 4096, 1);
+    CHECK(rc == 0, "create ring for zero-size tests");
+
+    /* Write 0 floats — should succeed (no-op) */
+    float dummy = 1.0f;
+    rc = spmc_write(&ring, &dummy, 0);
+    CHECK(rc == 0, "write 0 floats succeeds");
+
+    /* Available read should still be 0 */
+    uint32_t avail = spmc_available_read(&ring, 0);
+    CHECK(avail == 0, "no data available after zero-size write");
+
+    /* Write some real data, then read 0 */
+    float wbuf[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    spmc_write(&ring, wbuf, 10);
+
+    float rbuf[10] = {0};
+    rc = spmc_read(&ring, 0, rbuf, 0);
+    CHECK(rc == 0, "read 0 floats succeeds");
+
+    avail = spmc_available_read(&ring, 0);
+    CHECK(avail == 10, "data still available after zero-size read");
+
+    /* Advance 0 — should be no-op */
+    spmc_advance(&ring, 0, 0);
+    avail = spmc_available_read(&ring, 0);
+    CHECK(avail == 10, "data still available after zero-size advance");
+
+    spmc_destroy(&ring);
+}
+
+/* ---------- 14. wraparound exact boundary alignment ---------- */
+
+static void test_spmc_exact_boundary_alignment(void) {
+    printf("\n[test_spmc_exact_boundary_alignment]\n");
+
+    SPMCRing ring;
+    int rc = spmc_create(&ring, 1024, 1);
+    CHECK(rc == 0, "create ring for boundary alignment");
+
+    uint32_t cap = ring.size;
+
+    /* Write and read exactly (cap-1) repeatedly to force head/tail
+       to land exactly on the boundary */
+    float *wbuf = malloc(cap * sizeof(float));
+    float *rbuf = malloc(cap * sizeof(float));
+    int corrupt = 0;
+
+    for (int iter = 0; iter < 50; iter++) {
+        /* Fill with pattern for this iteration */
+        uint32_t chunk = cap - 1;
+        for (uint32_t i = 0; i < chunk; i++)
+            wbuf[i] = (float)(iter * 10000 + i);
+
+        rc = spmc_write(&ring, wbuf, chunk);
+        if (rc != 0) { corrupt++; break; }
+
+        rc = spmc_read(&ring, 0, rbuf, chunk);
+        if (rc != 0) { corrupt++; break; }
+
+        for (uint32_t i = 0; i < chunk; i++) {
+            if (rbuf[i] != (float)(iter * 10000 + i)) { corrupt++; break; }
+        }
+    }
+
+    CHECKF(corrupt == 0, "50 boundary-aligned cycles — %d corruptions", corrupt);
+
+    free(wbuf);
+    free(rbuf);
+    spmc_destroy(&ring);
+}
+
+/* ---------- 15. rapid deactivate/activate cycling ---------- */
+
+static void test_spmc_rapid_deactivate_activate(void) {
+    printf("\n[test_spmc_rapid_deactivate_activate]\n");
+
+    SPMCRing ring;
+    int rc = spmc_create(&ring, 4096, 2);
+    CHECK(rc == 0, "create ring with 2 consumers");
+
+    float wbuf[480], rbuf[480];
+    int ok = 1;
+
+    for (int cycle = 0; cycle < 100; cycle++) {
+        /* Deactivate consumer 1 */
+        spmc_deactivate(&ring, 1);
+
+        /* Write data while consumer 1 is inactive */
+        for (uint32_t i = 0; i < 480; i++)
+            wbuf[i] = (float)(cycle * 480 + i);
+        rc = spmc_write(&ring, wbuf, 480);
+        if (rc != 0) { ok = 0; break; }
+
+        /* Consumer 0 reads normally */
+        rc = spmc_read(&ring, 0, rbuf, 480);
+        if (rc != 0) { ok = 0; break; }
+        for (uint32_t i = 0; i < 480; i++) {
+            if (rbuf[i] != (float)(cycle * 480 + i)) { ok = 0; break; }
+        }
+
+        /* Reactivate consumer 1 — tail resets to head */
+        spmc_activate(&ring, 1);
+
+        /* Consumer 1 should have 0 available (just reactivated) */
+        uint32_t c1_avail = spmc_available_read(&ring, 1);
+        if (c1_avail != 0) { ok = 0; break; }
+    }
+
+    CHECK(ok, "100 rapid deactivate/activate cycles — no errors");
+    spmc_destroy(&ring);
+}
+
+/* ---------- 16. vm_ring full capacity overflow ---------- */
+
+static void test_vm_ring_overflow(void) {
+    printf("\n[test_vm_ring_overflow]\n");
+
+    VMRingBuffer rb;
+    int rc = vm_ring_create(&rb, 1024);
+    CHECK(rc == 0, "create 1024-float vm_ring");
+
+    uint32_t cap = rb.size;
+
+    /* Fill to capacity */
+    float *wbuf = calloc(cap, sizeof(float));
+    for (uint32_t i = 0; i < cap; i++) wbuf[i] = (float)i;
+    rc = vm_ring_write(&rb, wbuf, cap);
+    CHECK(rc == 0, "write exactly cap floats succeeds");
+
+    /* Overflow attempt should fail */
+    float one = 42.0f;
+    rc = vm_ring_write(&rb, &one, 1);
+    CHECK(rc == -1, "write to full vm_ring returns -1");
+
+    /* Available counts */
+    uint32_t r_avail = vm_ring_available_read(&rb);
+    uint32_t w_avail = vm_ring_available_write(&rb);
+    CHECK(r_avail == cap, "full ring: available_read == cap");
+    CHECK(w_avail == 0, "full ring: available_write == 0");
+
+    /* Read half, verify write works again */
+    float *rbuf = malloc((cap / 2) * sizeof(float));
+    rc = vm_ring_read(&rb, rbuf, cap / 2);
+    CHECK(rc == 0, "read half of full ring");
+
+    w_avail = vm_ring_available_write(&rb);
+    CHECK(w_avail == cap / 2, "write space restored after partial read");
+
+    rc = vm_ring_write(&rb, wbuf, cap / 2);
+    CHECK(rc == 0, "write after partial drain succeeds");
+
+    free(wbuf);
+    free(rbuf);
+    vm_ring_destroy(&rb);
+}
+
+/* ---------- 17. SPMC read from invalid consumer ---------- */
+
+static void test_spmc_invalid_consumer_id(void) {
+    printf("\n[test_spmc_invalid_consumer_id]\n");
+
+    SPMCRing ring;
+    int rc = spmc_create(&ring, 4096, 2);
+    CHECK(rc == 0, "create ring with 2 consumers");
+
+    float wbuf[480] = {0};
+    spmc_write(&ring, wbuf, 480);
+
+    /* Read from negative consumer_id */
+    float rbuf[480];
+    rc = spmc_read(&ring, -1, rbuf, 480);
+    CHECK(rc == -1, "read from consumer -1 returns -1");
+
+    /* Read from consumer_id >= n_consumers */
+    rc = spmc_read(&ring, 2, rbuf, 480);
+    CHECK(rc == -1, "read from consumer 2 (only 0,1 valid) returns -1");
+
+    rc = spmc_read(&ring, 99, rbuf, 480);
+    CHECK(rc == -1, "read from consumer 99 returns -1");
+
+    /* Valid consumer should still work */
+    rc = spmc_read(&ring, 0, rbuf, 480);
+    CHECK(rc == 0, "read from valid consumer 0 succeeds");
+
+    spmc_destroy(&ring);
+}
+
 /* ---------- main ---------- */
 
 int main(void) {
@@ -632,6 +960,13 @@ int main(void) {
     test_vm_ring_mirrored_peek();
     test_spmc_multi_consumer();
     test_spmc_create_destroy_edge_cases();
+    test_spmc_multi_reader_race();
+    test_spmc_full_buffer();
+    test_spmc_zero_size();
+    test_spmc_exact_boundary_alignment();
+    test_spmc_rapid_deactivate_activate();
+    test_vm_ring_overflow();
+    test_spmc_invalid_consumer_id();
 
     printf("\n=== Results: %d passed, %d failed ===\n", g_pass, g_fail);
     return g_fail > 0 ? 1 : 0;

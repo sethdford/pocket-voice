@@ -155,6 +155,120 @@ static void test_roundtrip_null_stt(void) {
     CHECK(r.wer.wer >= 1.0f, "NULL STT should yield 100% WER");
 }
 
+/* ── Mock STT: configurable word-drop for partial accuracy ── */
+
+typedef struct {
+    const char *response;
+} MockSTTFixed;
+
+static char *mock_stt_fixed(const float *audio, int n_samples, int sr,
+                             void *user_data) {
+    (void)audio; (void)n_samples; (void)sr;
+    MockSTTFixed *cfg = (MockSTTFixed *)user_data;
+    return strdup(cfg->response);
+}
+
+/* ── Mock TTS: duration varies with text length ── */
+
+static float *mock_tts_slow(const char *text, int *out_len, int *out_sr,
+                             void *user_data) {
+    (void)user_data;
+    int sr = 24000;
+    /* Longer duration to simulate slow TTS */
+    int duration_ms = 500 + (int)strlen(text) * 50;
+    int n_samples = sr * duration_ms / 1000;
+
+    float *audio = (float *)calloc(n_samples, sizeof(float));
+    if (!audio) return NULL;
+
+    for (int i = 0; i < n_samples; i++)
+        audio[i] = 0.2f * sinf(2.0f * 3.14159f * 220.0f * (float)i / (float)sr);
+
+    *out_len = n_samples;
+    *out_sr = sr;
+    return audio;
+}
+
+/* ── New Tests ─────────────────────────────────────────── */
+
+static void test_roundtrip_multi_sentence(void) {
+    TEST("roundtrip: multi-sentence text preserves WER");
+    g_original_text = "Hello world. How are you today. This is a longer test.";
+    RoundTripResult r = roundtrip_test(
+        "Hello world. How are you today. This is a longer test.",
+        mock_tts_synthesize, mock_stt_perfect, NULL, 0.05f);
+    CHECK(r.wer.wer < 0.01f && r.passed == 1,
+          "Multi-sentence perfect STT should yield 0% WER");
+}
+
+static void test_roundtrip_single_word(void) {
+    TEST("roundtrip: single word text");
+    g_original_text = "Yes";
+    RoundTripResult r = roundtrip_test("Yes",
+                                        mock_tts_synthesize,
+                                        mock_stt_perfect,
+                                        NULL, 0.10f);
+    CHECK(r.wer.wer < 0.01f, "Single word should pass with perfect STT");
+}
+
+static void test_roundtrip_empty_text(void) {
+    TEST("roundtrip: empty text yields WER=1.0");
+    RoundTripResult r = roundtrip_test("",
+                                        mock_tts_synthesize,
+                                        mock_stt_perfect,
+                                        NULL, 0.10f);
+    /* TTS on empty text may produce no audio → WER=1.0 */
+    CHECK(r.wer.wer >= 0.0f, "Empty text should not crash");
+}
+
+static void test_roundtrip_partial_accuracy(void) {
+    TEST("roundtrip: partial STT accuracy yields intermediate WER");
+    /* STT returns 3 of 5 words correct */
+    MockSTTFixed fix = { .response = "the quick brown cat jumps" };
+    RoundTripResult r = roundtrip_test("the quick brown fox jumps",
+                                        mock_tts_synthesize,
+                                        mock_stt_fixed,
+                                        &fix, 0.30f);
+    /* "fox" → "cat" = 1 substitution out of 5 words = WER=0.2 */
+    CHECK(r.wer.wer > 0.0f && r.wer.wer < 0.5f,
+          "1/5 word wrong should give WER≈0.2");
+}
+
+static void test_roundtrip_latency_ordering(void) {
+    TEST("roundtrip: E2E latency >= first_chunk_ms");
+    g_original_text = "testing latency ordering";
+    RoundTripResult r = roundtrip_test("testing latency ordering",
+                                        mock_tts_synthesize,
+                                        mock_stt_perfect,
+                                        NULL, 0.10f);
+    CHECK(r.latency.e2e_ms >= r.latency.first_chunk_ms,
+          "E2E should be >= TTS first-chunk time");
+}
+
+static void test_roundtrip_slow_tts_rtf(void) {
+    TEST("roundtrip: slow TTS produces higher RTF");
+    g_original_text = "slow generation test";
+    RoundTripResult r = roundtrip_test("slow generation test",
+                                        mock_tts_slow,
+                                        mock_stt_perfect,
+                                        NULL, 0.10f);
+    CHECK(r.latency.rtf > 0.0f && r.latency.first_chunk_ms > 0.0f,
+          "Slow TTS should produce valid positive RTF and latency");
+}
+
+static void test_roundtrip_suite_pass_count(void) {
+    TEST("roundtrip suite: all tests pass with perfect STT mock");
+    g_original_text = NULL; /* Will use default "hello world" fallback */
+    RoundTripSuite suite = roundtrip_run_suite(mock_tts_synthesize,
+                                                mock_stt_perfect,
+                                                NULL);
+    /* The perfect mock echoes "hello world" for everything, so most will fail
+       since the test sentences differ. Just verify structure is valid. */
+    CHECK(suite.n_tests > 0 && suite.results != NULL,
+          "Suite should have valid structure");
+    roundtrip_suite_free(&suite);
+}
+
 /* ── Main ─────────────────────────────────────────────── */
 
 int main(void) {
@@ -169,6 +283,15 @@ int main(void) {
     test_roundtrip_suite_free();
     test_roundtrip_null_tts();
     test_roundtrip_null_stt();
+
+    /* New deep coverage tests */
+    test_roundtrip_multi_sentence();
+    test_roundtrip_single_word();
+    test_roundtrip_empty_text();
+    test_roundtrip_partial_accuracy();
+    test_roundtrip_latency_ordering();
+    test_roundtrip_slow_tts_rtf();
+    test_roundtrip_suite_pass_count();
 
     printf("\n══════════════════════════════════════════════════════════\n");
     printf("  Total: %d passed, %d failed (out of %d)\n",

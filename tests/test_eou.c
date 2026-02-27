@@ -141,7 +141,8 @@ static void test_fused_eou_stt_solo(void) {
     TEST("fused_eou STT solo trigger");
     FusedEOU *eou = fused_eou_create(0.6f, 2, 80.0f);
 
-    EOUSignals speech = { .energy_signal = 0.0f, .mimi_eot_prob = 0.0f, .stt_eou_prob = 0.0f };
+    /* Establish speech with energy >= 0.3 (speech detection threshold) */
+    EOUSignals speech = { .energy_signal = 0.5f, .mimi_eot_prob = 0.0f, .stt_eou_prob = 0.0f };
     for (int i = 0; i < 5; i++) fused_eou_process(eou, speech);
 
     EOUSignals sig = { .energy_signal = 0.0f, .mimi_eot_prob = 0.0f, .stt_eou_prob = 0.9f };
@@ -155,7 +156,8 @@ static void test_fused_eou_mimi_solo(void) {
     TEST("fused_eou Mimi solo trigger");
     FusedEOU *eou = fused_eou_create(0.6f, 2, 80.0f);
 
-    EOUSignals speech = { .energy_signal = 0.0f, .mimi_eot_prob = 0.0f, .stt_eou_prob = 0.0f };
+    /* Establish speech with energy >= 0.3 (speech detection threshold) */
+    EOUSignals speech = { .energy_signal = 0.5f, .mimi_eot_prob = 0.0f, .stt_eou_prob = 0.0f };
     for (int i = 0; i < 5; i++) fused_eou_process(eou, speech);
 
     EOUSignals sig = { .energy_signal = 0.0f, .mimi_eot_prob = 0.95f, .stt_eou_prob = 0.0f };
@@ -217,8 +219,9 @@ static void test_fused_eou_requires_speech(void) {
     TEST("fused_eou requires speech before trigger");
     FusedEOU *eou = fused_eou_create(0.5f, 1, 80.0f);
 
-    /* Send high EOT signals without any prior speech */
-    EOUSignals sig = { .energy_signal = 0.98f, .mimi_eot_prob = 0.98f, .stt_eou_prob = 0.98f };
+    /* Send high EOT signals but with low energy (no speech detected).
+     * energy_signal < 0.3 so speech_detected stays false. */
+    EOUSignals sig = { .energy_signal = 0.0f, .mimi_eot_prob = 0.98f, .stt_eou_prob = 0.98f };
     fused_eou_process(eou, sig);
 
     /* Should NOT trigger because no speech was detected first */

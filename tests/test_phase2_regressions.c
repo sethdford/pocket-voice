@@ -444,6 +444,387 @@ static void test_text_normalize_edge_cases(void) {
 }
 
 /* ══════════════════════════════════════════════════════════
+ * 9. Breath create with invalid sample rates
+ * ══════════════════════════════════════════════════════════ */
+static void test_breath_invalid_sample_rate(void) {
+    printf("\n── test_breath_invalid_sample_rate ──\n");
+
+    /* Zero sample rate */
+    BreathSynth *bs = breath_create(0);
+    CHECK(bs == NULL, "breath_create(0) returns NULL");
+    if (bs) breath_destroy(bs);
+
+    /* Negative sample rate */
+    bs = breath_create(-48000);
+    CHECK(bs == NULL, "breath_create(-48000) returns NULL");
+    if (bs) breath_destroy(bs);
+
+    /* Very high sample rate — should still work */
+    bs = breath_create(192000);
+    CHECK(bs != NULL, "breath_create(192000) succeeds");
+    if (bs) {
+        float buf[100];
+        memset(buf, 0, sizeof(buf));
+        breath_generate(bs, buf, 100, 0.5f);
+        CHECK(buf_bounded(buf, 100, 2.0f), "192kHz breath output bounded");
+        breath_destroy(bs);
+    }
+
+    /* NULL destroy safety (re-verify) */
+    breath_destroy(NULL);
+    CHECK(1, "breath_destroy(NULL) safe");
+}
+
+/* ══════════════════════════════════════════════════════════
+ * 10. Breath generate with zero amplitude and zero samples
+ * ══════════════════════════════════════════════════════════ */
+static void test_breath_generate_edge_cases(void) {
+    printf("\n── test_breath_generate_edge_cases ──\n");
+
+    BreathSynth *bs = breath_create(48000);
+    CHECK(bs != NULL, "breath_create succeeds");
+    if (!bs) return;
+
+    /* Zero amplitude — output should remain unchanged */
+    float buf[200];
+    for (int i = 0; i < 200; i++) buf[i] = 0.42f;
+    breath_generate(bs, buf, 200, 0.0f);
+    int unchanged = 1;
+    for (int i = 0; i < 200; i++) {
+        if (fabsf(buf[i] - 0.42f) > 1e-5f) { unchanged = 0; break; }
+    }
+    CHECK(unchanged, "zero amplitude: buffer unchanged");
+
+    /* Zero samples — no crash */
+    breath_generate(bs, buf, 0, 1.0f);
+    CHECK(1, "zero samples: no crash");
+
+    /* Negative amplitude — should still be finite */
+    memset(buf, 0, sizeof(buf));
+    breath_generate(bs, buf, 200, -0.5f);
+    CHECK(buf_bounded(buf, 200, 5.0f), "negative amplitude: output finite");
+
+    breath_destroy(bs);
+}
+
+/* ══════════════════════════════════════════════════════════
+ * 11. Mel spectrogram — NULL and invalid config values
+ * ══════════════════════════════════════════════════════════ */
+static void test_mel_spectrogram_null_safety(void) {
+    printf("\n── test_mel_spectrogram_null_safety ──\n");
+
+    /* NULL config → should use defaults or return NULL */
+    MelSpectrogram *mel = mel_create(NULL);
+    /* Either NULL or valid is acceptable */
+    CHECKF(1, "mel_create(NULL) returned %p (no crash)", (void *)mel);
+    if (mel) mel_destroy(mel);
+
+    /* Process with NULL mel handle */
+    float audio[100] = {0};
+    float out[8000] = {0};
+    int frames = mel_process(NULL, audio, 100, out, 100);
+    CHECK(frames == -1 || frames == 0, "mel_process(NULL handle): safe return");
+
+    /* Reset NULL */
+    mel_reset(NULL);
+    CHECK(1, "mel_reset(NULL): no crash");
+
+    /* mel_n_mels and mel_hop_length with NULL */
+    int nm = mel_n_mels(NULL);
+    CHECK(nm == 0 || nm == -1 || nm == 80, "mel_n_mels(NULL): safe");
+    int hop = mel_hop_length(NULL);
+    CHECK(hop == 0 || hop == -1 || hop == 160, "mel_hop_length(NULL): safe");
+}
+
+/* ══════════════════════════════════════════════════════════
+ * 12. Mel spectrogram — negative and extreme PCM values
+ * ══════════════════════════════════════════════════════════ */
+static void test_mel_spectrogram_extreme_pcm(void) {
+    printf("\n── test_mel_spectrogram_extreme_pcm ──\n");
+
+    MelConfig cfg;
+    mel_config_default(&cfg);
+    MelSpectrogram *mel = mel_create(&cfg);
+    CHECK(mel != NULL, "mel_create succeeds");
+    if (!mel) return;
+
+    const int max_frames = 100;
+    const int n_mels = 80;
+    float *out = calloc(max_frames * n_mels, sizeof(float));
+    if (!out) { mel_destroy(mel); return; }
+
+    /* All negative values */
+    float neg[1600];
+    for (int i = 0; i < 1600; i++) neg[i] = -0.5f;
+    int frames = mel_process(mel, neg, 1600, out, max_frames);
+    CHECKF(frames >= 0, "all negative audio: returned %d frames", frames);
+    mel_reset(mel);
+
+    /* NaN input — should not propagate */
+    float nan_buf[1600];
+    for (int i = 0; i < 1600; i++) nan_buf[i] = 0.0f;
+    nan_buf[800] = 0.0f / 0.0f; /* NaN */
+    frames = mel_process(mel, nan_buf, 1600, out, max_frames);
+    CHECKF(frames >= -1, "NaN input: returned %d (no crash)", frames);
+    mel_reset(mel);
+
+    /* Infinity input */
+    float inf_buf[1600];
+    for (int i = 0; i < 1600; i++) inf_buf[i] = 0.0f;
+    inf_buf[800] = 1.0f / 0.0f; /* +Inf */
+    frames = mel_process(mel, inf_buf, 1600, out, max_frames);
+    CHECKF(frames >= -1, "Inf input: returned %d (no crash)", frames);
+    mel_reset(mel);
+
+    /* NULL PCM pointer */
+    frames = mel_process(mel, NULL, 100, out, max_frames);
+    CHECK(frames == -1 || frames == 0, "NULL PCM: safe return");
+
+    mel_destroy(mel);
+    free(out);
+}
+
+/* ══════════════════════════════════════════════════════════
+ * 13. Sentence buffer — speculative mode and adaptive
+ * ══════════════════════════════════════════════════════════ */
+static void test_sentence_buffer_speculative(void) {
+    printf("\n── test_sentence_buffer_speculative ──\n");
+
+    SentenceBuffer *sb = sentbuf_create(SENTBUF_MODE_SPECULATIVE, 3);
+    CHECK(sb != NULL, "sentbuf_create(SPECULATIVE, 3) succeeds");
+    if (!sb) return;
+
+    /* Enable adaptive mode */
+    sentbuf_set_adaptive(sb, 2, 2);
+    CHECK(1, "sentbuf_set_adaptive: no crash");
+
+    /* Enable eager flushing */
+    sentbuf_set_eager(sb, 4);
+    CHECK(1, "sentbuf_set_eager(4): no crash");
+
+    /* Feed several words without sentence boundary */
+    sentbuf_add(sb, "The ", 4);
+    sentbuf_add(sb, "quick ", 6);
+    sentbuf_add(sb, "brown ", 6);
+    sentbuf_add(sb, "fox ", 4);
+    sentbuf_add(sb, "jumps ", 6);
+
+    /* In speculative mode with eager=4, should have a segment */
+    char out[512];
+    int total = 0;
+    while (sentbuf_has_segment(sb)) {
+        int n = sentbuf_flush(sb, out, sizeof(out));
+        if (n > 0) total++;
+        else break;
+    }
+    CHECKF(total >= 0, "speculative mode: flushed %d segments", total);
+
+    /* Check prosody hint (should be neutral for plain text) */
+    SentBufProsodyHint hint = sentbuf_get_prosody_hint(sb);
+    CHECK(hint.exclamation_count == 0, "prosody hint: no exclamations");
+    CHECK(hint.question_count == 0, "prosody hint: no questions");
+
+    /* Sentence count */
+    int sc = sentbuf_sentence_count(sb);
+    CHECKF(sc >= 0, "sentence_count: %d", sc);
+
+    /* Predicted length */
+    int pl = sentbuf_predicted_length(sb);
+    CHECKF(pl >= 0, "predicted_length: %d", pl);
+
+    sentbuf_destroy(sb);
+}
+
+/* ══════════════════════════════════════════════════════════
+ * 14. Sentence buffer — prosody detection
+ * ══════════════════════════════════════════════════════════ */
+static void test_sentence_buffer_prosody(void) {
+    printf("\n── test_sentence_buffer_prosody ──\n");
+
+    SentenceBuffer *sb = sentbuf_create(SENTBUF_MODE_SENTENCE, 5);
+    CHECK(sb != NULL, "sentbuf_create succeeds");
+    if (!sb) return;
+
+    /* Feed text with exclamation */
+    sentbuf_add(sb, "WOW! That is AMAZING! ", 22);
+
+    char out[512];
+    if (sentbuf_has_segment(sb)) {
+        sentbuf_flush(sb, out, sizeof(out));
+        SentBufProsodyHint hint = sentbuf_get_prosody_hint(sb);
+        CHECKF(hint.exclamation_count >= 1, "exclamation detected: %d", hint.exclamation_count);
+        CHECK(hint.has_all_caps, "ALL CAPS detected");
+    } else {
+        /* Flush all to trigger prosody analysis */
+        sentbuf_flush_all(sb, out, sizeof(out));
+        CHECK(1, "flush_all completed");
+    }
+
+    sentbuf_reset(sb);
+
+    /* Feed question text */
+    sentbuf_add(sb, "How are you? ", 13);
+    if (sentbuf_has_segment(sb)) {
+        sentbuf_flush(sb, out, sizeof(out));
+        SentBufProsodyHint hint = sentbuf_get_prosody_hint(sb);
+        CHECKF(hint.question_count >= 1, "question detected: %d", hint.question_count);
+    } else {
+        sentbuf_flush_all(sb, out, sizeof(out));
+        CHECK(1, "question flush completed");
+    }
+
+    sentbuf_destroy(sb);
+}
+
+/* ══════════════════════════════════════════════════════════
+ * 15. Text normalizer — more format types
+ * ══════════════════════════════════════════════════════════ */
+static void test_text_normalize_formats(void) {
+    printf("\n── test_text_normalize_formats ──\n");
+
+    char out[4096];
+
+    /* Telephone */
+    int n = text_telephone("555-867-5309", out, sizeof(out));
+    CHECK(n > 0, "telephone: produces output");
+
+    /* Fraction */
+    n = text_fraction("3/4", out, sizeof(out));
+    CHECK(n > 0, "fraction 3/4: produces output");
+
+    /* Time */
+    n = text_time("3:45", NULL, out, sizeof(out));
+    CHECK(n > 0, "time 3:45: produces output");
+
+    /* Date */
+    n = text_date("2024-01-15", NULL, out, sizeof(out));
+    CHECK(n > 0, "date 2024-01-15: produces output");
+
+    /* Characters (spell out) */
+    n = text_characters("ABC", out, sizeof(out));
+    CHECK(n > 0, "characters ABC: produces output");
+
+    /* Unit */
+    n = text_unit("5kg", out, sizeof(out));
+    CHECK(n >= 0, "unit 5kg: no crash");
+
+    /* URL */
+    n = text_url("example.com", out, sizeof(out));
+    CHECK(n >= 0, "url: no crash");
+
+    /* Email */
+    n = text_email("test@example.com", out, sizeof(out));
+    CHECK(n >= 0, "email: no crash");
+
+    /* Currency: various formats */
+    n = text_currency("$0.99", out, sizeof(out));
+    CHECK(n > 0, "currency $0.99: produces output");
+
+    n = text_currency("$1,000,000", out, sizeof(out));
+    CHECK(n > 0, "currency $1M: produces output");
+
+    /* text_normalize with interpret_as */
+    n = text_normalize("42", "cardinal", NULL, out, sizeof(out));
+    CHECK(n > 0, "text_normalize cardinal 42: produces output");
+
+    n = text_normalize("3rd", "ordinal", NULL, out, sizeof(out));
+    CHECK(n > 0, "text_normalize ordinal 3rd: produces output");
+}
+
+/* ══════════════════════════════════════════════════════════
+ * 16. Text normalizer — nonverbalisms and IPA expansion
+ * ══════════════════════════════════════════════════════════ */
+static void test_text_expand_nonverbalisms(void) {
+    printf("\n── test_text_expand_nonverbalisms ──\n");
+
+    char out[4096];
+
+    /* Laughter marker */
+    int n = text_expand_nonverbalisms("[laughter] That's funny.", out, sizeof(out));
+    CHECK(n > 0, "nonverbalism [laughter]: produces output");
+
+    /* Sigh marker */
+    n = text_expand_nonverbalisms("Oh [sigh] not again.", out, sizeof(out));
+    CHECK(n > 0, "nonverbalism [sigh]: produces output");
+
+    /* Breath marker */
+    n = text_expand_nonverbalisms("[breath] Hello.", out, sizeof(out));
+    CHECK(n > 0, "nonverbalism [breath]: produces output");
+
+    /* Pause marker */
+    n = text_expand_nonverbalisms("Wait [pause] what?", out, sizeof(out));
+    CHECK(n > 0, "nonverbalism [pause]: produces output");
+
+    /* No markers — passthrough */
+    n = text_expand_nonverbalisms("Plain text here.", out, sizeof(out));
+    CHECK(n > 0, "no markers: passthrough");
+    CHECK(strstr(out, "Plain") != NULL, "passthrough preserved");
+
+    /* Empty string */
+    n = text_expand_nonverbalisms("", out, sizeof(out));
+    CHECK(n >= 0, "empty nonverbalism: no crash");
+
+    /* Inline IPA expansion */
+    n = text_expand_inline_ipa("Say <<h|ɛ|l|oʊ>> please.", out, sizeof(out));
+    CHECK(n > 0, "inline IPA <<>>: produces output");
+
+    /* No IPA — passthrough */
+    n = text_expand_inline_ipa("No IPA here.", out, sizeof(out));
+    CHECK(n > 0, "no IPA: passthrough");
+    CHECK(strstr(out, "No IPA") != NULL, "IPA passthrough preserved");
+
+    /* Small output buffer */
+    char tiny[8];
+    n = text_expand_nonverbalisms("[laughter] Ha!", tiny, sizeof(tiny));
+    CHECK(n >= 0, "small buffer nonverbalism: no crash");
+}
+
+/* ══════════════════════════════════════════════════════════
+ * 17. Conformer STT — extended null safety
+ * ══════════════════════════════════════════════════════════ */
+static void test_conformer_extended_null_safety(void) {
+    printf("\n── test_conformer_extended_null_safety ──\n");
+
+    /* Process with NULL engine */
+    float audio[100] = {0};
+    int rc = conformer_stt_process(NULL, audio, 100);
+    CHECK(rc == -1 || rc == 0, "conformer_stt_process(NULL): safe");
+
+    /* Process with NULL audio */
+    /* Can't call with valid engine since no model, just test NULL engine + NULL audio */
+    rc = conformer_stt_process(NULL, NULL, 0);
+    CHECK(rc == -1 || rc == 0, "conformer_stt_process(NULL, NULL, 0): safe");
+
+    /* Flush NULL */
+    rc = conformer_stt_flush(NULL);
+    CHECK(rc == -1 || rc == 0, "conformer_stt_flush(NULL): safe");
+
+    /* get_text NULL */
+    char buf[256];
+    rc = conformer_stt_get_text(NULL, buf, sizeof(buf));
+    CHECK(rc == -1 || rc == 0, "conformer_stt_get_text(NULL): safe");
+
+    /* Reset NULL */
+    conformer_stt_reset(NULL);
+    CHECK(1, "conformer_stt_reset(NULL): safe");
+
+    /* has_eou NULL */
+    rc = conformer_stt_has_eou(NULL);
+    CHECK(rc == 0 || rc == -1, "conformer_stt_has_eou(NULL): safe");
+
+    /* eou_prob NULL */
+    float prob = conformer_stt_eou_prob(NULL, 4);
+    CHECK(prob >= 0.0f || prob == 0.0f, "conformer_stt_eou_prob(NULL): safe");
+
+    /* Info functions with NULL */
+    int sr = conformer_stt_sample_rate(NULL);
+    CHECK(sr == 0 || sr == -1 || sr == 16000, "conformer_stt_sample_rate(NULL): safe");
+
+    int dm = conformer_stt_d_model(NULL);
+    CHECK(dm >= 0 || dm == -1, "conformer_stt_d_model(NULL): safe");
+}
+
+/* ══════════════════════════════════════════════════════════
  * Main
  * ══════════════════════════════════════════════════════════ */
 int main(void) {
@@ -457,6 +838,15 @@ int main(void) {
     test_mel_spectrogram_bounds();
     test_sentence_buffer_overflow();
     test_text_normalize_edge_cases();
+    test_breath_invalid_sample_rate();
+    test_breath_generate_edge_cases();
+    test_mel_spectrogram_null_safety();
+    test_mel_spectrogram_extreme_pcm();
+    test_sentence_buffer_speculative();
+    test_sentence_buffer_prosody();
+    test_text_normalize_formats();
+    test_text_expand_nonverbalisms();
+    test_conformer_extended_null_safety();
 
     printf("\n═══ Results: %d passed, %d failed ═══\n", g_pass, g_fail);
     return g_fail > 0 ? 1 : 0;

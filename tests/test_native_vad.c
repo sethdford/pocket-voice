@@ -99,6 +99,10 @@ int main(void) {
     CHECK(native_vad_process_audio(NULL, NULL, 0, NULL, 0) < 0,
           "process_audio(all NULL) returns error");
 
+    /* ── Empty path string ────────────────────────────────────────── */
+    printf("\n── Empty Path ──\n");
+    CHECK(native_vad_create("") == NULL, "create empty string returns NULL");
+
     /* ── Integration tests (require extracted weights) ───────────────── */
     const char *weights_path = "models/silero_vad.nvad";
     if (!file_exists(weights_path)) {
@@ -307,6 +311,133 @@ int main(void) {
     printf("    No context: %.4f, with context: %.4f\n", p2, p3);
     /* Just verify it's a valid probability — context may or may not change result */
     CHECK(p3 >= 0.0f && p3 <= 1.0f, "context-aware result is valid");
+
+    /* ── NULL samples on valid instance ─────────────────────────── */
+    printf("\n── NULL Samples on Valid Instance ──\n");
+    native_vad_reset(vad);
+    CHECK(native_vad_process(vad, NULL) < 0.0f, "process(vad, NULL) returns error");
+
+    /* ── NULL audio in process_audio on valid instance ────────── */
+    printf("\n── NULL Audio in Batch on Valid Instance ──\n");
+    native_vad_reset(vad);
+    float dummy_probs[4];
+    CHECK(native_vad_process_audio(vad, NULL, 1024, dummy_probs, 4) < 0,
+          "process_audio(vad, NULL audio) returns error");
+
+    /* ── NULL probs_out in process_audio ──────────────────────── */
+    printf("\n── NULL probs_out ──\n");
+    native_vad_reset(vad);
+    float valid_audio[1024];
+    memset(valid_audio, 0, sizeof(valid_audio));
+    CHECK(native_vad_process_audio(vad, valid_audio, 1024, NULL, 4) < 0,
+          "process_audio(vad, valid, NULL probs) returns error");
+
+    /* ── Zero n_samples in process_audio ─────────────────────── */
+    printf("\n── Zero N Samples ──\n");
+    native_vad_reset(vad);
+    float zero_probs[1];
+    int nc_zero = native_vad_process_audio(vad, valid_audio, 0, zero_probs, 1);
+    CHECK(nc_zero == 0, "process_audio with 0 samples returns 0");
+
+    /* ── Zero max_probs in process_audio ─────────────────────── */
+    printf("\n── Zero Max Probs ──\n");
+    native_vad_reset(vad);
+    float no_probs[1];
+    int nc_no = native_vad_process_audio(vad, valid_audio, 1024, no_probs, 0);
+    CHECK(nc_no == 0, "process_audio with max_probs=0 returns 0");
+
+    /* ── Multiple consecutive resets ─────────────────────────── */
+    printf("\n── Multiple Resets ──\n");
+    native_vad_reset(vad);
+    native_vad_reset(vad);
+    native_vad_reset(vad);
+    float p_multi_reset = native_vad_process(vad, silence);
+    CHECK(p_multi_reset >= 0.0f && p_multi_reset <= 1.0f,
+          "multiple resets produce valid prob on next process");
+
+    /* ── Reset immediately after create (no process) ─────────── */
+    printf("\n── Reset Without Processing ──\n");
+    {
+        NativeVad *vad2 = native_vad_create(weights_path);
+        if (vad2) {
+            native_vad_reset(vad2);
+            float p = native_vad_process(vad2, silence);
+            CHECK(p >= 0.0f && p <= 1.0f, "reset before first process is safe");
+            native_vad_destroy(vad2);
+        }
+    }
+
+    /* ── DC offset signal ────────────────────────────────────── */
+    printf("\n── DC Offset Signal ──\n");
+    native_vad_reset(vad);
+    {
+        float dc[512];
+        for (int i = 0; i < 512; i++)
+            dc[i] = 0.5f;  /* constant DC offset */
+        float p_dc = native_vad_process(vad, dc);
+        CHECK(p_dc >= 0.0f && p_dc <= 1.0f, "DC offset signal prob in valid range");
+    }
+
+    /* ── White noise signal ──────────────────────────────────── */
+    printf("\n── White Noise Signal ──\n");
+    native_vad_reset(vad);
+    {
+        float noise[512];
+        unsigned seed = 12345;
+        for (int i = 0; i < 512; i++) {
+            seed = seed * 1103515245 + 12345;
+            noise[i] = ((float)(seed >> 16) / 32768.0f) - 1.0f;
+        }
+        for (int i = 0; i < 5; i++)
+            native_vad_process(vad, noise);
+        float p_noise = native_vad_process(vad, noise);
+        CHECK(p_noise >= 0.0f && p_noise <= 1.0f, "white noise prob in valid range");
+    }
+
+    /* ── Alternating silence/tone chunks ─────────────────────── */
+    printf("\n── Alternating Silence/Tone ──\n");
+    native_vad_reset(vad);
+    {
+        float alt_probs[10];
+        for (int i = 0; i < 10; i++) {
+            if (i % 2 == 0)
+                alt_probs[i] = native_vad_process(vad, silence);
+            else
+                alt_probs[i] = native_vad_process(vad, tone);
+        }
+        int all_valid = 1;
+        for (int i = 0; i < 10; i++) {
+            if (alt_probs[i] < 0.0f || alt_probs[i] > 1.0f) {
+                all_valid = 0;
+                break;
+            }
+        }
+        CHECK(all_valid, "alternating silence/tone all probs in [0,1]");
+    }
+
+    /* ── Large batch processing exact count ──────────────────── */
+    printf("\n── Large Batch Count ──\n");
+    native_vad_reset(vad);
+    {
+        int total = 512 * 10;  /* exactly 10 chunks */
+        float *big = (float *)calloc(total, sizeof(float));
+        float probs[10];
+        int nc = native_vad_process_audio(vad, big, total, probs, 10);
+        CHECK(nc == 10, "process_audio 10 chunks returns exactly 10");
+        free(big);
+    }
+
+    /* ── Batch with non-aligned sample count ─────────────────── */
+    printf("\n── Non-Aligned Batch ──\n");
+    native_vad_reset(vad);
+    {
+        int total = 512 * 3 + 100;  /* 3 full chunks + 100 leftover */
+        float *na = (float *)calloc(total, sizeof(float));
+        float probs[4];
+        int nc = native_vad_process_audio(vad, na, total, probs, 4);
+        CHECK(nc == 3, "non-aligned batch returns 3 (discards partial)");
+        free(na);
+    }
 
     native_vad_destroy(vad);
 

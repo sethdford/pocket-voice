@@ -17,6 +17,21 @@
  *  13.  reset with NULL engine returns -1
  *  14.  Generate without valid model — graceful failure
  *  15.  Full lifecycle: create → set_text → generate → reset → destroy
+ *  16.  Create with swapped paths (config as weights, weights as config)
+ *  17.  Create with very long paths (4096 chars, slash-only)
+ *  18.  Create with special characters (tabs, newlines, control chars, spaces)
+ *  19.  set_params with extreme temperature (negative, large, inf, NaN)
+ *  20.  set_params with extreme rounds (0, negative, very large, INT_MAX)
+ *  21.  generate with zero max_tokens
+ *  22.  generate with negative max_tokens
+ *  23.  set_text with large token array (1000 IDs)
+ *  24.  set_text with max-value token IDs (UINT_MAX, zero)
+ *  25.  set_text with negative count
+ *  26.  Memory lifecycle stress: 100 create/destroy + 50 all-NULL rounds
+ *  27.  Double destroy safety
+ *  28.  Reset without prior set_text
+ *  29.  Generate without set_text
+ *  30.  Constants consistency across repeated calls
  */
 
 #include <stdio.h>
@@ -377,6 +392,390 @@ static void test_storm_lifecycle(void) {
     CHECK(1, "full lifecycle completed without crash");
 }
 
+/* ─── Test 16: Create with swapped paths ─────────────────────────────────── */
+
+static void test_storm_create_swapped_paths(void) {
+    printf("\n═══ Test 16: Create with swapped paths ═══\n");
+
+    /* Passing config as weights and weights as config should fail gracefully */
+    void *engine = sonata_storm_create(CONFIG_PATH, WEIGHTS_PATH);
+    CHECK(engine == NULL, "create with swapped (config, weights) returns NULL");
+    if (engine) sonata_storm_destroy(engine);
+}
+
+/* ─── Test 17: Create with very long paths ───────────────────────────────── */
+
+static void test_storm_create_long_paths(void) {
+    printf("\n═══ Test 17: Create with very long paths ═══\n");
+
+    /* Build a 4096-char path */
+    char long_path[4097];
+    memset(long_path, 'a', 4096);
+    long_path[4096] = '\0';
+
+    void *engine = sonata_storm_create(long_path, long_path);
+    CHECK(engine == NULL, "create with 4096-char paths returns NULL");
+    if (engine) sonata_storm_destroy(engine);
+
+    /* Path with only slashes */
+    engine = sonata_storm_create("///////////", "///////////");
+    CHECK(engine == NULL, "create with slash-only paths returns NULL");
+    if (engine) sonata_storm_destroy(engine);
+}
+
+/* ─── Test 18: Create with special characters ────────────────────────────── */
+
+static void test_storm_create_special_chars(void) {
+    printf("\n═══ Test 18: Create with special character paths ═══\n");
+
+    void *engine = sonata_storm_create("weights\twith\ttabs.bin", "config\nwith\nnewlines.json");
+    CHECK(engine == NULL, "create with tab/newline paths returns NULL");
+    if (engine) sonata_storm_destroy(engine);
+
+    engine = sonata_storm_create("path with spaces/weights.bin", "path with spaces/config.json");
+    CHECK(engine == NULL, "create with spaces in path returns NULL");
+    if (engine) sonata_storm_destroy(engine);
+
+    engine = sonata_storm_create("\x01\x02\x03", "\x04\x05\x06");
+    CHECK(engine == NULL, "create with control character paths returns NULL");
+    if (engine) sonata_storm_destroy(engine);
+}
+
+/* ─── Test 19: set_params extreme temperature ────────────────────────────── */
+
+static void test_storm_set_params_extreme_temp(void) {
+    printf("\n═══ Test 19: set_params with extreme temperature values ═══\n");
+
+    if (!model_exists()) {
+        printf("  [SKIP] Model not found — skipping extreme temp tests\n");
+        return;
+    }
+
+    void *engine = sonata_storm_create(WEIGHTS_PATH, CONFIG_PATH);
+    if (!engine) {
+        printf("  [SKIP] Failed to create engine — skipping\n");
+        return;
+    }
+
+    int rc;
+
+    /* Negative temperature */
+    rc = sonata_storm_set_params(engine, -1.0f, 8);
+    CHECKF(rc == 0 || rc == -1, "set_params(temp=-1.0) = %d (handled gracefully)", rc);
+
+    /* Very large temperature */
+    rc = sonata_storm_set_params(engine, 100.0f, 8);
+    CHECKF(rc == 0 || rc == -1, "set_params(temp=100.0) = %d (handled gracefully)", rc);
+
+    /* Infinity */
+    float inf = 1.0f / 0.0f;
+    rc = sonata_storm_set_params(engine, inf, 8);
+    CHECKF(rc == 0 || rc == -1, "set_params(temp=inf) = %d (handled gracefully)", rc);
+
+    /* NaN */
+    float nan_val = 0.0f / 0.0f;
+    rc = sonata_storm_set_params(engine, nan_val, 8);
+    CHECKF(rc == 0 || rc == -1, "set_params(temp=NaN) = %d (handled gracefully)", rc);
+
+    sonata_storm_destroy(engine);
+}
+
+/* ─── Test 20: set_params extreme rounds ─────────────────────────────────── */
+
+static void test_storm_set_params_extreme_rounds(void) {
+    printf("\n═══ Test 20: set_params with extreme round values ═══\n");
+
+    if (!model_exists()) {
+        printf("  [SKIP] Model not found — skipping extreme rounds tests\n");
+        return;
+    }
+
+    void *engine = sonata_storm_create(WEIGHTS_PATH, CONFIG_PATH);
+    if (!engine) {
+        printf("  [SKIP] Failed to create engine — skipping\n");
+        return;
+    }
+
+    int rc;
+
+    /* Zero rounds */
+    rc = sonata_storm_set_params(engine, 0.8f, 0);
+    CHECKF(rc == 0 || rc == -1, "set_params(rounds=0) = %d (handled gracefully)", rc);
+
+    /* Negative rounds */
+    rc = sonata_storm_set_params(engine, 0.8f, -1);
+    CHECKF(rc == 0 || rc == -1, "set_params(rounds=-1) = %d (handled gracefully)", rc);
+
+    /* Very large rounds */
+    rc = sonata_storm_set_params(engine, 0.8f, 999999);
+    CHECKF(rc == 0 || rc == -1, "set_params(rounds=999999) = %d (handled gracefully)", rc);
+
+    /* INT_MAX */
+    rc = sonata_storm_set_params(engine, 0.8f, 2147483647);
+    CHECKF(rc == 0 || rc == -1, "set_params(rounds=INT_MAX) = %d (handled gracefully)", rc);
+
+    sonata_storm_destroy(engine);
+}
+
+/* ─── Test 21: generate with zero max_tokens ─────────────────────────────── */
+
+static void test_storm_generate_zero_max(void) {
+    printf("\n═══ Test 21: generate with zero max_tokens ═══\n");
+
+    if (!model_exists()) {
+        printf("  [SKIP] Model not found — skipping zero max_tokens test\n");
+        return;
+    }
+
+    void *engine = sonata_storm_create(WEIGHTS_PATH, CONFIG_PATH);
+    if (!engine) {
+        printf("  [SKIP] Failed to create engine — skipping\n");
+        return;
+    }
+
+    unsigned int text_ids[] = {10, 20, 30};
+    sonata_storm_set_text(engine, text_ids, 3);
+
+    int out_tokens[1];
+    int out_count = 0;
+    int rc = sonata_storm_generate(engine, out_tokens, 0, &out_count);
+    CHECKF(rc == 0 || rc == -1, "generate(max=0) = %d (handled gracefully)", rc);
+    CHECKF(out_count == 0, "generate(max=0) count = %d (expected 0)", out_count);
+
+    sonata_storm_destroy(engine);
+}
+
+/* ─── Test 22: generate with negative max_tokens ─────────────────────────── */
+
+static void test_storm_generate_negative_max(void) {
+    printf("\n═══ Test 22: generate with negative max_tokens ═══\n");
+
+    if (!model_exists()) {
+        printf("  [SKIP] Model not found — skipping negative max_tokens test\n");
+        return;
+    }
+
+    void *engine = sonata_storm_create(WEIGHTS_PATH, CONFIG_PATH);
+    if (!engine) {
+        printf("  [SKIP] Failed to create engine — skipping\n");
+        return;
+    }
+
+    unsigned int text_ids[] = {10, 20, 30};
+    sonata_storm_set_text(engine, text_ids, 3);
+
+    int out_tokens[64];
+    int out_count = 0;
+    int rc = sonata_storm_generate(engine, out_tokens, -1, &out_count);
+    CHECKF(rc == 0 || rc == -1, "generate(max=-1) = %d (handled gracefully)", rc);
+
+    sonata_storm_destroy(engine);
+}
+
+/* ─── Test 23: set_text with large token count ───────────────────────────── */
+
+static void test_storm_set_text_large(void) {
+    printf("\n═══ Test 23: set_text with large token array ═══\n");
+
+    if (!model_exists()) {
+        printf("  [SKIP] Model not found — skipping large text test\n");
+        return;
+    }
+
+    void *engine = sonata_storm_create(WEIGHTS_PATH, CONFIG_PATH);
+    if (!engine) {
+        printf("  [SKIP] Failed to create engine — skipping\n");
+        return;
+    }
+
+    /* 1000 token IDs */
+    unsigned int *big_ids = (unsigned int *)malloc(1000 * sizeof(unsigned int));
+    for (int i = 0; i < 1000; i++) big_ids[i] = (unsigned int)(i + 1);
+
+    int rc = sonata_storm_set_text(engine, big_ids, 1000);
+    CHECKF(rc == 0 || rc == -1, "set_text(1000 tokens) = %d (handled gracefully)", rc);
+
+    free(big_ids);
+    sonata_storm_destroy(engine);
+}
+
+/* ─── Test 24: set_text with max-value IDs ───────────────────────────────── */
+
+static void test_storm_set_text_max_ids(void) {
+    printf("\n═══ Test 24: set_text with max-value token IDs ═══\n");
+
+    if (!model_exists()) {
+        printf("  [SKIP] Model not found — skipping max-value IDs test\n");
+        return;
+    }
+
+    void *engine = sonata_storm_create(WEIGHTS_PATH, CONFIG_PATH);
+    if (!engine) {
+        printf("  [SKIP] Failed to create engine — skipping\n");
+        return;
+    }
+
+    unsigned int max_ids[] = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
+    int rc = sonata_storm_set_text(engine, max_ids, 3);
+    CHECKF(rc == 0 || rc == -1, "set_text(UINT_MAX ids) = %d (handled gracefully)", rc);
+
+    unsigned int zero_ids[] = {0, 0, 0};
+    rc = sonata_storm_set_text(engine, zero_ids, 3);
+    CHECKF(rc == 0 || rc == -1, "set_text(zero ids) = %d (handled gracefully)", rc);
+
+    sonata_storm_destroy(engine);
+}
+
+/* ─── Test 25: set_text with negative count ──────────────────────────────── */
+
+static void test_storm_set_text_negative_count(void) {
+    printf("\n═══ Test 25: set_text with negative count ═══\n");
+
+    if (!model_exists()) {
+        printf("  [SKIP] Model not found — skipping negative count test\n");
+        return;
+    }
+
+    void *engine = sonata_storm_create(WEIGHTS_PATH, CONFIG_PATH);
+    if (!engine) {
+        printf("  [SKIP] Failed to create engine — skipping\n");
+        return;
+    }
+
+    unsigned int ids[] = {1, 2, 3};
+    int rc = sonata_storm_set_text(engine, ids, -1);
+    CHECKF(rc == 0 || rc == -1, "set_text(n=-1) = %d (handled gracefully)", rc);
+
+    rc = sonata_storm_set_text(engine, ids, -999);
+    CHECKF(rc == 0 || rc == -1, "set_text(n=-999) = %d (handled gracefully)", rc);
+
+    sonata_storm_destroy(engine);
+}
+
+/* ─── Test 26: Memory lifecycle stress ───────────────────────────────────── */
+
+static void test_storm_lifecycle_stress(void) {
+    printf("\n═══ Test 26: Memory lifecycle stress (100 create/destroy) ═══\n");
+
+    /* 100 rapid create/destroy cycles with invalid paths (no model needed) */
+    int ok = 1;
+    for (int i = 0; i < 100; i++) {
+        void *engine = sonata_storm_create(
+            "/nonexistent/storm_weights.safetensors",
+            "/nonexistent/storm_config.json"
+        );
+        if (engine != NULL) {
+            ok = 0;
+            sonata_storm_destroy(engine);
+        }
+    }
+    CHECK(ok, "100 create/destroy cycles with invalid paths — all returned NULL");
+
+    /* 100 destroy(NULL) calls */
+    for (int i = 0; i < 100; i++) {
+        sonata_storm_destroy(NULL);
+    }
+    CHECK(1, "100 destroy(NULL) calls — no crash");
+
+    /* Alternating NULL operations */
+    for (int i = 0; i < 50; i++) {
+        sonata_storm_set_text(NULL, NULL, 0);
+        sonata_storm_set_params(NULL, 0.5f, 4);
+        sonata_storm_reset(NULL);
+        int out[1]; int cnt = 0;
+        sonata_storm_generate(NULL, out, 1, &cnt);
+    }
+    CHECK(1, "50 rounds of all-NULL operations — no crash");
+}
+
+/* ─── Test 27: Double destroy safety ─────────────────────────────────────── */
+
+static void test_storm_double_destroy(void) {
+    printf("\n═══ Test 27: Double destroy safety ═══\n");
+
+    /* We can only test double-NULL, since real engines can't be double-freed safely
+       without model files. But the NULL path is the critical one. */
+    sonata_storm_destroy(NULL);
+    sonata_storm_destroy(NULL);
+    CHECK(1, "double destroy(NULL) is safe");
+}
+
+/* ─── Test 28: Reset without prior set_text ──────────────────────────────── */
+
+static void test_storm_reset_without_set(void) {
+    printf("\n═══ Test 28: Reset without prior set_text ═══\n");
+
+    if (!model_exists()) {
+        printf("  [SKIP] Model not found — skipping reset-without-set test\n");
+        return;
+    }
+
+    void *engine = sonata_storm_create(WEIGHTS_PATH, CONFIG_PATH);
+    if (!engine) {
+        printf("  [SKIP] Failed to create engine — skipping\n");
+        return;
+    }
+
+    /* Reset without ever calling set_text */
+    int rc = sonata_storm_reset(engine);
+    CHECKF(rc == 0, "reset without prior set_text = %d (expected 0)", rc);
+
+    /* Multiple resets in a row */
+    rc = sonata_storm_reset(engine);
+    CHECKF(rc == 0, "second consecutive reset = %d (expected 0)", rc);
+
+    rc = sonata_storm_reset(engine);
+    CHECKF(rc == 0, "third consecutive reset = %d (expected 0)", rc);
+
+    sonata_storm_destroy(engine);
+}
+
+/* ─── Test 29: Generate without set_text ─────────────────────────────────── */
+
+static void test_storm_generate_without_set_text(void) {
+    printf("\n═══ Test 29: Generate without set_text ═══\n");
+
+    if (!model_exists()) {
+        printf("  [SKIP] Model not found — skipping generate-without-set test\n");
+        return;
+    }
+
+    void *engine = sonata_storm_create(WEIGHTS_PATH, CONFIG_PATH);
+    if (!engine) {
+        printf("  [SKIP] Failed to create engine — skipping\n");
+        return;
+    }
+
+    /* Try to generate without calling set_text first */
+    int out_tokens[64];
+    int out_count = 0;
+    int rc = sonata_storm_generate(engine, out_tokens, 64, &out_count);
+    CHECKF(rc == 0 || rc == -1, "generate without set_text = %d (handled gracefully)", rc);
+
+    sonata_storm_destroy(engine);
+}
+
+/* ─── Test 30: Constants are consistent ──────────────────────────────────── */
+
+static void test_storm_constants_consistency(void) {
+    printf("\n═══ Test 30: Constants consistency across calls ═══\n");
+
+    int sr1 = sonata_storm_sample_rate();
+    int sr2 = sonata_storm_sample_rate();
+    int sr3 = sonata_storm_sample_rate();
+    CHECK(sr1 == sr2 && sr2 == sr3, "sample_rate is consistent across 3 calls");
+
+    int fr1 = sonata_storm_frame_rate();
+    int fr2 = sonata_storm_frame_rate();
+    int fr3 = sonata_storm_frame_rate();
+    CHECK(fr1 == fr2 && fr2 == fr3, "frame_rate is consistent across 3 calls");
+
+    /* Validate the mathematical relationship */
+    CHECK(sr1 > 0 && fr1 > 0, "both rates are positive");
+    int samples_per_frame = sr1 / fr1;
+    CHECKF(samples_per_frame == 480, "samples_per_frame = %d (expected 480 = 24000/50)", samples_per_frame);
+}
+
 /* ─── Main ──────────────────────────────────────────────────────────────── */
 
 int main(void) {
@@ -399,6 +798,23 @@ int main(void) {
     test_storm_reset_null();
     test_storm_generate_no_model();
     test_storm_lifecycle();
+
+    /* New edge case tests (16-30) */
+    test_storm_create_swapped_paths();
+    test_storm_create_long_paths();
+    test_storm_create_special_chars();
+    test_storm_set_params_extreme_temp();
+    test_storm_set_params_extreme_rounds();
+    test_storm_generate_zero_max();
+    test_storm_generate_negative_max();
+    test_storm_set_text_large();
+    test_storm_set_text_max_ids();
+    test_storm_set_text_negative_count();
+    test_storm_lifecycle_stress();
+    test_storm_double_destroy();
+    test_storm_reset_without_set();
+    test_storm_generate_without_set_text();
+    test_storm_constants_consistency();
 
     printf("\n═══════════════════════════════════════════\n");
     printf("Results: %d / %d passed\n", g_pass, g_pass + g_fail);

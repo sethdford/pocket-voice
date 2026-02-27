@@ -440,6 +440,205 @@ static void test_duration_estimation_extended(void) {
     ASSERT_EQ(n, 0, "NULL buffer returns 0");
 }
 
+/* ═══════════════════════════════════════════════════════════════════ */
+/* Deepened tests: boundary conditions, extreme values, stress        */
+/* ═══════════════════════════════════════════════════════════════════ */
+
+static void test_extreme_prosody_values(void) {
+    printf("\n=== Extreme Prosody Values ===\n");
+
+    /* Analyze text with extreme punctuation */
+    MultiScaleProsody msp = prosody_analyze_text("WHAT?!?!?!?!");
+    ASSERT(msp.contour == PROSODY_CONTOUR_INTERROGATIVE ||
+           msp.contour == PROSODY_CONTOUR_EXCLAMATORY,
+           "extreme punctuation → interrogative or exclamatory");
+    ASSERT(msp.utterance.pitch >= 0.5f && msp.utterance.pitch <= 2.0f,
+           "extreme punctuation pitch stays in sane range");
+
+    /* Very long ALL CAPS text */
+    char caps_text[512];
+    memset(caps_text, 0, sizeof(caps_text));
+    strcpy(caps_text, "EVERY SINGLE WORD IS CAPITALIZED HERE TODAY NOW");
+    msp = prosody_analyze_text(caps_text);
+    int emph = 0;
+    for (int i = 0; i < msp.n_words; i++) {
+        if (msp.emphasis_mask[i]) emph++;
+    }
+    ASSERT(emph >= 3, "many ALL CAPS words detected");
+
+    /* Text with only whitespace */
+    msp = prosody_analyze_text("   \t  \n  ");
+    ASSERT(msp.n_words == 0, "whitespace-only → 0 words");
+
+    /* Single punctuation character */
+    msp = prosody_analyze_text("?");
+    ASSERT(msp.n_words >= 0, "single ? doesn't crash");
+
+    /* Extremely long single word (no spaces) */
+    char longword[300];
+    memset(longword, 'a', 299);
+    longword[299] = '\0';
+    msp = prosody_analyze_text(longword);
+    ASSERT(msp.n_words >= 1, "very long word is counted");
+    ASSERT(msp.contour >= 0, "long word has valid contour");
+}
+
+static void test_conversation_adaptation_boundary(void) {
+    printf("\n=== Conversation Adaptation: Boundary Conditions ===\n");
+
+    ConversationProsodyState state;
+    prosody_conversation_init(&state);
+
+    /* Zero duration edge case */
+    prosody_conversation_update(&state, 0.0f, 0, 0.0f, 0.0f);
+    ProsodyHint hint = prosody_conversation_adapt(&state);
+    ASSERT(hint.rate >= 0.0f, "zero-duration update doesn't produce NaN rate");
+    ASSERT(hint.pitch >= 0.0f, "zero-duration update doesn't produce NaN pitch");
+
+    /* Very large values */
+    prosody_conversation_init(&state);
+    prosody_conversation_update(&state, 1000.0f, 10000, -100.0f, 5000.0f);
+    hint = prosody_conversation_adapt(&state);
+    ASSERT(hint.rate >= 0.0f && hint.rate <= 10.0f, "extreme values → rate in sane range");
+    ASSERT(hint.pitch >= 0.0f && hint.pitch <= 10.0f, "extreme values → pitch in sane range");
+
+    /* Negative word count */
+    prosody_conversation_init(&state);
+    prosody_conversation_update(&state, 1.0f, -5, -20.0f, 150.0f);
+    hint = prosody_conversation_adapt(&state);
+    ASSERT(hint.rate >= 0.0f, "negative word count handled gracefully");
+
+    /* Many rapid updates (stress test) */
+    prosody_conversation_init(&state);
+    for (int i = 0; i < 1000; i++) {
+        prosody_conversation_update(&state, 1.0f + (float)(i % 10) * 0.1f,
+                                     5 + (i % 20), -20.0f + (float)(i % 30),
+                                     100.0f + (float)(i % 200));
+    }
+    ASSERT(state.n_samples == 1000, "1000 samples tracked");
+    hint = prosody_conversation_adapt(&state);
+    ASSERT(hint.rate > 0.0f, "rate positive after 1000 updates");
+    ASSERT(hint.pitch > 0.0f, "pitch positive after 1000 updates");
+    ASSERT(hint.rate <= 3.0f, "rate bounded after many updates");
+    ASSERT(hint.pitch <= 3.0f, "pitch bounded after many updates");
+}
+
+static void test_contour_detection_comprehensive(void) {
+    printf("\n=== Contour Detection: Comprehensive ===\n");
+
+    /* Tag question */
+    MultiScaleProsody msp = prosody_analyze_text("You're coming, aren't you?");
+    ASSERT(msp.contour == PROSODY_CONTOUR_INTERROGATIVE ||
+           msp.contour == PROSODY_CONTOUR_LIST,
+           "tag question recognized");
+
+    /* Multiple sentences: analyze first */
+    msp = prosody_analyze_text("Stop! Don't move.");
+    ASSERT(msp.contour == PROSODY_CONTOUR_EXCLAMATORY ||
+           msp.contour == PROSODY_CONTOUR_IMPERATIVE,
+           "command with ! → exclamatory or imperative");
+
+    /* Enumeration with many items */
+    msp = prosody_analyze_text("Red, orange, yellow, green, blue, and violet.");
+    ASSERT(msp.contour == PROSODY_CONTOUR_LIST, "long list → list contour");
+
+    /* Continuation (no final punctuation) */
+    msp = prosody_analyze_text("If you think about it");
+    ASSERT(msp.contour >= 0, "no-punctuation text has valid contour");
+
+    /* Declarative with period */
+    msp = prosody_analyze_text("The sun sets in the west.");
+    ASSERT_EQ(msp.contour, PROSODY_CONTOUR_DECLARATIVE,
+              "simple declaration → declarative contour");
+
+    /* Question word at start */
+    msp = prosody_analyze_text("Where did you go?");
+    ASSERT_EQ(msp.contour, PROSODY_CONTOUR_INTERROGATIVE,
+              "wh-question → interrogative");
+
+    /* Yes/no question */
+    msp = prosody_analyze_text("Did you finish the report?");
+    ASSERT_EQ(msp.contour, PROSODY_CONTOUR_INTERROGATIVE,
+              "yes/no question → interrogative");
+}
+
+static void test_emotion_hint_consistency(void) {
+    printf("\n=== Emotion Hint Consistency ===\n");
+
+    /* Happy emotion should have pitch >= 1.0 */
+    EmotionDetection det = prosody_detect_emotion("I am so happy and delighted!");
+    ASSERT(det.hint.pitch >= 1.0f, "happy → pitch >= 1.0");
+    ASSERT(det.hint.rate >= 0.9f, "happy → rate not too slow");
+
+    /* Sad emotion should have lower pitch and rate */
+    det = prosody_detect_emotion("I'm devastated and heartbroken about this loss.");
+    if (det.emotion == EMOTION_SAD) {
+        ASSERT(det.hint.pitch <= 1.05f, "sad → pitch not elevated");
+        ASSERT(det.hint.rate <= 1.05f, "sad → rate not elevated");
+    } else {
+        ASSERT(det.confidence >= 0.0f, "non-sad still valid");
+    }
+
+    /* Angry should have energy boost */
+    det = prosody_detect_emotion("I am FURIOUS and absolutely livid!");
+    if (det.emotion == EMOTION_ANGRY) {
+        ASSERT(det.hint.energy >= 0.0f, "angry → energy not negative");
+    } else {
+        ASSERT(det.emotion != EMOTION_NEUTRAL, "furious → non-neutral");
+    }
+
+    /* All emotions should produce hints in valid ranges */
+    const char *test_texts[] = {
+        "I love this!", "I hate this!", "What happened?!",
+        "How boring.", "INCREDIBLE NEWS!", NULL
+    };
+    for (int i = 0; test_texts[i]; i++) {
+        det = prosody_detect_emotion(test_texts[i]);
+        ASSERT(det.hint.pitch >= 0.3f && det.hint.pitch <= 3.0f,
+               "hint pitch in [0.3, 3.0]");
+        ASSERT(det.hint.rate >= 0.3f && det.hint.rate <= 3.0f,
+               "hint rate in [0.3, 3.0]");
+        ASSERT(det.confidence >= 0.0f && det.confidence <= 1.0f,
+               "confidence in [0, 1]");
+    }
+}
+
+static void test_sentence_syllable_stress(void) {
+    printf("\n=== Sentence Syllable: Stress ===\n");
+
+    /* Very short input */
+    ASSERT_EQ(prosody_count_syllables("I"), 1, "I = 1 syllable");
+    ASSERT_EQ(prosody_count_syllables("a"), 1, "a = 1 syllable");
+
+    /* Punctuation-only word */
+    ASSERT_EQ(prosody_count_syllables("..."), 0, "ellipsis = 0 syllables");
+    ASSERT_EQ(prosody_count_syllables("!"), 0, "exclamation = 0 syllables");
+
+    /* Number-like string */
+    ASSERT(prosody_count_syllables("42") >= 0, "number string doesn't crash");
+
+    /* Hyphenated word */
+    int s = prosody_count_syllables("mother-in-law");
+    ASSERT(s >= 3, "hyphenated word has multiple syllables");
+
+    /* Sentence with mixed content */
+    s = prosody_count_sentence_syllables("I don't think 42 is the answer, but OK.");
+    ASSERT(s >= 5, "mixed sentence has reasonable syllable count");
+
+    /* Repeated same word */
+    s = prosody_count_sentence_syllables("the the the the the");
+    ASSERT_EQ(s, 5, "5 'the' words = 5 syllables");
+
+    /* Very long sentence */
+    char long_sent[4096];
+    memset(long_sent, 0, sizeof(long_sent));
+    for (int i = 0; i < 100; i++) {
+        strcat(long_sent, "hello ");
+    }
+    s = prosody_count_sentence_syllables(long_sent);
+    ASSERT(s >= 100, "100 'hello' words >= 100 syllables");
+}
+
 int main(void) {
     printf("════════════════════════════════════════════\n");
     printf("  Prosody Prediction Tests\n");
@@ -460,6 +659,13 @@ int main(void) {
     test_emosteer_extended();
     test_multi_scale_edge_cases();
     test_duration_estimation_extended();
+
+    /* Deepened tests */
+    test_extreme_prosody_values();
+    test_conversation_adaptation_boundary();
+    test_contour_detection_comprehensive();
+    test_emotion_hint_consistency();
+    test_sentence_syllable_stress();
 
     printf("\n════════════════════════════════════════════\n");
     printf("  Results: %d passed, %d failed\n", g_pass, g_fail);

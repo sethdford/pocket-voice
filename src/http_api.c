@@ -234,7 +234,7 @@ static int parse_request(int fd, HttpRequest *req) {
 
     char *cl = strcasestr(buf, "Content-Length:");
     if (cl) {
-        const char *val = cl + 14; /* Skip "Content-Length:" (14 chars) */
+        const char *val = cl + 15; /* Skip "Content-Length:" (15 chars) */
         while (*val == ' ' || *val == '\t') val++;
         int content_length = atoi(val);
         if (content_length < 0 || content_length > MAX_REQ_SIZE) {

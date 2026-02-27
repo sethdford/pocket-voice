@@ -434,6 +434,166 @@ int main(void) {
         printf("  [SKIP] %s not found\n", tts_wav);
     }
 
+    /* ── 11. Create with invalid VAD path ─────────────────────────── */
+    printf("\n── Invalid VAD Path Config ──\n");
+    {
+        SpeechDetectorConfig bad_cfg = {
+            .native_vad_path = "/nonexistent/model.nvad",
+            .mimi_latent_dim = 80,
+            .mimi_hidden_dim = 64,
+            .eot_threshold = 0.6f,
+            .eot_consec_frames = 2,
+        };
+        SpeechDetector *sd_bad = speech_detector_create(&bad_cfg);
+        CHECK(sd_bad != NULL, "create with bad VAD path still succeeds (graceful fallback)");
+        if (sd_bad) {
+            CHECK(speech_detector_has_vad(sd_bad) == 0,
+                  "bad VAD path: has_vad returns 0");
+            speech_detector_destroy(sd_bad);
+        }
+    }
+
+    /* ── 12. Multiple reset calls (idempotent) ───────────────────── */
+    printf("\n── Multiple Reset Calls ──\n");
+    speech_detector_reset(sd);
+    speech_detector_reset(sd);
+    speech_detector_reset(sd);
+    CHECK(speech_detector_speech_prob(sd) == -1.0f,
+          "triple reset: speech_prob still -1");
+    CHECK(speech_detector_eot_prob(sd) == 0.0f,
+          "triple reset: eot_prob still 0");
+
+    /* ── 13. speech_active with various energy_vad values ────────── */
+    printf("\n── speech_active Various Energy VAD ──\n");
+    speech_detector_reset(sd);
+    /* Feed some speech first to set neural VAD state */
+    for (int i = 0; i < 5; i++)
+        speech_detector_feed(sd, synth_speech, 4800);
+    {
+        int active_0 = speech_detector_speech_active(sd, 0);
+        int active_1 = speech_detector_speech_active(sd, 1);
+        int active_2 = speech_detector_speech_active(sd, 2);
+        int active_3 = speech_detector_speech_active(sd, 3);
+        CHECK(active_0 == 0 || active_0 == 1, "speech_active(energy=0) returns 0 or 1");
+        CHECK(active_1 == 0 || active_1 == 1, "speech_active(energy=1) returns 0 or 1");
+        CHECK(active_2 == 0 || active_2 == 1, "speech_active(energy=2) returns 0 or 1");
+        CHECK(active_3 == 0 || active_3 == 1, "speech_active(energy=3) returns 0 or 1");
+    }
+
+    /* ── 14. Feed-reset-feed cycle preserves capabilities ────────── */
+    printf("\n── Feed-Reset-Feed Cycle ──\n");
+    speech_detector_reset(sd);
+    for (int i = 0; i < 3; i++)
+        speech_detector_feed(sd, synth_speech, 4800);
+    float sp_before = speech_detector_speech_prob(sd);
+    CHECK(sp_before >= 0.0f && sp_before <= 1.0f, "prob valid before reset");
+
+    speech_detector_reset(sd);
+    CHECK(speech_detector_speech_prob(sd) == -1.0f, "prob -1 after reset");
+
+    for (int i = 0; i < 3; i++)
+        speech_detector_feed(sd, synth_speech, 4800);
+    float sp_after = speech_detector_speech_prob(sd);
+    CHECK(sp_after >= 0.0f && sp_after <= 1.0f, "prob valid after re-feed");
+
+    /* ── 15. Multiple create/destroy cycles (leak check) ─────────── */
+    printf("\n── Create/Destroy Cycles ──\n");
+    for (int cycle = 0; cycle < 5; cycle++) {
+        SpeechDetector *sd_tmp = speech_detector_create(&cfg);
+        CHECK(sd_tmp != NULL, "create succeeds in cycle");
+        if (sd_tmp) {
+            speech_detector_feed(sd_tmp, silence, 4800);
+            speech_detector_destroy(sd_tmp);
+        }
+    }
+    CHECK(1, "5 create/destroy cycles completed without crash");
+
+    /* ── 16. EOU with boundary STT probabilities ─────────────────── */
+    printf("\n── EOU Boundary STT Probs ──\n");
+    speech_detector_reset(sd);
+    for (int i = 0; i < 5; i++)
+        speech_detector_feed(sd, synth_speech, 4800);
+
+    EOUResult r_stt0 = speech_detector_eou(sd, 3, 0.0f);
+    CHECK(r_stt0.fused_prob >= 0.0f && r_stt0.fused_prob <= 1.0f,
+          "EOU with stt=0.0 prob in range");
+
+    EOUResult r_stt1 = speech_detector_eou(sd, 3, 1.0f);
+    CHECK(r_stt1.fused_prob >= 0.0f && r_stt1.fused_prob <= 1.0f,
+          "EOU with stt=1.0 prob in range");
+
+    /* Higher STT prob should yield higher or equal fused prob */
+    CHECK(r_stt1.fused_prob >= r_stt0.fused_prob,
+          "higher STT prob yields higher or equal fused prob");
+
+    /* ── 17. has_vad/has_endpointer persist after reset ──────────── */
+    printf("\n── Capabilities After Reset ──\n");
+    speech_detector_reset(sd);
+    CHECK(speech_detector_has_vad(sd) == 1, "has_vad persists after reset");
+    CHECK(speech_detector_has_endpointer(sd) == 1, "has_endpointer persists after reset");
+
+    /* ── 18. Repeated EOU calls without new feed ─────────────────── */
+    printf("\n── Repeated EOU Without Feed ──\n");
+    speech_detector_reset(sd);
+    for (int i = 0; i < 5; i++)
+        speech_detector_feed(sd, synth_speech, 4800);
+    {
+        EOUResult results[5];
+        for (int i = 0; i < 5; i++)
+            results[i] = speech_detector_eou(sd, 3, 0.5f);
+        int all_valid = 1;
+        for (int i = 0; i < 5; i++) {
+            if (results[i].fused_prob < 0.0f || results[i].fused_prob > 1.0f) {
+                all_valid = 0;
+                break;
+            }
+        }
+        CHECK(all_valid, "repeated EOU calls without new feed all valid");
+    }
+
+    /* ── 19. Feed negative n_samples ─────────────────────────────── */
+    printf("\n── Negative N Samples Feed ──\n");
+    speech_detector_reset(sd);
+    speech_detector_feed(sd, silence, -1);
+    speech_detector_feed_16k(sd, silence, -1);
+    CHECK(speech_detector_speech_prob(sd) == -1.0f,
+          "negative n_samples feed: no crash, prob still -1");
+
+    /* ── 20. speech_active on silence (should be inactive) ───────── */
+    printf("\n── Speech Active on Silence ──\n");
+    speech_detector_reset(sd);
+    for (int i = 0; i < 10; i++)
+        speech_detector_feed(sd, silence, 4800);
+    CHECK(speech_detector_speech_active(sd, 0) == 0,
+          "silence + energy_vad=0 → not active");
+
+    /* ── 21. EOU energy_vad=1 (speech onset) ─────────────────────── */
+    printf("\n── EOU Energy VAD Onset ──\n");
+    speech_detector_reset(sd);
+    for (int i = 0; i < 5; i++)
+        speech_detector_feed(sd, synth_speech, 4800);
+    {
+        EOUResult r_onset = speech_detector_eou(sd, 1, 0.5f);
+        CHECK(r_onset.fused_prob >= 0.0f && r_onset.fused_prob <= 1.0f,
+              "EOU with energy_vad=1 (onset) prob in range");
+    }
+
+    /* ── 22. Config with all zero dims ───────────────────────────── */
+    printf("\n── Zero Dim Config ──\n");
+    {
+        SpeechDetectorConfig zero_cfg = {
+            .native_vad_path = nvad_path,
+            .mimi_latent_dim = 0,
+            .mimi_hidden_dim = 0,
+            .eot_threshold = 0.0f,
+            .eot_consec_frames = 0,
+        };
+        SpeechDetector *sd_zero = speech_detector_create(&zero_cfg);
+        CHECK(sd_zero != NULL, "create with zero dims succeeds (uses defaults)");
+        if (sd_zero)
+            speech_detector_destroy(sd_zero);
+    }
+
     /* ── Cleanup ───────────────────────────────────────────────────── */
     speech_detector_destroy(sd);
 

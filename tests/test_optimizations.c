@@ -511,6 +511,440 @@ static void test_voice_quality_degraded(void) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * Test 10: FP16 denormals and extreme values
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static void test_fp16_denormals(void) {
+    TEST("FP16 denormals: very small values near zero");
+
+    /* FP16 smallest normal ≈ 6.1e-5, denormal range down to ~5.96e-8 */
+    float src[8] = {1e-4f, -1e-4f, 1e-6f, -1e-6f, 1e-8f, -1e-8f, 0.0f, -0.0f};
+    __fp16 fp16_buf[8];
+    float dst[8];
+
+    for (int i = 0; i < 8; i += 4) {
+        float32x4_t v = vld1q_f32(src + i);
+        vst1_f16(fp16_buf + i, vcvt_f16_f32(v));
+    }
+    for (int i = 0; i < 8; i += 4) {
+        float16x4_t h = vld1_f16(fp16_buf + i);
+        vst1q_f32(dst + i, vcvt_f32_f16(h));
+    }
+
+    /* Verify zeros stay zero and small values don't become NaN */
+    int ok = 1;
+    for (int i = 0; i < 8; i++) {
+        if (isnan(dst[i]) || isinf(dst[i])) { ok = 0; break; }
+    }
+    /* Zero should round-trip exactly */
+    if (dst[6] != 0.0f) ok = 0;
+
+    if (ok) {
+        PASS();
+    } else {
+        FAIL("Denormal/zero values produced NaN/Inf or didn't preserve zero");
+    }
+}
+
+static void test_fp16_large_values(void) {
+    TEST("FP16 large values: saturation at FP16 max (~65504)");
+
+    /* FP16 max is ~65504. Values beyond this should saturate to Inf */
+    float src[4] = {65504.0f, -65504.0f, 100000.0f, -100000.0f};
+    __fp16 fp16_buf[4];
+    float dst[4];
+
+    float32x4_t v = vld1q_f32(src);
+    vst1_f16(fp16_buf, vcvt_f16_f32(v));
+    float16x4_t h = vld1_f16(fp16_buf);
+    vst1q_f32(dst, vcvt_f32_f16(h));
+
+    /* 65504 should round-trip exactly, 100000 should become Inf */
+    int ok = 1;
+    if (fabsf(dst[0] - 65504.0f) > 1.0f) ok = 0;  /* Should preserve max */
+    if (fabsf(dst[1] + 65504.0f) > 1.0f) ok = 0;
+    if (!isinf(dst[2])) ok = 0;  /* Should overflow to +Inf */
+    if (!isinf(dst[3])) ok = 0;  /* Should overflow to -Inf */
+
+    if (ok) {
+        PASS();
+    } else {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "dst=[%.0f, %.0f, %.0f, %.0f]",
+                 dst[0], dst[1], dst[2], dst[3]);
+        FAIL(msg);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Test 11: Layer norm numerical stability with extreme inputs
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static void test_layer_norm_extreme(void) {
+    TEST("Layer norm with large uniform input → zero mean, unit var");
+
+    int D = 64;
+    float *input = (float *)malloc(D * sizeof(float));
+    float *output = (float *)malloc(D * sizeof(float));
+    float *gamma = (float *)malloc(D * sizeof(float));
+    float *beta = (float *)malloc(D * sizeof(float));
+
+    /* All same value — variance = 0 before epsilon */
+    for (int i = 0; i < D; i++) {
+        input[i] = 1000.0f;
+        gamma[i] = 1.0f;
+        beta[i] = 0.0f;
+    }
+
+    float mean;
+    vDSP_meanv(input, 1, &mean, D);
+    float neg_mean = -mean;
+    vDSP_vsadd(input, 1, &neg_mean, output, 1, D);
+    float var;
+    vDSP_measqv(output, 1, &var, D);
+    float inv_std = 1.0f / sqrtf(var + 1e-5f);
+    vDSP_vsmul(output, 1, &inv_std, output, 1, D);
+    vDSP_vma(output, 1, gamma, 1, beta, 1, output, 1, D);
+
+    /* With constant input, output should be all zeros (0/std_epsilon) */
+    float out_max = 0.0f;
+    for (int i = 0; i < D; i++) {
+        float a = fabsf(output[i]);
+        if (a > out_max) out_max = a;
+    }
+
+    if (out_max < 0.01f) {
+        PASS();
+    } else {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "max_val=%.6f (expected near 0)", out_max);
+        FAIL(msg);
+    }
+
+    free(input); free(output); free(gamma); free(beta);
+}
+
+static void test_layer_norm_large_spread(void) {
+    TEST("Layer norm with large spread input → stable output");
+
+    int D = 128;
+    float *input = (float *)malloc(D * sizeof(float));
+    float *output = (float *)malloc(D * sizeof(float));
+    float *gamma = (float *)malloc(D * sizeof(float));
+    float *beta = (float *)malloc(D * sizeof(float));
+
+    /* Large spread: alternating ±10000 */
+    for (int i = 0; i < D; i++) {
+        input[i] = (i % 2 == 0) ? 10000.0f : -10000.0f;
+        gamma[i] = 1.0f;
+        beta[i] = 0.0f;
+    }
+
+    float mean;
+    vDSP_meanv(input, 1, &mean, D);
+    float neg_mean = -mean;
+    vDSP_vsadd(input, 1, &neg_mean, output, 1, D);
+    float var;
+    vDSP_measqv(output, 1, &var, D);
+    float inv_std = 1.0f / sqrtf(var + 1e-5f);
+    vDSP_vsmul(output, 1, &inv_std, output, 1, D);
+    vDSP_vma(output, 1, gamma, 1, beta, 1, output, 1, D);
+
+    /* Output should have mean≈0 and variance≈1, no NaN/Inf */
+    int has_nan = 0;
+    for (int i = 0; i < D; i++) {
+        if (isnan(output[i]) || isinf(output[i])) { has_nan = 1; break; }
+    }
+    float out_mean;
+    vDSP_meanv(output, 1, &out_mean, D);
+
+    if (!has_nan && fabsf(out_mean) < 0.01f) {
+        PASS();
+    } else {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "has_nan=%d mean=%.6f", has_nan, out_mean);
+        FAIL(msg);
+    }
+
+    free(input); free(output); free(gamma); free(beta);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Test 12: INT8 quantization saturation and edge cases
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static void test_int8_saturation(void) {
+    TEST("INT8 quantization: all values at ±1.0 saturate correctly");
+
+    int N = 16, K = 32;
+    float *orig = (float *)malloc(N * K * sizeof(float));
+    int8_t *quant = (int8_t *)malloc(N * K);
+    float *scales = (float *)malloc(N * sizeof(float));
+
+    /* All +1.0 or -1.0 */
+    for (int i = 0; i < N * K; i++)
+        orig[i] = (i % 2 == 0) ? 1.0f : -1.0f;
+
+    quantize_symmetric(orig, N, K, quant, scales);
+
+    /* All quantized values should be exactly ±127 */
+    int all_sat = 1;
+    for (int i = 0; i < N * K; i++) {
+        if (quant[i] != 127 && quant[i] != -127) { all_sat = 0; break; }
+    }
+
+    if (all_sat) {
+        PASS();
+    } else {
+        FAIL("Expected all values to quantize to ±127");
+    }
+
+    free(orig); free(quant); free(scales);
+}
+
+static void test_int8_zero_weights(void) {
+    TEST("INT8 quantization: zero weight matrix → zero output");
+
+    int N = 16, K = 32;
+    float *orig = (float *)calloc(N * K, sizeof(float));
+    int8_t *quant = (int8_t *)malloc(N * K);
+    float *scales = (float *)malloc(N * sizeof(float));
+    float *deq = (float *)malloc(N * K * sizeof(float));
+
+    quantize_symmetric(orig, N, K, quant, scales);
+    dequantize_neon(quant, scales, deq, N, K);
+
+    /* All dequantized values should be zero */
+    float max_val = 0.0f;
+    for (int i = 0; i < N * K; i++) {
+        float a = fabsf(deq[i]);
+        if (a > max_val) max_val = a;
+    }
+
+    if (max_val < 1e-6f) {
+        PASS();
+    } else {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "max_val=%.8f (expected 0)", max_val);
+        FAIL(msg);
+    }
+
+    free(orig); free(quant); free(scales); free(deq);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Test 13: Softmax numerical stability edge cases
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static void test_softmax_uniform(void) {
+    TEST("Softmax with uniform input → uniform output (1/N)");
+
+    int N = 64;
+    float *x = (float *)malloc(N * sizeof(float));
+    for (int i = 0; i < N; i++) x[i] = 5.0f;  /* All same value */
+
+    float max_val;
+    vDSP_maxv(x, 1, &max_val, N);
+    float neg_max = -max_val;
+    vDSP_vsadd(x, 1, &neg_max, x, 1, N);
+    int n = N;
+    vvexpf(x, x, &n);
+    float sum;
+    vDSP_sve(x, 1, &sum, N);
+    vDSP_vsdiv(x, 1, &sum, x, 1, N);
+
+    /* All outputs should be 1/N = 1/64 ≈ 0.015625 */
+    float expected = 1.0f / (float)N;
+    float max_err = 0.0f;
+    for (int i = 0; i < N; i++) {
+        float err = fabsf(x[i] - expected);
+        if (err > max_err) max_err = err;
+    }
+
+    if (max_err < 1e-5f) {
+        PASS();
+    } else {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "max_err=%.8f (expected near 0)", max_err);
+        FAIL(msg);
+    }
+
+    free(x);
+}
+
+static void test_softmax_one_hot(void) {
+    TEST("Softmax with one very large input → near one-hot");
+
+    int N = 32;
+    float *x = (float *)malloc(N * sizeof(float));
+    for (int i = 0; i < N; i++) x[i] = 0.0f;
+    x[0] = 100.0f;  /* One very large value */
+
+    float max_val;
+    vDSP_maxv(x, 1, &max_val, N);
+    float neg_max = -max_val;
+    vDSP_vsadd(x, 1, &neg_max, x, 1, N);
+    int n = N;
+    vvexpf(x, x, &n);
+    float sum;
+    vDSP_sve(x, 1, &sum, N);
+    vDSP_vsdiv(x, 1, &sum, x, 1, N);
+
+    /* x[0] should be ~1.0, all others ~0.0 */
+    int ok = (x[0] > 0.999f);
+    for (int i = 1; i < N; i++) {
+        if (x[i] > 0.001f) ok = 0;
+    }
+
+    if (ok) {
+        PASS();
+    } else {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "x[0]=%.6f (expected ~1.0)", x[0]);
+        FAIL(msg);
+    }
+
+    free(x);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Test 14: Depthwise conv1d with various kernels
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static void test_depthwise_conv1d_averaging(void) {
+    TEST("Depthwise conv1d: [1/3, 1/3, 1/3] averaging kernel");
+
+    int T = 16, D = 2, K = 3;
+    float *in = (float *)calloc(T * D, sizeof(float));
+    float *out = (float *)calloc(T * D, sizeof(float));
+    float *kernel = (float *)calloc(D * K, sizeof(float));
+
+    /* Input: increasing sequence per channel */
+    for (int t = 0; t < T; t++)
+        for (int d = 0; d < D; d++)
+            in[t * D + d] = (float)(t + 1);
+
+    /* Averaging kernel */
+    for (int d = 0; d < D; d++)
+        for (int k = 0; k < K; k++)
+            kernel[d * K + k] = 1.0f / 3.0f;
+
+    int pad = K / 2;
+    for (int d = 0; d < D; d++) {
+        for (int t = 0; t < T; t++) {
+            float sum = 0.0f;
+            for (int k = 0; k < K; k++) {
+                int tt = t - pad + k;
+                if (tt >= 0 && tt < T)
+                    sum += in[tt * D + d] * kernel[d * K + k];
+            }
+            out[t * D + d] = sum;
+        }
+    }
+
+    /* Interior output at t=5: avg(5, 6, 7) = 6.0 */
+    float expected = (5.0f + 6.0f + 7.0f) / 3.0f;
+    if (fabsf(out[5 * D] - expected) < 0.01f) {
+        PASS();
+    } else {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "out[5]=%.4f expected=%.4f", out[5 * D], expected);
+        FAIL(msg);
+    }
+
+    free(in); free(out); free(kernel);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Test 15: Latency profiler multiple turns
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static void test_latency_profiler_multi_turn(void) {
+    TEST("Latency profiler: multiple turns accumulate stats");
+
+    LatencyProfile lp;
+    lp_init(&lp);
+
+    /* Turn 1 */
+    lp_mark_vad_end(&lp);
+    usleep(500);
+    lp_mark_stt_start(&lp);
+    usleep(500);
+    lp_mark_stt_end(&lp);
+    usleep(500);
+    lp_mark_llm_start(&lp);
+    usleep(500);
+    lp_mark_llm_first_token(&lp);
+    usleep(500);
+    lp_mark_llm_end(&lp);
+    usleep(500);
+    lp_mark_tts_start(&lp);
+    usleep(500);
+    lp_mark_tts_first_audio(&lp);
+    usleep(500);
+    lp_mark_speaker_start(&lp);
+    lp_compute(&lp);
+
+    int turn1 = lp.n_turns;
+
+    /* Turn 2 */
+    lp_mark_vad_end(&lp);
+    usleep(500);
+    lp_mark_stt_start(&lp);
+    usleep(500);
+    lp_mark_stt_end(&lp);
+    usleep(500);
+    lp_mark_llm_start(&lp);
+    usleep(500);
+    lp_mark_llm_first_token(&lp);
+    usleep(500);
+    lp_mark_llm_end(&lp);
+    usleep(500);
+    lp_mark_tts_start(&lp);
+    usleep(500);
+    lp_mark_tts_first_audio(&lp);
+    usleep(500);
+    lp_mark_speaker_start(&lp);
+    lp_compute(&lp);
+
+    if (lp.n_turns == turn1 + 1 && lp.history_len >= 2) {
+        PASS();
+    } else {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "turns=%d history=%d (expected %d, >=2)",
+                 lp.n_turns, lp.history_len, turn1 + 1);
+        FAIL(msg);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Test 16: Voice quality with short signal
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static void test_voice_quality_short_signal(void) {
+    TEST("Voice quality: very short signal (1000 samples)");
+
+    int n = 1000;
+    float *ref = (float *)malloc(n * sizeof(float));
+    for (int i = 0; i < n; i++)
+        ref[i] = sinf(2.0f * 3.14159f * 440.0f * (float)i / 16000.0f) * 0.5f;
+
+    VoiceQualityReport report = vq_evaluate(ref, ref, n, 16000);
+
+    /* Should handle short signal gracefully */
+    if (report.valid && !isnan(report.pesq) && !isnan(report.stoi)) {
+        PASS();
+    } else {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "valid=%d pesq=%.2f stoi=%.2f",
+                 report.valid, report.pesq, report.stoi);
+        FAIL(msg);
+    }
+
+    free(ref);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * Main
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -542,6 +976,33 @@ int main(void) {
     /* Voice quality */
     test_voice_quality_identical();
     test_voice_quality_degraded();
+
+    /* New deep coverage tests */
+
+    /* FP16 edge cases */
+    test_fp16_denormals();
+    test_fp16_large_values();
+
+    /* Layer norm numerical stability */
+    test_layer_norm_extreme();
+    test_layer_norm_large_spread();
+
+    /* INT8 quantization edge cases */
+    test_int8_saturation();
+    test_int8_zero_weights();
+
+    /* Softmax numerical stability */
+    test_softmax_uniform();
+    test_softmax_one_hot();
+
+    /* Convolution */
+    test_depthwise_conv1d_averaging();
+
+    /* Latency profiler multi-turn */
+    test_latency_profiler_multi_turn();
+
+    /* Voice quality short signal */
+    test_voice_quality_short_signal();
 
     fprintf(stderr, "\n═══ Results: %d/%d passed, %d failed ═══\n\n",
             tests_passed, tests_run, tests_failed);

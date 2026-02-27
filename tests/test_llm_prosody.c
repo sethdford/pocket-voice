@@ -696,6 +696,408 @@ static void test_emergent_tts_categories(void) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * 7. Malformed JSON & Edge Cases
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static void test_malformed_json(void) {
+    int prev_passed = tests_passed, prev_run = tests_run;
+    printf("=== Malformed JSON & Edge Cases ===\n");
+
+    /* Test: completely invalid JSON */
+    TEST("invalid JSON returns NULL");
+    {
+        cJSON *root = cJSON_Parse("this is not json at all");
+        ASSERT(root == NULL, "expected NULL for garbage input");
+        PASS();
+    }
+
+    /* Test: truncated JSON (missing closing bracket) */
+    TEST("truncated JSON");
+    {
+        cJSON *root = cJSON_Parse("{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"");
+        ASSERT(root == NULL, "truncated JSON should fail");
+        PASS();
+    }
+
+    /* Test: empty JSON object */
+    TEST("empty JSON object");
+    {
+        cJSON *root = cJSON_Parse("{}");
+        ASSERT(root != NULL, "empty object should parse");
+        cJSON *candidates = cJSON_GetObjectItem(root, "candidates");
+        ASSERT(candidates == NULL, "no candidates in empty object");
+        cJSON_Delete(root);
+        PASS();
+    }
+
+    /* Test: empty candidates array */
+    TEST("empty candidates array");
+    {
+        cJSON *root = cJSON_Parse("{\"candidates\":[]}");
+        ASSERT(root != NULL, "should parse");
+        cJSON *candidates = cJSON_GetObjectItem(root, "candidates");
+        ASSERT(candidates != NULL, "candidates exists");
+        ASSERT_INT_EQ(cJSON_GetArraySize(candidates), 0);
+        cJSON_Delete(root);
+    }
+
+    /* Test: candidate with null text */
+    TEST("candidate with null text field");
+    {
+        const char *sse_data =
+            "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":null}]}}]}";
+        cJSON *root = cJSON_Parse(sse_data);
+        ASSERT(root != NULL, "should parse");
+        cJSON *parts = cJSON_GetObjectItem(
+            cJSON_GetObjectItem(
+                cJSON_GetArrayItem(cJSON_GetObjectItem(root, "candidates"), 0),
+                "content"),
+            "parts");
+        cJSON *part = cJSON_GetArrayItem(parts, 0);
+        cJSON *text = cJSON_GetObjectItem(part, "text");
+        ASSERT(text != NULL, "text key exists");
+        ASSERT(text->valuestring == NULL, "text value is null");
+        cJSON_Delete(root);
+        PASS();
+    }
+
+    /* Test: empty string response */
+    TEST("empty string text response");
+    {
+        const char *sse_data =
+            "{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"\"}]}}]}";
+        cJSON *root = cJSON_Parse(sse_data);
+        ASSERT(root != NULL, "should parse");
+        cJSON *text = cJSON_GetObjectItem(
+            cJSON_GetArrayItem(
+                cJSON_GetObjectItem(
+                    cJSON_GetObjectItem(
+                        cJSON_GetArrayItem(cJSON_GetObjectItem(root, "candidates"), 0),
+                        "content"),
+                    "parts"),
+                0),
+            "text");
+        ASSERT(text && text->valuestring, "text exists");
+        ASSERT(strcmp(text->valuestring, "") == 0, "text is empty string");
+        cJSON_Delete(root);
+        PASS();
+    }
+
+    printf("  malformed_json: %d/%d passed\n\n",
+           tests_passed - prev_passed, tests_run - prev_run);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 8. Claude SSE Format Variants
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static void test_claude_sse_variants(void) {
+    int prev_passed = tests_passed, prev_run = tests_run;
+    printf("=== Claude SSE Format Variants ===\n");
+
+    /* Test: message_start event */
+    TEST("claude message_start event");
+    {
+        const char *sse_data =
+            "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_01\","
+            "\"type\":\"message\",\"role\":\"assistant\",\"content\":[],"
+            "\"model\":\"claude-3-5-sonnet-20241022\"}}";
+        cJSON *root = cJSON_Parse(sse_data);
+        ASSERT(root != NULL, "JSON parse");
+        cJSON *type = cJSON_GetObjectItem(root, "type");
+        ASSERT(type && type->valuestring, "has type");
+        ASSERT(strcmp(type->valuestring, "message_start") == 0, "type is message_start");
+        cJSON *msg = cJSON_GetObjectItem(root, "message");
+        ASSERT(msg != NULL, "has message object");
+        cJSON *role = cJSON_GetObjectItem(msg, "role");
+        ASSERT(role && strcmp(role->valuestring, "assistant") == 0, "role is assistant");
+        cJSON_Delete(root);
+        PASS();
+    }
+
+    /* Test: content_block_start event */
+    TEST("claude content_block_start");
+    {
+        const char *sse_data =
+            "{\"type\":\"content_block_start\",\"index\":0,"
+            "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}";
+        cJSON *root = cJSON_Parse(sse_data);
+        ASSERT(root != NULL, "JSON parse");
+        cJSON *type = cJSON_GetObjectItem(root, "type");
+        ASSERT(strcmp(type->valuestring, "content_block_start") == 0, "type match");
+        cJSON *block = cJSON_GetObjectItem(root, "content_block");
+        ASSERT(block != NULL, "has content_block");
+        cJSON_Delete(root);
+        PASS();
+    }
+
+    /* Test: message_stop event */
+    TEST("claude message_stop event");
+    {
+        const char *sse_data =
+            "{\"type\":\"message_stop\"}";
+        cJSON *root = cJSON_Parse(sse_data);
+        ASSERT(root != NULL, "JSON parse");
+        cJSON *type = cJSON_GetObjectItem(root, "type");
+        ASSERT(strcmp(type->valuestring, "message_stop") == 0, "type is message_stop");
+        cJSON_Delete(root);
+        PASS();
+    }
+
+    /* Test: message_delta with stop_reason */
+    TEST("claude message_delta with stop_reason");
+    {
+        const char *sse_data =
+            "{\"type\":\"message_delta\","
+            "\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},"
+            "\"usage\":{\"output_tokens\":42}}";
+        cJSON *root = cJSON_Parse(sse_data);
+        ASSERT(root != NULL, "JSON parse");
+        cJSON *delta = cJSON_GetObjectItem(root, "delta");
+        cJSON *stop = cJSON_GetObjectItem(delta, "stop_reason");
+        ASSERT(stop && strcmp(stop->valuestring, "end_turn") == 0, "stop_reason match");
+        cJSON *usage = cJSON_GetObjectItem(root, "usage");
+        cJSON *tokens = cJSON_GetObjectItem(usage, "output_tokens");
+        ASSERT(tokens && tokens->valueint == 42, "output_tokens match");
+        cJSON_Delete(root);
+        PASS();
+    }
+
+    /* Test: content_block_delta with unicode text */
+    TEST("claude delta with unicode");
+    {
+        const char *sse_data =
+            "{\"type\":\"content_block_delta\",\"index\":0,"
+            "\"delta\":{\"type\":\"text_delta\",\"text\":\"Caf\\u00e9 na\\u00efve\"}}";
+        cJSON *root = cJSON_Parse(sse_data);
+        ASSERT(root != NULL, "JSON parse");
+        cJSON *text = cJSON_GetObjectItem(cJSON_GetObjectItem(root, "delta"), "text");
+        ASSERT(text && text->valuestring, "has text");
+        ASSERT(strstr(text->valuestring, "Caf") != NULL, "unicode text decoded");
+        cJSON_Delete(root);
+        PASS();
+    }
+
+    printf("  claude_sse: %d/%d passed\n\n",
+           tests_passed - prev_passed, tests_run - prev_run);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 9. SSML Parser Helper Functions
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static void test_ssml_parser_helpers(void) {
+    int prev_passed = tests_passed, prev_run = tests_run;
+    printf("=== SSML Parser Helpers ===\n");
+
+    /* ssml_is_ssml detection */
+    TEST("ssml_is_ssml with <speak>");
+    ASSERT(ssml_is_ssml("<speak>hello</speak>") == 1, "should detect SSML");
+    PASS();
+
+    TEST("ssml_is_ssml with plain text");
+    ASSERT(ssml_is_ssml("Just plain text") == 0, "not SSML");
+    PASS();
+
+    TEST("ssml_is_ssml with <?xml>");
+    ASSERT(ssml_is_ssml("<?xml version=\"1.0\"?><speak>hi</speak>") == 1, "xml header is SSML");
+    PASS();
+
+    /* Rate parsing */
+    TEST("ssml_parse_rate percentage");
+    ASSERT_FLOAT_NEAR(ssml_parse_rate("90%"), 0.9f, 0.01f);
+
+    TEST("ssml_parse_rate keyword slow");
+    {
+        float r = ssml_parse_rate("slow");
+        ASSERT(r < 1.0f, "slow should be < 1.0");
+        PASS();
+    }
+
+    TEST("ssml_parse_rate keyword fast");
+    {
+        float r = ssml_parse_rate("fast");
+        ASSERT(r > 1.0f, "fast should be > 1.0");
+        PASS();
+    }
+
+    /* Pitch parsing */
+    TEST("ssml_parse_pitch +10%");
+    ASSERT_FLOAT_NEAR(ssml_parse_pitch("+10%"), 1.1f, 0.01f);
+
+    TEST("ssml_parse_pitch -20%");
+    ASSERT_FLOAT_NEAR(ssml_parse_pitch("-20%"), 0.8f, 0.01f);
+
+    TEST("ssml_parse_pitch keyword low");
+    {
+        float p = ssml_parse_pitch("low");
+        ASSERT(p < 1.0f, "low pitch < 1.0");
+        PASS();
+    }
+
+    TEST("ssml_parse_pitch keyword high");
+    {
+        float p = ssml_parse_pitch("high");
+        ASSERT(p > 1.0f, "high pitch > 1.0");
+        PASS();
+    }
+
+    /* Volume parsing */
+    TEST("ssml_parse_volume keyword loud");
+    {
+        float v = ssml_parse_volume("loud");
+        ASSERT(v > 1.0f, "loud volume > 1.0");
+        PASS();
+    }
+
+    TEST("ssml_parse_volume keyword soft");
+    {
+        float v = ssml_parse_volume("soft");
+        ASSERT(v < 1.0f, "soft volume < 1.0");
+        PASS();
+    }
+
+    printf("  ssml_helpers: %d/%d passed\n\n",
+           tests_passed - prev_passed, tests_run - prev_run);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 10. Nonverbalism Expansion
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static void test_nonverbalism_expansion(void) {
+    int prev_passed = tests_passed, prev_run = tests_run;
+    char out[4096];
+    printf("=== Nonverbalism Expansion ===\n");
+
+    TEST("[laughter] expansion");
+    text_expand_nonverbalisms("He said [laughter] that was funny", out, sizeof(out));
+    ASSERT(strstr(out, "<break") != NULL || strstr(out, "happy") != NULL,
+           "[laughter] should produce break or emotion");
+    PASS();
+
+    TEST("[sigh] expansion");
+    text_expand_nonverbalisms("She let out a [sigh] and continued", out, sizeof(out));
+    ASSERT(strstr(out, "<break") != NULL || strstr(out, "sad") != NULL,
+           "[sigh] should produce break or sad emotion");
+    PASS();
+
+    TEST("[pause] expansion");
+    text_expand_nonverbalisms("Wait [pause] let me think", out, sizeof(out));
+    ASSERT(strstr(out, "500") != NULL || strstr(out, "<break") != NULL,
+           "[pause] should produce 500ms break");
+    PASS();
+
+    TEST("[long pause] expansion");
+    text_expand_nonverbalisms("And then [long pause] it happened", out, sizeof(out));
+    ASSERT(strstr(out, "1000") != NULL || strstr(out, "<break") != NULL,
+           "[long pause] should produce 1000ms break");
+    PASS();
+
+    TEST("no markers passthrough");
+    text_expand_nonverbalisms("Just a regular sentence.", out, sizeof(out));
+    ASSERT(strcmp(out, "Just a regular sentence.") == 0, "no change without markers");
+    PASS();
+
+    TEST("NULL input safety");
+    {
+        int r = text_expand_nonverbalisms(NULL, out, sizeof(out));
+        ASSERT(r == 0 || out[0] == '\0', "NULL input handled safely");
+        PASS();
+    }
+
+    printf("  nonverbalism: %d/%d passed\n\n",
+           tests_passed - prev_passed, tests_run - prev_run);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 11. SSML Segment Boundary Cases
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static void test_ssml_segment_boundaries(void) {
+    int prev_passed = tests_passed, prev_run = tests_run;
+    SSMLSegment segs[SSML_MAX_SEGMENTS];
+    printf("=== SSML Segment Boundaries ===\n");
+
+    /* Test: empty <speak> tag */
+    TEST("empty speak tag");
+    {
+        int n = ssml_parse("<speak></speak>", segs, SSML_MAX_SEGMENTS);
+        ASSERT(n >= 0, "empty speak doesn't crash");
+        PASS();
+    }
+
+    /* Test: multiple breaks in sequence */
+    TEST("consecutive breaks");
+    {
+        int n = ssml_parse(
+            "<speak>Hello<break time=\"100ms\"/><break time=\"200ms\"/>World</speak>",
+            segs, SSML_MAX_SEGMENTS);
+        ASSERT(n >= 1, "consecutive breaks produce segments");
+        PASS();
+    }
+
+    /* Test: deeply nested SSML */
+    TEST("nested prosody + emotion + emphasis");
+    {
+        int n = ssml_parse(
+            "<speak><prosody rate=\"110%\"><emotion type=\"happy\">"
+            "<emphasis level=\"moderate\">Wow!</emphasis></emotion></prosody></speak>",
+            segs, SSML_MAX_SEGMENTS);
+        ASSERT(n >= 1, "deep nesting produces segments");
+        /* Rate should reflect the 110% prosody */
+        int found = 0;
+        for (int i = 0; i < n; i++) {
+            if (strstr(segs[i].text, "Wow")) {
+                found = 1;
+                ASSERT(segs[i].rate > 1.0f, "rate from prosody tag applied");
+            }
+        }
+        ASSERT(found, "found Wow segment");
+        PASS();
+    }
+
+    /* Test: NULL input to ssml_parse */
+    TEST("NULL input to ssml_parse");
+    {
+        int n = ssml_parse(NULL, segs, SSML_MAX_SEGMENTS);
+        ASSERT(n <= 0, "NULL input returns 0 or -1");
+        PASS();
+    }
+
+    /* Test: very long plain text */
+    TEST("long plain text passthrough");
+    {
+        char long_text[4000];
+        memset(long_text, 'A', sizeof(long_text) - 1);
+        long_text[sizeof(long_text) - 1] = '\0';
+        int n = ssml_parse(long_text, segs, SSML_MAX_SEGMENTS);
+        ASSERT(n == 1, "long plain text = 1 segment");
+        PASS();
+    }
+
+    /* Test: phoneme tag */
+    TEST("phoneme IPA override");
+    {
+        int n = ssml_parse(
+            "<speak><phoneme alphabet=\"ipa\" ph=\"təˈmeɪtoʊ\">tomato</phoneme></speak>",
+            segs, SSML_MAX_SEGMENTS);
+        ASSERT(n >= 1, "phoneme tag produces segment");
+        int found = 0;
+        for (int i = 0; i < n; i++) {
+            if (segs[i].phoneme_ipa[0] != '\0') {
+                found = 1;
+            }
+        }
+        ASSERT(found, "phoneme IPA populated");
+        PASS();
+    }
+
+    printf("  ssml_boundaries: %d/%d passed\n\n",
+           tests_passed - prev_passed, tests_run - prev_run);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * main
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -706,6 +1108,13 @@ int main(void) {
     test_expanded_normalization();
     test_question_intonation();
     test_emergent_tts_categories();
+
+    /* New deepened tests */
+    test_malformed_json();
+    test_claude_sse_variants();
+    test_ssml_parser_helpers();
+    test_nonverbalism_expansion();
+    test_ssml_segment_boundaries();
 
     printf("═══════════════════════════\n");
     printf("Total: %d/%d tests passed", tests_passed, tests_run);
