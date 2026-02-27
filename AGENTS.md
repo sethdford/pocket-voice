@@ -1019,8 +1019,8 @@ Pure C CTC speech recognition engine symmetric to Sonata TTS. Two-pass architect
 
 The `Makefile` builds in three stages:
 
-1. **C shared libraries** → `build/*.dylib` (43 dylibs + 1 metallib, each `.c` compiles independently)
-2. **Rust cdylibs** → `src/{stt,llm,sonata_lm,sonata_flow,sonata_storm}/target/release/*.dylib` (via `cargo build --release`)
+1. **C shared libraries** → `build/*.dylib` (44 dylibs + 1 metallib, each `.c` compiles independently)
+2. **Rust cdylibs** → `src/{stt,llm,local_llm,sonata_lm,sonata_flow,sonata_storm}/target/release/*.dylib` (via `cargo build --release`)
 3. **Pipeline binary** → `sonata` (links all of the above)
 
 Frameworks linked: Accelerate, CoreAudio, AudioToolbox, Security, Metal, Foundation, IOSurface, libcurl. Homebrew deps: curl, opus, onnxruntime, espeak-ng.

@@ -31,14 +31,14 @@ ANTHROPIC_API_KEY=sk-ant-... ./sonata
 
 The build has three stages:
 
-1. **C shared libraries** — 43+ dylibs in `build/`, each `.c` compiles independently
+1. **C shared libraries** — 44 dylibs in `build/`, each `.c` compiles independently
 2. **Rust cdylibs** — STT, LLM, Sonata LM/Flow/Storm via `cargo build --release`
 3. **Pipeline binary** — links all of the above
 
 ### Run Tests
 
 ```bash
-# Run the full test suite (~30 test targets)
+# Run the full test suite (56+ test targets)
 make test
 
 # Run a specific test suite

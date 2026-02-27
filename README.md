@@ -26,7 +26,7 @@ Mic → STT → LLM → TTS → Speaker
 
 ## Key Features
 
-- **100% native audio pipeline**: C + Rust. Single `make` builds 43 shared libraries, 5 Rust crates, custom Metal kernels, and one binary.
+- **100% native audio pipeline**: C + Rust. Single `make` builds 44 shared libraries, 6 Rust crates, custom Metal kernels, and one binary.
 - **Full-duplex barge-in**: CoreAudio VoiceProcessingIO with hardware AEC. Speak while the assistant is talking — playback interrupts immediately.
 - **Fused 3-signal end-of-utterance**: Energy VAD + LSTM endpointer + ASR-inline EOU token, weighted and fused for <240ms turn detection.
 - **Speculative prefill**: LLM request fires at 70% EOU confidence. Saves 100-300ms when the prediction is correct.
@@ -140,7 +140,7 @@ Listening → Recording → Processing → Streaming → Speaking → Listening
 | **Speaking**   | Drains remaining TTS audio to speaker                                       |
 | **Barge-in**   | User speaks during playback → immediate interrupt, back to Listening        |
 
-## Native Libraries (43 C shared libraries + 5 Rust cdylibs + 1 metallib)
+## Native Libraries (44 C shared libraries + 6 Rust cdylibs + 1 metallib)
 
 ### Core Audio Engine
 
@@ -392,21 +392,22 @@ make bench-industry          # Industry-standard quality benchmarks
 ## Build
 
 ```bash
-make          # Build everything: 43 C shared libraries + 5 Rust cdylibs + 1 metallib + binary
+make          # Build everything: 44 C shared libraries + 6 Rust cdylibs + 1 metallib + binary
 make libs     # Build just the C shared libraries + metallib
 make clean    # Remove all build artifacts
 ```
 
 Build output:
 
-1. `build/*.dylib` — 43 C shared libraries
+1. `build/*.dylib` — 44 C shared libraries
 2. `build/tensor_ops.metallib` — Custom Metal kernels (Flash Attention v2, fused SiLU+gate, layer norm)
 3. `src/stt/target/release/libpocket_stt.dylib` — Rust STT cdylib (Kyutai 1B, candle + Metal)
 4. `src/llm/target/release/libpocket_llm.dylib` — Rust local LLM cdylib (Llama 3.2, candle + Metal)
-5. `src/sonata_lm/target/release/libsonata_lm.dylib` — Rust Sonata LM cdylib (241M semantic model)
-6. `src/sonata_flow/target/release/libsonata_flow.dylib` — Rust Sonata Flow cdylib (35.7M flow matching)
-7. `src/sonata_storm/target/release/libsonata_storm.dylib` — Rust Sonata Storm cdylib (parallel TTS)
-8. `sonata` — Pipeline binary linking everything
+5. `src/local_llm/target/release/liblocal_llm.dylib` — Rust local LLM alternative cdylib (candle + Metal)
+6. `src/sonata_lm/target/release/libsonata_lm.dylib` — Rust Sonata LM cdylib (241M semantic model)
+7. `src/sonata_flow/target/release/libsonata_flow.dylib` — Rust Sonata Flow cdylib (35.7M flow matching)
+8. `src/sonata_storm/target/release/libsonata_storm.dylib` — Rust Sonata Storm cdylib (parallel TTS)
+9. `sonata` — Pipeline binary linking everything
 
 ## Run
 
@@ -498,7 +499,7 @@ sonata/
 ├── CONTRIBUTING.md       # Contributing guide
 ├── AGENTS.md             # AI agent guidance
 ├── LICENSE               # MIT
-├── src/                  # 43 C source files + 5 Rust crates + Metal kernels
+├── src/                  # 45 C source files + 6 Rust crates + Metal kernels
 ├── include/              # C header files
 ├── tests/                # 30+ test suites
 ├── scripts/              # Benchmarking, conversion, and export scripts
