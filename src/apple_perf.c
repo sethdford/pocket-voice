@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/sysctl.h>
 
 #include <mach/mach.h>
 #include <mach/mach_time.h>
@@ -596,3 +597,76 @@ void ap_zerocopy_destroy(APZeroCopyBuffer *buf)
 }
 
 #endif
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Apple Silicon Chip Generation Detection
+ *
+ * Uses sysctlbyname("machdep.cpu.brand_string") to detect M1–M5+.
+ * Brand strings follow the pattern "Apple M<N>" or "Apple M<N> Pro/Max/Ultra".
+ * Result is cached in a static for zero-cost repeated queries.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static APChipGeneration g_chip_gen = AP_CHIP_UNKNOWN;
+static int g_chip_detected = 0;
+
+APChipGeneration ap_chip_generation(void)
+{
+    if (g_chip_detected) return g_chip_gen;
+    g_chip_detected = 1;
+
+    char brand[256] = {0};
+    size_t len = sizeof(brand) - 1;
+    if (sysctlbyname("machdep.cpu.brand_string", brand, &len, NULL, 0) != 0) {
+        fprintf(stderr, "[apple_perf] sysctlbyname failed — chip unknown\n");
+        return AP_CHIP_UNKNOWN;
+    }
+
+    /* Brand strings: "Apple M1", "Apple M2 Pro", "Apple M3 Max", etc.
+     * Find "Apple M" then parse the generation digit. */
+    const char *m = strstr(brand, "Apple M");
+    if (!m) {
+        /* Might be running in Rosetta or a non-Apple-Silicon Mac */
+        fprintf(stderr, "[apple_perf] Not Apple Silicon: %s\n", brand);
+        return AP_CHIP_UNKNOWN;
+    }
+
+    /* Skip "Apple M" → points to generation digit(s) */
+    const char *gen_str = m + 7;
+    int gen = atoi(gen_str);
+
+    switch (gen) {
+        case 1: g_chip_gen = AP_CHIP_M1; break;
+        case 2: g_chip_gen = AP_CHIP_M2; break;
+        case 3: g_chip_gen = AP_CHIP_M3; break;
+        case 4: g_chip_gen = AP_CHIP_M4; break;
+        default:
+            if (gen >= 5) {
+                g_chip_gen = AP_CHIP_M5; /* M5 or future — treat as M5+ */
+            } else {
+                g_chip_gen = AP_CHIP_UNKNOWN;
+            }
+            break;
+    }
+
+    fprintf(stderr, "[apple_perf] Detected chip: %s (gen=%d → %s)\n",
+            brand, gen, ap_chip_generation_name(g_chip_gen));
+    return g_chip_gen;
+}
+
+const char *ap_chip_generation_name(APChipGeneration gen)
+{
+    switch (gen) {
+        case AP_CHIP_M1: return "M1";
+        case AP_CHIP_M2: return "M2";
+        case AP_CHIP_M3: return "M3";
+        case AP_CHIP_M4: return "M4";
+        case AP_CHIP_M5: return "M5+";
+        default:         return "Unknown";
+    }
+}
+
+int ap_has_neural_accel(void)
+{
+    APChipGeneration gen = ap_chip_generation();
+    return (gen >= AP_CHIP_M5) ? 1 : 0;
+}

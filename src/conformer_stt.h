@@ -51,7 +51,7 @@ typedef struct {
     uint32_t win_length;        /* Mel window in samples (e.g. 400) */
     uint32_t n_fft;             /* FFT size (e.g. 512) */
     uint32_t subsample_factor;  /* Time reduction factor (4 or 8) */
-    uint32_t dtype;             /* 0 = fp32, 1 = fp16, 2 = int8 (per-channel symmetric) */
+    uint32_t dtype;             /* 0 = fp32, 1 = fp16, 2 = int8, 3 = int4 (weight-only) */
     uint32_t flags;             /* Bitfield (CSTT_FLAG_*) */
     uint32_t sub_type;          /* Subsampling type (CSTT_SUB_*) */
     uint32_t n_sub_convs;       /* Number of conv layers in subsampling */
@@ -211,6 +211,31 @@ int conformer_stt_has_eou_support(const ConformerSTT *stt);
 
 /** Returns 1 if the model uses TDT (transducer) decoding instead of CTC. */
 int conformer_stt_is_tdt(const ConformerSTT *stt);
+
+/* ─── Conmer Mode (Attention-Free Streaming) ──────────────────────────── */
+
+/**
+ * Enable or disable Conmer mode (convolution-only Conformer).
+ *
+ * When enabled, multi-head self-attention is skipped in all encoder blocks.
+ * Based on Amazon Conmer research (Interspeech 2023): for streaming short
+ * utterances (<10s), removing MHSA yields ~4% WER improvement and ~10%
+ * compute savings because the local context from depthwise convolution
+ * is sufficient.
+ *
+ * Block architecture in Conmer mode:
+ *   input → FFN½ → Conv → FFN½ → LayerNorm → output
+ *
+ * The model still loads attention weights (for fallback), but they are
+ * not exercised during forward passes while Conmer mode is active.
+ *
+ * @param stt     Engine instance
+ * @param enable  1 to enable Conmer mode, 0 for standard Conformer
+ */
+void conformer_stt_set_conmer_mode(ConformerSTT *stt, int enable);
+
+/** Returns 1 if Conmer mode is currently enabled. */
+int conformer_stt_is_conmer(const ConformerSTT *stt);
 
 /* ─── External Forward-Pass Hook ───────────────────────────────────────── */
 

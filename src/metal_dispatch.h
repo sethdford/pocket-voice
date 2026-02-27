@@ -88,6 +88,57 @@ int metal_dispatch_layer_norm(const void *input, void *output,
  */
 void metal_dispatch_cleanup(void);
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Chip-Aware Dispatch Thresholds
+ *
+ * Metal dispatch overhead varies dramatically by chip generation:
+ *   M1-M4: +3228% to +568006% overhead for conformer-sized matrices
+ *   M5+:   Neural accelerators in GPU cores make small dispatches viable
+ *
+ * Default thresholds (minimum dimension for GPU path):
+ *   M1-M4:  1024  (only large matrices benefit from GPU)
+ *   M5+:    128   (neural accelerators handle small matrices well)
+ *   Unknown: 2048  (conservative — prefer CPU)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * Set the minimum matrix dimension for Metal GPU dispatch.
+ * Matrices where min(M,N,K) < threshold use CPU (cblas_sgemm).
+ * Set to 0 to always use GPU, INT_MAX to always use CPU.
+ * @param min_dim  Minimum dimension threshold
+ */
+void metal_dispatch_set_threshold(int min_dim);
+
+/**
+ * Get the current Metal dispatch threshold.
+ * @return Current minimum dimension for GPU dispatch
+ */
+int metal_dispatch_get_threshold(void);
+
+/**
+ * Auto-configure the dispatch threshold based on detected chip generation.
+ * Called automatically by metal_dispatch_init(), but can be called manually
+ * to re-detect (e.g. after testing override via metal_dispatch_set_threshold).
+ */
+void metal_dispatch_auto_threshold(void);
+
+/**
+ * Check if Metal 4 TensorOps (neural accelerator path) is available.
+ * Requires M5+ hardware with Metal 4 GPU family support.
+ * @return 1 if Metal 4 TensorOps available, 0 otherwise
+ */
+int metal_dispatch_has_tensorops(void);
+
+/**
+ * Benchmark CPU vs GPU for a given matrix size on this hardware.
+ * Runs multiple iterations and returns the faster path.
+ * @param M  Rows of A / rows of C
+ * @param K  Cols of A / cols of B
+ * @param N  Rows of B / cols of C
+ * @return 0 if CPU is faster, 1 if GPU is faster, -1 on error
+ */
+int metal_dispatch_benchmark(int M, int K, int N);
+
 #ifdef __cplusplus
 }
 #endif

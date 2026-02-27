@@ -160,6 +160,36 @@ static inline float *ap_amx_alloc(int n_floats) {
     return p;
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Apple Silicon Chip Generation Detection
+ *
+ * Runtime detection of Apple Silicon generation (M1–M5+) using
+ * sysctlbyname("machdep.cpu.brand_string"). Used to select optimal
+ * Metal dispatch thresholds — M5+ has neural accelerators in GPU cores
+ * that make small matrix GPU dispatch viable, while M1-M4 should prefer
+ * CPU (cblas/AMX) for conformer-sized matrices.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+typedef enum {
+    AP_CHIP_UNKNOWN = 0,
+    AP_CHIP_M1      = 1,
+    AP_CHIP_M2      = 2,
+    AP_CHIP_M3      = 3,
+    AP_CHIP_M4      = 4,
+    AP_CHIP_M5      = 5,
+} APChipGeneration;
+
+/** Detect the Apple Silicon chip generation at runtime.
+ *  Returns AP_CHIP_M1..AP_CHIP_M5 or AP_CHIP_UNKNOWN.
+ *  Result is cached after first call. */
+APChipGeneration ap_chip_generation(void);
+
+/** Returns the chip generation as a human-readable string (e.g. "M3"). */
+const char *ap_chip_generation_name(APChipGeneration gen);
+
+/** Returns 1 if chip has neural accelerators in GPU cores (M5+). */
+int ap_has_neural_accel(void);
+
 #ifdef __cplusplus
 }
 #endif

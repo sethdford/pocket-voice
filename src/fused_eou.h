@@ -59,6 +59,13 @@ typedef struct {
 #define EOU_SRC_MIMI     (1 << 1)
 #define EOU_SRC_STT      (1 << 2)
 #define EOU_SRC_FUSED    (1 << 3)
+#define EOU_SRC_PROSODY  (1 << 4)
+
+/* Prosodic features for turn-taking detection (Krisp-inspired) */
+typedef struct {
+    float pitch_hz;     /* Fundamental frequency in Hz (0 if unvoiced) */
+    float energy_db;    /* Frame energy in dB */
+} ProsodyFrame;
 
 /**
  * Create a fused EOU detector.
@@ -111,6 +118,39 @@ int fused_eou_triggered(const FusedEOU *eou);
  * Print a diagnostic summary of the last endpoint decision.
  */
 void fused_eou_print_status(const FusedEOU *eou);
+
+/**
+ * Set conversation context for semantic EOU threshold adjustment.
+ * Inspired by LiveKit Turn Detector: uses the last transcript to adjust
+ * the endpoint threshold (questions lower it, conjunctions raise it).
+ *
+ * @param last_transcript  Most recent ASR transcript (NULL to clear)
+ */
+void fused_eou_set_context(FusedEOU *eou, const char *last_transcript);
+
+/**
+ * Feed a prosody frame into the internal ring buffer.
+ * Call per audio analysis frame (~10-20ms). The detector computes
+ * pitch trajectory and energy decay over the last ~500ms.
+ */
+void fused_eou_feed_prosody(FusedEOU *eou, ProsodyFrame frame);
+
+/**
+ * Set the prosody signal weight (default 0.0 for backward compatibility).
+ * Recommended value: 0.15. The original 3-signal weights are scaled by
+ * (1 - w_prosody) so the total always sums to 1.0.
+ */
+void fused_eou_set_prosody_weight(FusedEOU *eou, float w_prosody);
+
+/**
+ * Get the current prosody-derived end-of-turn probability.
+ */
+float fused_eou_prosody_prob(const FusedEOU *eou);
+
+/**
+ * Get the current context threshold adjustment.
+ */
+float fused_eou_context_adjustment(const FusedEOU *eou);
 
 #ifdef __cplusplus
 }

@@ -11,6 +11,9 @@
 #include <stdio.h>
 #include <math.h>
 
+#define PROSODY_BUF_SIZE 32  /* Ring buffer for ~500ms of prosody frames */
+#define CONTEXT_MAX_LEN 256
+
 struct FusedEOU {
     /* Fusion weights (normalized to sum to 1.0) */
     float w_energy;
@@ -37,6 +40,19 @@ struct FusedEOU {
     int   speech_detected;  /* Has speech been detected? */
     int   frames_since_speech;
     int   total_frames;
+
+    /* Prosody signal (4th signal — Krisp-inspired) */
+    float w_prosody;        /* Weight for prosody in fusion (default 0.0) */
+    float solo_prosody;     /* Solo threshold for prosody */
+    float pitch_buf[PROSODY_BUF_SIZE];
+    float energy_buf[PROSODY_BUF_SIZE];
+    int   prosody_write;    /* Ring buffer write index */
+    int   prosody_count;    /* Total prosody frames accumulated */
+    float prosody_prob;     /* Cached P(eot) from prosody */
+
+    /* Conversation context (LiveKit-inspired) */
+    float context_adj;      /* Threshold adjustment: <0 = easier trigger */
+    char  last_transcript[CONTEXT_MAX_LEN];
 };
 
 FusedEOU *fused_eou_create(float threshold, int consec_frames, float frame_ms) {
@@ -55,11 +71,121 @@ FusedEOU *fused_eou_create(float threshold, int consec_frames, float frame_ms) {
     eou->consec_required = consec_frames;
     eou->frame_ms = frame_ms;
 
+    eou->w_prosody    = 0.0f;   /* Off by default — backward compatible */
+    eou->solo_prosody = 0.92f;
+
     return eou;
 }
 
 void fused_eou_destroy(FusedEOU *eou) {
     free(eou);
+}
+
+/* ── Prosody probability from pitch trajectory + energy decay ──── */
+static float compute_prosody_prob(const FusedEOU *eou) {
+    if (eou->prosody_count < 4) return 0.5f; /* Not enough data → neutral */
+
+    int n = eou->prosody_count < PROSODY_BUF_SIZE
+          ? eou->prosody_count : PROSODY_BUF_SIZE;
+    int half = n / 2;
+
+    /* Split buffer into first half and second half */
+    float pitch_first = 0, pitch_second = 0;
+    float energy_first = 0, energy_second = 0;
+    int voiced_first = 0, voiced_second = 0;
+
+    for (int i = 0; i < n; i++) {
+        int idx = (eou->prosody_write - n + i + PROSODY_BUF_SIZE)
+                % PROSODY_BUF_SIZE;
+        if (i < half) {
+            if (eou->pitch_buf[idx] > 0.0f) {
+                pitch_first += eou->pitch_buf[idx];
+                voiced_first++;
+            }
+            energy_first += eou->energy_buf[idx];
+        } else {
+            if (eou->pitch_buf[idx] > 0.0f) {
+                pitch_second += eou->pitch_buf[idx];
+                voiced_second++;
+            }
+            energy_second += eou->energy_buf[idx];
+        }
+    }
+
+    /* Pitch trajectory: falling → completion (high), rising → continuation (low) */
+    float pitch_score = 0.5f;
+    if (voiced_first >= 2 && voiced_second >= 2) {
+        float avg1 = pitch_first / (float)voiced_first;
+        float avg2 = pitch_second / (float)voiced_second;
+        if (avg1 > 1.0f) {
+            float ratio = avg2 / avg1;
+            /* Sigmoid centered at 1.0: ratio < 1 (falling) → high score */
+            pitch_score = 1.0f / (1.0f + expf((ratio - 1.0f) * 10.0f));
+        }
+    }
+
+    /* Energy decay: fast drop → completion (high), increasing → continuation (low) */
+    float e1 = energy_first / (float)(half > 0 ? half : 1);
+    float e2 = energy_second / (float)((n - half) > 0 ? (n - half) : 1);
+    float drop = e1 - e2; /* Positive = energy dropping (in dB) */
+    float energy_score = 1.0f / (1.0f + expf(-drop * 0.3f));
+
+    /* Combine: 60% pitch, 40% energy (pitch is primary turn-taking cue) */
+    return 0.6f * pitch_score + 0.4f * energy_score;
+}
+
+/* ── Context adjustment from last transcript ──────────────────── */
+static float compute_context_adj(const char *transcript) {
+    if (!transcript || !transcript[0]) return 0.0f;
+
+    size_t len = strlen(transcript);
+
+    /* Find last non-whitespace character */
+    size_t end = len;
+    while (end > 0 && (transcript[end - 1] == ' ' ||
+                        transcript[end - 1] == '\n' ||
+                        transcript[end - 1] == '\r' ||
+                        transcript[end - 1] == '\t')) {
+        end--;
+    }
+    if (end == 0) return 0.0f;
+
+    /* Question mark → lower threshold (speaker is done asking) */
+    if (transcript[end - 1] == '?') return -0.10f;
+
+    /* Find last word boundaries */
+    size_t word_end = end;
+    size_t word_start = end;
+    while (word_start > 0 && transcript[word_start - 1] != ' ')
+        word_start--;
+
+    size_t word_len = word_end - word_start;
+    if (word_len == 0 || word_len > 16) return 0.0f;
+
+    /* Lowercase copy of last word */
+    char word[17];
+    for (size_t i = 0; i < word_len; i++) {
+        char c = transcript[word_start + i];
+        word[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+    }
+    word[word_len] = '\0';
+
+    /* Conjunctions → raise threshold (speaker likely continuing) */
+    static const char *conjs[] = {
+        "and", "but", "or", "so", "because", "however",
+        "although", "since", "while", "yet", "then"
+    };
+    for (int i = 0; i < (int)(sizeof(conjs) / sizeof(conjs[0])); i++) {
+        if (strcmp(word, conjs[i]) == 0) return 0.10f;
+    }
+
+    /* Fillers → slight raise (speaker likely thinking/continuing) */
+    static const char *fillers[] = {"um", "uh", "like", "well", "actually"};
+    for (int i = 0; i < (int)(sizeof(fillers) / sizeof(fillers[0])); i++) {
+        if (strcmp(word, fillers[i]) == 0) return 0.05f;
+    }
+
+    return 0.0f;
 }
 
 EOUResult fused_eou_process(FusedEOU *eou, EOUSignals sig) {
@@ -92,10 +218,24 @@ EOUResult fused_eou_process(FusedEOU *eou, EOUSignals sig) {
         src |= EOU_SRC_STT;
     }
 
-    /* ── Weighted Fusion ──────────────────────────────── */
-    float fused = eou->w_energy * sig.energy_signal
-                + eou->w_mimi  * sig.mimi_eot_prob
-                + eou->w_stt   * sig.stt_eou_prob;
+    /* ── Prosody signal (4th signal) ─────────────────── */
+    eou->prosody_prob = compute_prosody_prob(eou);
+    if (eou->prosody_prob >= eou->solo_prosody && eou->speech_detected &&
+        eou->w_prosody > 0.0f) {
+        src |= EOU_SRC_PROSODY;
+    }
+
+    /* ── Weighted Fusion (3-signal core + optional prosody) ── */
+    float core = eou->w_energy * sig.energy_signal
+               + eou->w_mimi  * sig.mimi_eot_prob
+               + eou->w_stt   * sig.stt_eou_prob;
+    float fused;
+    if (eou->w_prosody > 0.0f) {
+        fused = (1.0f - eou->w_prosody) * core
+              + eou->w_prosody * eou->prosody_prob;
+    } else {
+        fused = core;
+    }
 
     /* EMA smoothing (alpha = 0.4 for fast response) */
     eou->smoothed_prob = 0.4f * fused + 0.6f * eou->smoothed_prob;
@@ -110,22 +250,27 @@ EOUResult fused_eou_process(FusedEOU *eou, EOUSignals sig) {
         should_trigger = 1;
     }
 
+    /* ── Context-adjusted threshold ───────────────────── */
+    float eff_threshold = eou->threshold + eou->context_adj;
+    if (eff_threshold < 0.1f) eff_threshold = 0.1f;
+    if (eff_threshold > 0.99f) eff_threshold = 0.99f;
+
     /* Silence-duration fast path: if the user has been silent for 300ms+
      * after producing speech AND we're already above the fused threshold,
      * trigger immediately without waiting for consecutive-frame consensus.
      * This mimics natural conversational turn-taking. The prob threshold
-     * must match the fused path (eou->threshold) to preserve the speculative
-     * prefill zone: prob in [0.55, threshold) where we send to LLM early
-     * but do not commit to EOU yet. */
+     * must match the fused path to preserve the speculative prefill zone:
+     * prob in [0.55, threshold) where we send to LLM early but do not
+     * commit to EOU yet. */
     float silence_ms = (float)eou->frames_since_speech * eou->frame_ms;
     if (eou->speech_detected && silence_ms >= 300.0f &&
-        eou->smoothed_prob >= eou->threshold) {
+        eou->smoothed_prob >= eff_threshold) {
         should_trigger = 1;
         src |= EOU_SRC_ENERGY | EOU_SRC_FUSED;
     }
 
     /* Fused trigger: combined probability above threshold for N frames */
-    if (eou->smoothed_prob >= eou->threshold && eou->speech_detected) {
+    if (eou->smoothed_prob >= eff_threshold && eou->speech_detected) {
         eou->consec_count++;
         if (eou->consec_count >= eou->consec_required) {
             should_trigger = 1;
@@ -157,6 +302,13 @@ void fused_eou_reset(FusedEOU *eou) {
     eou->speech_detected = 0;
     eou->frames_since_speech = 0;
     eou->total_frames = 0;
+
+    /* Clear prosody buffers (context persists across utterances) */
+    memset(eou->pitch_buf, 0, sizeof(eou->pitch_buf));
+    memset(eou->energy_buf, 0, sizeof(eou->energy_buf));
+    eou->prosody_write = 0;
+    eou->prosody_count = 0;
+    eou->prosody_prob = 0.0f;
 }
 
 void fused_eou_set_weights(FusedEOU *eou, float w_energy, float w_mimi, float w_stt) {
@@ -190,15 +342,58 @@ void fused_eou_print_status(const FusedEOU *eou) {
     if (!eou) return;
 
     const char *src_str = "none";
-    if (eou->trigger_source & EOU_SRC_FUSED)  src_str = "FUSED";
-    else if (eou->trigger_source & EOU_SRC_MIMI) src_str = "MIMI";
-    else if (eou->trigger_source & EOU_SRC_STT)  src_str = "STT";
-    else if (eou->trigger_source & EOU_SRC_ENERGY) src_str = "ENERGY";
+    if (eou->trigger_source & EOU_SRC_FUSED)    src_str = "FUSED";
+    else if (eou->trigger_source & EOU_SRC_PROSODY) src_str = "PROSODY";
+    else if (eou->trigger_source & EOU_SRC_MIMI)    src_str = "MIMI";
+    else if (eou->trigger_source & EOU_SRC_STT)     src_str = "STT";
+    else if (eou->trigger_source & EOU_SRC_ENERGY)   src_str = "ENERGY";
 
     fprintf(stderr, "[fused_eou] prob=%.3f trig=%d src=%s consec=%d "
-            "latency=%.0fms frames=%d\n",
+            "latency=%.0fms frames=%d prosody=%.3f ctx_adj=%+.2f\n",
             eou->smoothed_prob, eou->triggered, src_str,
             eou->consec_count,
             (float)eou->frames_since_speech * eou->frame_ms,
-            eou->total_frames);
+            eou->total_frames,
+            eou->prosody_prob,
+            eou->context_adj);
+}
+
+/* ── Conversation Context ──────────────────────────────── */
+
+void fused_eou_set_context(FusedEOU *eou, const char *last_transcript) {
+    if (!eou) return;
+    if (last_transcript) {
+        strncpy(eou->last_transcript, last_transcript, CONTEXT_MAX_LEN - 1);
+        eou->last_transcript[CONTEXT_MAX_LEN - 1] = '\0';
+    } else {
+        eou->last_transcript[0] = '\0';
+    }
+    eou->context_adj = compute_context_adj(eou->last_transcript);
+}
+
+/* ── Prosodic Turn-Taking ──────────────────────────────── */
+
+void fused_eou_feed_prosody(FusedEOU *eou, ProsodyFrame frame) {
+    if (!eou) return;
+    eou->pitch_buf[eou->prosody_write]  = frame.pitch_hz;
+    eou->energy_buf[eou->prosody_write] = frame.energy_db;
+    eou->prosody_write = (eou->prosody_write + 1) % PROSODY_BUF_SIZE;
+    eou->prosody_count++;
+    if (eou->prosody_count > 1000000)
+        eou->prosody_count = PROSODY_BUF_SIZE; /* Prevent overflow */
+}
+
+void fused_eou_set_prosody_weight(FusedEOU *eou, float w_prosody) {
+    if (!eou) return;
+    if (w_prosody < 0.0f) w_prosody = 0.0f;
+    if (w_prosody > 0.5f) w_prosody = 0.5f; /* Cap to preserve core signals */
+    eou->w_prosody = w_prosody;
+}
+
+float fused_eou_prosody_prob(const FusedEOU *eou) {
+    return eou ? eou->prosody_prob : 0.0f;
+}
+
+float fused_eou_context_adjustment(const FusedEOU *eou) {
+    return eou ? eou->context_adj : 0.0f;
 }

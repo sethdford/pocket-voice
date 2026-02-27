@@ -146,6 +146,7 @@ typedef struct {
     const float  *ctc_w_qs;         /* Per-channel scales for INT8 CTC weight */
     int use_fp16_gemm;               /* 1 = use cblas_hgemm for large matmuls */
     int use_int8_gemm;               /* 1 = use int8 dequant+sgemm for matmuls */
+    int use_int4_gemm;               /* 1 = use int4 weight-only dequant+sgemm */
 } ModelWeights;
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -194,6 +195,9 @@ typedef struct {
 
     /* INT8 dequantize tile scratch — reuses fp16_in memory when dtype==int8 */
     float *int8_tile;      /* [INT8_TILE_N * max(D, ff_dim)] for tiled dequant GEMM */
+
+    /* INT4 dequantize tile scratch — same purpose, used when dtype==int4 */
+    float *int4_tile;      /* [INT4_TILE_N * max(D, ff_dim)] for tiled dequant GEMM */
 } Workspace;
 
 typedef struct {
@@ -276,6 +280,9 @@ struct ConformerSTT {
     float      *tdt_enc_accum;   /* Accumulated encoder output [T, D] */
     int         tdt_enc_len;     /* Number of accumulated time steps */
     int         tdt_enc_cap;     /* Capacity in time steps */
+
+    /* Conmer mode: skip MHSA in encoder blocks (convolution-only) */
+    int    conmer_mode;
 
     /* External forward-pass hook (BNNS, Metal, etc.) */
     conformer_external_forward_fn external_forward;
@@ -478,12 +485,85 @@ static void linear_int8(float *out, const float *in, const int8_t *W_q,
     }
 }
 
-/* Dispatch: INT8 dequant > native hgemm > fp16 fallback > fp32 */
+/* INT4 weight-only dequantize-and-GEMM: per-channel symmetric.
+ * Weight layout: nibble-packed uint8 data [N, ceil(K/2)] followed by fp32 scales [N].
+ * Each byte holds 2 signed 4-bit weights: low nibble = even index, high nibble = odd.
+ * Dequantizes tiles to fp32, then runs sgemm. ~8x smaller than fp32.
+ * This is a MEMORY-REDUCTION path — fp32 remains the fastest compute path. */
+#define INT4_TILE_N 64
+static void linear_int4(float *out, const float *in, const int8_t *W_packed,
+                        const float *scales, const float *bias,
+                        int M, int K, int N, float *W_tile) {
+    int K_packed = (K + 1) / 2;  /* bytes per row */
+
+    for (int n0 = 0; n0 < N; n0 += INT4_TILE_N) {
+        int tile_n = (n0 + INT4_TILE_N <= N) ? INT4_TILE_N : (N - n0);
+
+        for (int r = 0; r < tile_n; r++) {
+            const uint8_t *row = (const uint8_t *)W_packed + (size_t)(n0 + r) * K_packed;
+            float *dst = W_tile + (size_t)r * K;
+            float s = scales[n0 + r];
+            int k = 0;
+
+            /* NEON vectorized dequantize: 8 packed bytes → 16 fp32 per iteration.
+             * Each byte yields 2 signed 4-bit values. */
+            for (; k + 15 < K; k += 16) {
+                uint8x8_t packed = vld1_u8(row + k / 2);
+                /* Extract low nibbles (even indices) and high nibbles (odd indices) */
+                int8x8_t lo_nib = vreinterpret_s8_u8(vand_u8(packed, vdup_n_u8(0x0F)));
+                int8x8_t hi_nib = vreinterpret_s8_u8(vshr_n_u8(packed, 4));
+                /* Sign-extend: if nibble >= 8, subtract 16 */
+                int8x8_t lo_sign = vsub_s8(lo_nib, vand_s8(
+                    vreinterpret_s8_u8(vcge_s8(lo_nib, vdup_n_s8(8))),
+                    vdup_n_s8(16)));
+                int8x8_t hi_sign = vsub_s8(hi_nib, vand_s8(
+                    vreinterpret_s8_u8(vcge_s8(hi_nib, vdup_n_s8(8))),
+                    vdup_n_s8(16)));
+                /* Interleave: lo[0],hi[0],lo[1],hi[1],... → 16 signed values */
+                int8x8x2_t zipped = vzip_s8(lo_sign, hi_sign);
+                int8x16_t vals = vcombine_s8(zipped.val[0], zipped.val[1]);
+                /* Widen to int16 then int32 then float32 */
+                int16x8_t w_lo16 = vmovl_s8(vget_low_s8(vals));
+                int16x8_t w_hi16 = vmovl_s8(vget_high_s8(vals));
+                float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w_lo16)));
+                float32x4_t f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w_lo16)));
+                float32x4_t f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(w_hi16)));
+                float32x4_t f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(w_hi16)));
+                float32x4_t sv = vdupq_n_f32(s);
+                vst1q_f32(dst + k,      vmulq_f32(f0, sv));
+                vst1q_f32(dst + k + 4,  vmulq_f32(f1, sv));
+                vst1q_f32(dst + k + 8,  vmulq_f32(f2, sv));
+                vst1q_f32(dst + k + 12, vmulq_f32(f3, sv));
+            }
+            /* Scalar tail */
+            for (; k < K; k++) {
+                uint8_t byte = row[k / 2];
+                int nibble = (k & 1) ? ((byte >> 4) & 0x0F) : (byte & 0x0F);
+                if (nibble >= 8) nibble -= 16;
+                dst[k] = (float)nibble * s;
+            }
+        }
+
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    M, tile_n, K,
+                    1.0f, in, K, W_tile, K,
+                    0.0f, out + n0, N);
+    }
+
+    if (bias) {
+        for (int m = 0; m < M; m++)
+            vDSP_vadd(out + m * N, 1, bias, 1, out + m * N, 1, N);
+    }
+}
+
+/* Dispatch: INT4 dequant > INT8 dequant > native hgemm > fp16 fallback > fp32 */
 static void linear_dispatch(float *out, const float *in, const float *W,
                             const __fp16 *W_h, const float *bias,
                             int M, int K, int N, Workspace *ws,
                             const int8_t *W_q, const float *scales) {
-    if (W_q && scales && ws->int8_tile) {
+    if (W_q && scales && ws->int4_tile) {
+        linear_int4(out, in, W_q, scales, bias, M, K, N, ws->int4_tile);
+    } else if (W_q && scales && ws->int8_tile) {
         linear_int8(out, in, W_q, scales, bias, M, K, N, ws->int8_tile);
     } else if (W_h) {
         if (ws->fp16_in && ws->fp16_out && get_cblas_hgemm() != NULL) {
@@ -1548,6 +1628,103 @@ static void conformer_block_forward_cached(float *x, const ConformerBlockWeights
     layer_norm(x, x, bw->final_norm_w, bw->final_norm_b, T, D);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Conmer block: Conformer with MHSA removed (convolution-only).
+ *
+ * Architecture: input → FFN½ → Conv → FFN½ → LayerNorm → output
+ *
+ * Based on Amazon Conmer (Interspeech 2023): for streaming short utterances,
+ * removing self-attention yields ~4% WER improvement and ~10% compute savings.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static void conformer_block_forward_conmer(float *x, const ConformerBlockWeights *bw,
+                                            Workspace *ws, int T, int D,
+                                            int ff_mult, int conv_kernel) {
+    int ff_dim = D * ff_mult;
+    float *tmp = ws->residual;
+
+    /* FFN1 half-step */
+    ffn_forward(tmp, x, bw->ff1_norm_w, bw->ff1_norm_b,
+                bw->ff1_up_w, bw->ff1_up_b,
+                bw->ff1_down_w, bw->ff1_down_b,
+                bw->ff1_up_w_h, bw->ff1_down_w_h,
+                bw->ff1_up_w_q, bw->ff1_up_w_qs,
+                bw->ff1_down_w_q, bw->ff1_down_w_qs,
+                ws, T, D, ff_dim);
+    vDSP_vadd(x, 1, tmp, 1, x, 1, T * D);
+
+    /* MHSA SKIPPED — Conmer mode: convolution provides sufficient local context */
+
+    /* Conv module (same as standard Conformer) */
+    conv_module_forward(tmp, x, bw, ws, T, D, conv_kernel);
+    vDSP_vadd(x, 1, tmp, 1, x, 1, T * D);
+
+    /* FFN2 half-step */
+    ffn_forward(tmp, x, bw->ff2_norm_w, bw->ff2_norm_b,
+                bw->ff2_up_w, bw->ff2_up_b,
+                bw->ff2_down_w, bw->ff2_down_b,
+                bw->ff2_up_w_h, bw->ff2_down_w_h,
+                bw->ff2_up_w_q, bw->ff2_up_w_qs,
+                bw->ff2_down_w_q, bw->ff2_down_w_qs,
+                ws, T, D, ff_dim);
+    vDSP_vadd(x, 1, tmp, 1, x, 1, T * D);
+
+    layer_norm(x, x, bw->final_norm_w, bw->final_norm_b, T, D);
+}
+
+/**
+ * Cache-aware Conmer block: conv with cached overlap, no MHSA.
+ */
+static void conformer_block_forward_cached_conmer(float *x, const ConformerBlockWeights *bw,
+                                                   Workspace *ws, int T, int D,
+                                                   int ff_mult, int conv_kernel,
+                                                   LayerCache *cache) {
+    int ff_dim = D * ff_mult;
+    float *tmp = ws->residual;
+
+    /* FFN1 half-step */
+    ffn_forward(tmp, x, bw->ff1_norm_w, bw->ff1_norm_b,
+                bw->ff1_up_w, bw->ff1_up_b,
+                bw->ff1_down_w, bw->ff1_down_b,
+                bw->ff1_up_w_h, bw->ff1_down_w_h,
+                bw->ff1_up_w_q, bw->ff1_up_w_qs,
+                bw->ff1_down_w_q, bw->ff1_down_w_qs,
+                ws, T, D, ff_dim);
+    vDSP_vadd(x, 1, tmp, 1, x, 1, T * D);
+
+    /* MHSA SKIPPED — Conmer mode */
+
+    /* Conv module with cached overlap */
+    float *conv_normed = ws->buf_b;
+    layer_norm(conv_normed, x, bw->conv_norm_w, bw->conv_norm_b, T, D);
+    linear_dispatch(ws->conv_mid, conv_normed, bw->conv_pw1_w, bw->conv_pw1_w_h,
+                    bw->conv_pw1_b, T, D, 2 * D, ws,
+                    bw->conv_pw1_w_q, bw->conv_pw1_w_qs);
+    glu(conv_normed, ws->conv_mid, T, D);
+    depthwise_conv1d_cached(tmp, conv_normed, bw->conv_dw_w, bw->conv_dw_b,
+                             T, D, conv_kernel, cache, ws);
+    batch_norm_ws(conv_normed, tmp, bw->conv_bn_gamma, bw->conv_bn_beta,
+                  bw->conv_bn_mean, bw->conv_bn_var, T, D,
+                  ws->bn_scale, ws->bn_shift);
+    silu_inplace_ws(conv_normed, T * D, ws->silu_tmp);
+    linear_dispatch(tmp, conv_normed, bw->conv_pw2_w, bw->conv_pw2_w_h,
+                    bw->conv_pw2_b, T, D, D, ws,
+                    bw->conv_pw2_w_q, bw->conv_pw2_w_qs);
+    vDSP_vadd(x, 1, tmp, 1, x, 1, T * D);
+
+    /* FFN2 half-step */
+    ffn_forward(tmp, x, bw->ff2_norm_w, bw->ff2_norm_b,
+                bw->ff2_up_w, bw->ff2_up_b,
+                bw->ff2_down_w, bw->ff2_down_b,
+                bw->ff2_up_w_h, bw->ff2_down_w_h,
+                bw->ff2_up_w_q, bw->ff2_up_w_qs,
+                bw->ff2_down_w_q, bw->ff2_down_w_qs,
+                ws, T, D, ff_dim);
+    vDSP_vadd(x, 1, tmp, 1, x, 1, T * D);
+
+    layer_norm(x, x, bw->final_norm_w, bw->final_norm_b, T, D);
+}
+
 static int full_forward(ConformerSTT *stt, const float *mel_in, int T) {
     int D         = (int)stt->header.d_model;
     int n_heads   = (int)stt->header.n_heads;
@@ -1600,6 +1777,8 @@ static int full_forward(ConformerSTT *stt, const float *mel_in, int T) {
     if (!use_rel_pe)
         add_sinusoidal_pe(ws->buf_a, T_sub, D);
 
+    int use_conmer = stt->conmer_mode;
+
     if (stt->cache_aware && stt->layer_caches) {
         for (int i = 0; i < w->n_blocks; i++) {
             /* Prefetch next layer's weights into L2 while computing this layer */
@@ -1610,9 +1789,15 @@ static int full_forward(ConformerSTT *stt, const float *mel_in, int T) {
                         __builtin_prefetch(next_w + p, 0, 1);
                 }
             }
-            conformer_block_forward_cached(ws->buf_a, &w->blocks[i],
-                                            ws, T_sub, D, n_heads, ff_mult, conv_kern,
-                                            use_rel_pe, &stt->layer_caches[i]);
+            if (use_conmer) {
+                conformer_block_forward_cached_conmer(ws->buf_a, &w->blocks[i],
+                                                      ws, T_sub, D, ff_mult, conv_kern,
+                                                      &stt->layer_caches[i]);
+            } else {
+                conformer_block_forward_cached(ws->buf_a, &w->blocks[i],
+                                                ws, T_sub, D, n_heads, ff_mult, conv_kern,
+                                                use_rel_pe, &stt->layer_caches[i]);
+            }
         }
     } else {
         for (int i = 0; i < w->n_blocks; i++) {
@@ -1623,9 +1808,14 @@ static int full_forward(ConformerSTT *stt, const float *mel_in, int T) {
                         __builtin_prefetch(next_w + p, 0, 1);
                 }
             }
-            conformer_block_forward(ws->buf_a, &w->blocks[i],
-                                    ws, T_sub, D, n_heads, ff_mult, conv_kern,
-                                    use_rel_pe);
+            if (use_conmer) {
+                conformer_block_forward_conmer(ws->buf_a, &w->blocks[i],
+                                               ws, T_sub, D, ff_mult, conv_kern);
+            } else {
+                conformer_block_forward(ws->buf_a, &w->blocks[i],
+                                        ws, T_sub, D, n_heads, ff_mult, conv_kern,
+                                        use_rel_pe);
+            }
         }
     }
 
@@ -1776,6 +1966,41 @@ static const float *read_weight_int8(const char **cursor, float **arena,
     return dst;
 }
 
+/* INT4 weight reading: per-channel symmetric, nibble-packed.
+ * Data layout: uint8_t[N * ceil(K/2)] (packed 2 weights/byte) followed by float scales[N].
+ * Low nibble = even index weight, high nibble = odd index weight.
+ * Dequantizes into the fp32 arena for use with cblas_sgemm. */
+static const float *read_weight_int4(const char **cursor, float **arena,
+                                      int count, int n_rows, const int8_t **q_out,
+                                      const float **scales_out) {
+    int K = count / n_rows;
+    int K_packed = (K + 1) / 2;
+    size_t packed_bytes = (size_t)n_rows * K_packed;
+
+    const uint8_t *packed = (const uint8_t *)*cursor;
+    /* Store raw packed pointer via int8_t* cast (reuse existing pointer type) */
+    if (q_out) *q_out = (const int8_t *)packed;
+    *cursor += packed_bytes;
+
+    const float *sc = (const float *)*cursor;
+    *cursor += (size_t)n_rows * sizeof(float);
+    if (scales_out) *scales_out = sc;
+
+    float *dst = *arena;
+    for (int r = 0; r < n_rows; r++) {
+        float s = sc[r];
+        const uint8_t *row = packed + (size_t)r * K_packed;
+        for (int k = 0; k < K; k++) {
+            uint8_t byte = row[k / 2];
+            int nibble = (k & 1) ? ((byte >> 4) & 0x0F) : (byte & 0x0F);
+            if (nibble >= 8) nibble -= 16;  /* sign-extend 4-bit */
+            dst[r * K + k] = (float)nibble * s;
+        }
+    }
+    *arena += count;
+    return dst;
+}
+
 /* Read a bias/norm weight as fp32 regardless of model dtype (biases are never quantized) */
 static const float *read_weight_always_fp32(const char **cursor, int count) {
     const float *ptr = (const float *)*cursor;
@@ -1783,20 +2008,28 @@ static const float *read_weight_always_fp32(const char **cursor, int count) {
     return ptr;
 }
 
-/* Unified read_weight: dispatches to fp32, fp16, or int8 based on dtype flag. */
+/* Unified read_weight: dispatches to fp32, fp16, int8, or int4 based on dtype flag. */
 typedef struct {
     const char *cursor;
     float *arena;
     int is_fp16;
     int is_int8;
-    int current_n_rows;   /* For INT8: number of output rows (set before calling read_weight for matrices) */
+    int is_int4;
+    int current_n_rows;   /* For INT8/INT4: number of output rows (set before calling read_weight for matrices) */
     const __fp16 *last_fp16;  /* Raw fp16 address of last read (for GEMM path) */
-    const int8_t *last_int8;  /* Raw INT8 quantized weights of last read */
-    const float  *last_int8_scales; /* Per-channel scales of last INT8 read */
+    const int8_t *last_int8;  /* Raw INT8/INT4 quantized weights of last read */
+    const float  *last_int8_scales; /* Per-channel scales of last INT8/INT4 read */
 } WeightReader;
 
 static const float *read_weight(WeightReader *r, int count) {
-    if (r->is_int8 && r->current_n_rows > 0) {
+    if (r->is_int4 && r->current_n_rows > 0) {
+        r->last_fp16 = NULL;
+        const float *w = read_weight_int4(&r->cursor, &r->arena, count,
+                                           r->current_n_rows, &r->last_int8,
+                                           &r->last_int8_scales);
+        r->current_n_rows = 0;
+        return w;
+    } else if (r->is_int8 && r->current_n_rows > 0) {
         r->last_fp16 = NULL;
         const float *w = read_weight_int8(&r->cursor, &r->arena, count,
                                            r->current_n_rows, &r->last_int8,
@@ -1819,7 +2052,7 @@ static const float *read_weight(WeightReader *r, int count) {
 /* For INT8, biases and norms are stored as fp32. This macro reads them as fp32
  * regardless of dtype, then advances the reader cursor. */
 static const float *read_bias(WeightReader *r, int count) {
-    if (r->is_int8) {
+    if (r->is_int8 || r->is_int4) {
         return read_weight_always_fp32(&r->cursor, count);
     }
     return read_weight(r, count);
@@ -2046,22 +2279,24 @@ static int load_weights(ConformerSTT *stt) {
     int has_rel_pe = (h->flags & CSTT_FLAG_REL_PE) ? 1 : 0;
     int is_fp16 = (h->dtype == 1) ? 1 : 0;
     int is_int8 = (h->dtype == 2) ? 1 : 0;
+    int is_int4 = (h->dtype == 3) ? 1 : 0;
 
     WeightReader reader;
     reader.cursor = (const char *)stt->mmap_base + sizeof(CSTTHeader);
     reader.is_fp16 = is_fp16;
     reader.is_int8 = is_int8;
+    reader.is_int4 = is_int4;
     reader.arena = NULL;
     reader.current_n_rows = 0;
     reader.last_int8 = NULL;
     reader.last_int8_scales = NULL;
 
-    if (is_fp16 || is_int8) {
+    if (is_fp16 || is_int8 || is_int4) {
         size_t total = estimate_total_weights(h);
         stt->fp16_arena = (float *)malloc(total * sizeof(float));
         if (!stt->fp16_arena) return -1;
         reader.arena = stt->fp16_arena;
-        const char *dtype_label = is_int8 ? "int8" : "fp16";
+        const char *dtype_label = is_int4 ? "int4" : (is_int8 ? "int8" : "fp16");
         fprintf(stderr, "[conformer_stt] %s mode: dequantizing to fp32 (%.1f MB arena)\n",
                 dtype_label, (float)(total * 4) / (1024 * 1024));
     }
@@ -2089,6 +2324,7 @@ static int load_weights(ConformerSTT *stt) {
     w->ctc_b = read_weight(&reader, vocab);
     w->use_fp16_gemm = is_fp16;
     w->use_int8_gemm = is_int8;
+    w->use_int4_gemm = is_int4;
 
     /* TDT transducer decoder weights */
     if (h->flags & CSTT_FLAG_TDT) {
@@ -2274,12 +2510,22 @@ static int workspace_alloc(Workspace *ws, const CSTTHeader *h) {
          * ff_dim (for FFN down projection) or D (for attention/CTC). */
         size_t max_k = (size_t)(ff_dim > D ? ff_dim : D);
         ws->int8_tile = (float *)calloc((size_t)INT8_TILE_N * max_k, sizeof(float));
+        ws->int4_tile = NULL;
+        ws->fp16_in = NULL;
+        ws->fp16_out = NULL;
+    } else if (h->dtype == 3) {
+        /* INT4 weight-only mode: allocate tile scratch for nibble dequantization.
+         * Same tile strategy as INT8 but unpacking 2 weights per byte. */
+        size_t max_k = (size_t)(ff_dim > D ? ff_dim : D);
+        ws->int4_tile = (float *)calloc((size_t)INT4_TILE_N * max_k, sizeof(float));
+        ws->int8_tile = NULL;
         ws->fp16_in = NULL;
         ws->fp16_out = NULL;
     } else {
         ws->fp16_in = NULL;
         ws->fp16_out = NULL;
         ws->int8_tile = NULL;
+        ws->int4_tile = NULL;
     }
 
     if (!ws->buf_a || !ws->buf_b || !ws->residual || !ws->qkv ||
@@ -2291,7 +2537,8 @@ static int workspace_alloc(Workspace *ws, const CSTTHeader *h) {
         !ws->bn_scale || !ws->bn_shift || !ws->lsp_tmp || !ws->mel_norm_buf ||
         ((h->flags & CSTT_FLAG_REL_PE) && (!ws->rel_pe || !ws->rel_pe_proj)) ||
         (h->dtype == 1 && (!ws->fp16_in || !ws->fp16_out)) ||
-        (h->dtype == 2 && !ws->int8_tile))
+        (h->dtype == 2 && !ws->int8_tile) ||
+        (h->dtype == 3 && !ws->int4_tile))
         return -1;
 
     return 0;
@@ -2327,6 +2574,7 @@ static void workspace_free(Workspace *ws) {
     free(ws->fp16_in);
     free(ws->fp16_out);
     free(ws->int8_tile);
+    free(ws->int4_tile);
     memset(ws, 0, sizeof(Workspace));
 }
 
@@ -2398,7 +2646,10 @@ ConformerSTT *conformer_stt_create(const char *model_path) {
         goto fail;
     }
 
-    if (stt->weights.use_int8_gemm) {
+    if (stt->weights.use_int4_gemm) {
+        fprintf(stderr, "[conformer_stt] INT4 weight-only GEMM dispatch active "
+                "(nibble-packed, per-channel dequant, tile=%d)\n", INT4_TILE_N);
+    } else if (stt->weights.use_int8_gemm) {
         fprintf(stderr, "[conformer_stt] INT8 GEMM dispatch active "
                 "(per-channel symmetric, tile=%d)\n", INT8_TILE_N);
     } else if (stt->weights.use_fp16_gemm && get_cblas_hgemm()) {
@@ -3025,4 +3276,17 @@ float *conformer_stt_get_logits_buf(ConformerSTT *stt, int *out_vocab) {
     if (!stt) return NULL;
     if (out_vocab) *out_vocab = (int)stt->header.vocab_size;
     return stt->work.logits;
+}
+
+void conformer_stt_set_conmer_mode(ConformerSTT *stt, int enable) {
+    if (!stt) return;
+    stt->conmer_mode = enable ? 1 : 0;
+    if (enable) {
+        fprintf(stderr, "[conformer_stt] Conmer mode ENABLED — MHSA skipped in all blocks\n");
+    }
+}
+
+int conformer_stt_is_conmer(const ConformerSTT *stt) {
+    if (!stt) return 0;
+    return stt->conmer_mode;
 }

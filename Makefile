@@ -199,9 +199,10 @@ $(BUILD)/libmetal_loader.dylib: src/metal_loader.c src/metal_loader.h | $(BUILD)
 	$(CC) $(CFLAGS) -shared -fPIC -x objective-c -framework Metal -framework Foundation \
 	  -install_name @rpath/libmetal_loader.dylib -o $@ src/metal_loader.c
 
-$(BUILD)/libmetal_dispatch.dylib: src/metal_dispatch.c src/metal_dispatch.h $(BUILD)/libmetal_loader.dylib | $(BUILD)
+$(BUILD)/libmetal_dispatch.dylib: src/metal_dispatch.c src/metal_dispatch.h \
+                                 $(BUILD)/libmetal_loader.dylib $(BUILD)/libapple_perf.dylib | $(BUILD)
 	$(CC) $(CFLAGS) -shared -fPIC -x objective-c -framework Metal -framework Foundation -framework Accelerate \
-	  -L$(BUILD) -lmetal_loader -Wl,-rpath,@loader_path \
+	  -L$(BUILD) -lmetal_loader -lapple_perf -Wl,-rpath,@loader_path \
 	  -install_name @rpath/libmetal_dispatch.dylib -o $@ src/metal_dispatch.c
 
 $(BUILD)/libconformer_stt.dylib: src/conformer_stt.c src/conformer_stt.h \
@@ -907,11 +908,46 @@ bench-audit: tests/bench_audit.c \
 	  -o $(BUILD)/bench-audit tests/bench_audit.c
 	./$(BUILD)/bench-audit
 
-.PHONY: test test-eou test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-roundtrip test-llm-prosody test-websocket test-optimizations test-sonata test-sonata-quality test-sonata-stt test-sonata-v3 test-beam-search bench-sonata bench-quality bench-live bench-industry test-apple-perf test-quality-improvements test-real-models test-native-vad bench-vad test-speech-detector test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-sonata-storm test-audio-emotion test-sonata-flow-ffi test-sonata-lm-ffi test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-sonata-refiner test-tdt-decoder test-web-remote test-opus-codec test-audio-converter test-spatial-audio test-metal-loader test-metal-dispatch test-bnns-convnext test-coverage-gaps test-correctness-audit test-integration-audit test-security-audit test-assumptions bench-audit bench
+# ─── Research Implementation Tests ────────────────────────────────────────
+
+test-research-stt: tests/test_research_stt.c \
+                   $(BUILD)/libconformer_stt.dylib $(BUILD)/libmel_spectrogram.dylib | $(BUILD)
+	$(CC) $(CFLAGS) -DACCELERATE_NEW_LAPACK -Isrc -framework Accelerate \
+	  -L$(BUILD) -lconformer_stt -lmel_spectrogram \
+	  -lctc_beam_decoder -ltdt_decoder \
+	  -Wl,-rpath,$(CURDIR)/$(BUILD) -lm \
+	  -o $(BUILD)/test-research-stt tests/test_research_stt.c
+	./$(BUILD)/test-research-stt
+
+test-research-eou: tests/test_research_eou.c $(BUILD)/libfused_eou.dylib | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc \
+	  -L$(BUILD) -lfused_eou \
+	  -Wl,-rpath,$(CURDIR)/$(BUILD) -lm \
+	  -o $(BUILD)/test-research-eou tests/test_research_eou.c
+	./$(BUILD)/test-research-eou
+
+test-research-istft: tests/test_research_istft.c \
+                     $(BUILD)/libsonata_istft.dylib | $(BUILD)
+	$(CC) $(CFLAGS) -DACCELERATE_NEW_LAPACK -Isrc -framework Accelerate \
+	  -L$(BUILD) -lsonata_istft \
+	  -Wl,-rpath,$(CURDIR)/$(BUILD) -lm \
+	  -o $(BUILD)/test-research-istft tests/test_research_istft.c
+	./$(BUILD)/test-research-istft
+
+test-research-metal: tests/test_research_metal.c \
+                     $(BUILD)/libmetal_dispatch.dylib $(BUILD)/libapple_perf.dylib | $(BUILD)
+	$(CC) $(CFLAGS) -DACCELERATE_NEW_LAPACK -Isrc \
+	  -framework Metal -framework Foundation -framework Accelerate \
+	  -L$(BUILD) -lmetal_dispatch -lapple_perf \
+	  -Wl,-rpath,$(CURDIR)/$(BUILD) -lm \
+	  -o $(BUILD)/test-research-metal tests/test_research_metal.c
+	./$(BUILD)/test-research-metal
+
+.PHONY: test test-eou test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-roundtrip test-llm-prosody test-websocket test-optimizations test-sonata test-sonata-quality test-sonata-stt test-sonata-v3 test-beam-search bench-sonata bench-quality bench-live bench-industry test-apple-perf test-quality-improvements test-real-models test-native-vad bench-vad test-speech-detector test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-sonata-storm test-audio-emotion test-sonata-flow-ffi test-sonata-lm-ffi test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-sonata-refiner test-tdt-decoder test-web-remote test-opus-codec test-audio-converter test-spatial-audio test-metal-loader test-metal-dispatch test-bnns-convnext test-coverage-gaps test-correctness-audit test-integration-audit test-security-audit test-assumptions bench-audit bench test-research-stt test-research-eou test-research-istft test-research-metal
 
 bench: libs sonata
 	@bash scripts/benchmark.sh --all
-test: bench-quality test-quality test-eou test-roundtrip test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-llm-prosody test-optimizations test-beam-search test-sonata test-sonata-v3 test-sonata-quality test-sonata-stt test-real-models test-websocket test-native-vad test-speech-detector test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-quality-improvements test-sonata-storm test-audio-emotion test-sonata-flow-ffi test-sonata-lm-ffi test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-sonata-refiner test-tdt-decoder test-web-remote test-opus-codec test-audio-converter test-spatial-audio test-metal-loader test-metal-dispatch test-bnns-convnext test-coverage-gaps test-integration-audit test-correctness-audit test-security-audit test-assumptions
+test: bench-quality test-quality test-eou test-roundtrip test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-llm-prosody test-optimizations test-beam-search test-sonata test-sonata-v3 test-sonata-quality test-sonata-stt test-real-models test-websocket test-native-vad test-speech-detector test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-quality-improvements test-sonata-storm test-audio-emotion test-sonata-flow-ffi test-sonata-lm-ffi test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-sonata-refiner test-tdt-decoder test-web-remote test-opus-codec test-audio-converter test-spatial-audio test-metal-loader test-metal-dispatch test-bnns-convnext test-coverage-gaps test-integration-audit test-correctness-audit test-security-audit test-assumptions test-research-stt test-research-eou test-research-istft test-research-metal
 	@echo ""
 	@echo "═══ Quality Benchmark Self-Tests ═══"
 	./$(BUILD)/bench-quality

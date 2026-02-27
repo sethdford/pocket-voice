@@ -47,6 +47,10 @@ struct SonataISTFT {
 
     /* Overlap-add buffer (n_fft samples) */
     float *overlap_buf;
+
+    /* Ring buffer state for streaming mode (MS-Wavehax caching) */
+    int streaming;      /* nonzero = ring buffer mode */
+    int ring_head;      /* read/write position in overlap_buf as ring */
 };
 
 SonataISTFT *sonata_istft_create(int n_fft, int hop_length) {
@@ -107,6 +111,14 @@ void sonata_istft_destroy(SonataISTFT *dec) {
 void sonata_istft_reset(SonataISTFT *dec) {
     if (!dec) return;
     memset(dec->overlap_buf, 0, dec->n_fft * sizeof(float));
+    dec->ring_head = 0;
+}
+
+void sonata_istft_set_streaming(SonataISTFT *dec, int enable) {
+    if (!dec) return;
+    dec->streaming = enable ? 1 : 0;
+    /* Reset state when switching modes to avoid stale overlap data */
+    sonata_istft_reset(dec);
 }
 
 int sonata_istft_decode_frame(
@@ -165,7 +177,52 @@ int sonata_istft_decode_frame(
     /* Apply Hann window */
     vDSP_vmul(dec->frame_buf, 1, dec->window, 1, dec->frame_buf, 1, n_fft);
 
-    /* Overlap-add */
+    if (dec->streaming) {
+        /*
+         * Ring buffer overlap-add (MS-Wavehax caching).
+         * Uses overlap_buf as a circular buffer indexed by ring_head.
+         * Eliminates the memmove on every frame — pure index arithmetic.
+         */
+        const int hop = dec->hop_length;
+        int head = dec->ring_head;
+        int first = n_fft - head; /* samples before wrap */
+
+        /* Add frame_buf into ring buffer at [head, head+n_fft) mod n_fft */
+        if (first >= n_fft) {
+            /* head == 0: no wrap */
+            vDSP_vadd(dec->overlap_buf, 1, dec->frame_buf, 1,
+                      dec->overlap_buf, 1, n_fft);
+        } else {
+            /* Two-part add: [head..n_fft) then [0..head) */
+            vDSP_vadd(dec->overlap_buf + head, 1, dec->frame_buf, 1,
+                      dec->overlap_buf + head, 1, first);
+            vDSP_vadd(dec->overlap_buf, 1, dec->frame_buf + first, 1,
+                      dec->overlap_buf, 1, n_fft - first);
+        }
+
+        /* Copy hop_length samples from ring_head to output */
+        int out_first = n_fft - head;
+        if (out_first >= hop) {
+            memcpy(out_audio, dec->overlap_buf + head, hop * sizeof(float));
+            /* Zero consumed samples */
+            memset(dec->overlap_buf + head, 0, hop * sizeof(float));
+        } else {
+            memcpy(out_audio, dec->overlap_buf + head,
+                   out_first * sizeof(float));
+            memcpy(out_audio + out_first, dec->overlap_buf,
+                   (hop - out_first) * sizeof(float));
+            /* Zero consumed samples (two parts) */
+            memset(dec->overlap_buf + head, 0, out_first * sizeof(float));
+            memset(dec->overlap_buf, 0, (hop - out_first) * sizeof(float));
+        }
+
+        /* Advance ring head */
+        dec->ring_head = (head + hop) % n_fft;
+
+        return hop;
+    }
+
+    /* Non-streaming: linear overlap-add with memmove */
     vDSP_vadd(dec->overlap_buf, 1, dec->frame_buf, 1,
               dec->overlap_buf, 1, n_fft);
 

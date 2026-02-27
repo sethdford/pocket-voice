@@ -10,20 +10,33 @@
 
 #include "metal_dispatch.h"
 #include "metal_loader.h"
+#include "apple_perf.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <Accelerate/Accelerate.h>
 #include <arm_neon.h>
+#include <mach/mach_time.h>
 
 /* Singleton state */
 static MetalKernels *g_metal = NULL;
 static int g_initialized = 0;
 
+/* Chip-aware dispatch threshold (min dimension for GPU path) */
+static int g_threshold = 0;        /* 0 = not yet configured */
+static int g_threshold_set = 0;    /* 1 = user override via set_threshold */
+static int g_has_tensorops = -1;   /* -1 = not checked, 0 = no, 1 = yes */
+
 int metal_dispatch_init(const char *metallib_path) {
     if (g_initialized) return metal_dispatch_available();
     g_initialized = 1;
+
+    /* Auto-configure threshold if not manually set */
+    if (!g_threshold_set) {
+        metal_dispatch_auto_threshold();
+    }
 
     if (!metallib_path) {
         fprintf(stderr, "[metal_dispatch] No metallib path provided — CPU only\n");
@@ -34,7 +47,9 @@ int metal_dispatch_init(const char *metallib_path) {
     if (metal_kernels_available(g_metal)) {
         const char *names[16];
         int n = metal_kernels_list(g_metal, names, 16);
-        fprintf(stderr, "[metal_dispatch] GPU dispatch ready — %d kernel(s)\n", n);
+        fprintf(stderr, "[metal_dispatch] GPU dispatch ready — %d kernel(s), "
+                "threshold=%d (%s)\n", n, g_threshold,
+                ap_chip_generation_name(ap_chip_generation()));
         return 1;
     }
 
@@ -99,7 +114,19 @@ int metal_dispatch_gemm_alpha(const float *A, const float *B, float *C,
     size_t b_elems = (size_t)N * K;
     size_t c_elems = (size_t)M * N;
 
-    /* For small matrices, CPU is faster due to conversion overhead */
+    /* Chip-aware threshold: use CPU for matrices below the threshold.
+     * On M1-M4 the audit proved Metal adds +3228% to +568006% overhead
+     * for conformer-sized matrices. On M5+ neural accelerators make
+     * small GPU dispatch viable. */
+    int min_dim = M < N ? M : N;
+    if (K < min_dim) min_dim = K;
+    int threshold = g_threshold > 0 ? g_threshold : 1024; /* safe default */
+    if (min_dim < threshold) {
+        cpu_gemm(A, B, C, M, N, K, alpha);
+        return 0;
+    }
+
+    /* Legacy small-matrix guard (catches edge cases the threshold misses) */
     if (a_elems + b_elems + c_elems < 4096) {
         cpu_gemm(A, B, C, M, N, K, alpha);
         return 0;
@@ -178,10 +205,153 @@ int metal_dispatch_layer_norm(const void *input, void *output,
     return metal_layer_norm(g_metal, input, output, gamma, beta, N, D, eps);
 }
 
+/* ── Chip-Aware Threshold Configuration ────────────────────────────────── */
+
+void metal_dispatch_set_threshold(int min_dim) {
+    g_threshold = min_dim;
+    g_threshold_set = 1;
+    fprintf(stderr, "[metal_dispatch] Manual threshold override: %d\n", min_dim);
+}
+
+int metal_dispatch_get_threshold(void) {
+    if (g_threshold == 0 && !g_threshold_set) {
+        metal_dispatch_auto_threshold();
+    }
+    return g_threshold;
+}
+
+void metal_dispatch_auto_threshold(void) {
+    APChipGeneration gen = ap_chip_generation();
+    switch (gen) {
+        case AP_CHIP_M5:
+            /* M5+ neural accelerators: GPU viable for small matrices */
+            g_threshold = 128;
+            break;
+        case AP_CHIP_M1:
+        case AP_CHIP_M2:
+        case AP_CHIP_M3:
+        case AP_CHIP_M4:
+            /* Audit-proven: Metal adds massive overhead for small matrices */
+            g_threshold = 1024;
+            break;
+        default:
+            /* Unknown chip — conservative, prefer CPU */
+            g_threshold = 2048;
+            break;
+    }
+    fprintf(stderr, "[metal_dispatch] Auto threshold for %s: %d\n",
+            ap_chip_generation_name(gen), g_threshold);
+}
+
+int metal_dispatch_has_tensorops(void) {
+    if (g_has_tensorops >= 0) return g_has_tensorops;
+
+    /* Metal 4 TensorOps require M5+ hardware.
+     * Runtime check: Metal 4 GPU family support is only available on M5+.
+     * We check the chip generation first as a fast path — the actual
+     * MTLDevice.supportsFamily check requires Objective-C and is deferred
+     * to metal_loader.c if needed. */
+    if (!ap_has_neural_accel()) {
+        g_has_tensorops = 0;
+        return 0;
+    }
+
+    /* On M5+, Metal 4 TensorOps are available if Metal GPU is initialized.
+     * The actual MTLGPUFamilyMetal4 check is done in metal_loader at init time.
+     * For now, we gate on chip generation — Metal 4 launched with M5. */
+    g_has_tensorops = metal_dispatch_available() ? 1 : 0;
+    if (g_has_tensorops) {
+        fprintf(stderr, "[metal_dispatch] Metal 4 TensorOps available — "
+                "using neural accelerator path\n");
+    }
+    return g_has_tensorops;
+}
+
+int metal_dispatch_benchmark(int M, int K, int N) {
+    if (!metal_dispatch_available()) return 0; /* CPU only */
+
+    const int WARMUP = 3;
+    const int ITERS  = 10;
+    size_t a_sz = (size_t)M * K;
+    size_t b_sz = (size_t)N * K;
+    size_t c_sz = (size_t)M * N;
+
+    float *A = (float *)calloc(a_sz, sizeof(float));
+    float *B = (float *)calloc(b_sz, sizeof(float));
+    float *C = (float *)calloc(c_sz, sizeof(float));
+
+    if (!A || !B || !C) {
+        free(A); free(B); free(C);
+        return -1;
+    }
+
+    /* Fill with small random-ish values */
+    for (size_t i = 0; i < a_sz; i++) A[i] = 0.01f * (float)(i % 97);
+    for (size_t i = 0; i < b_sz; i++) B[i] = 0.01f * (float)(i % 89);
+
+    mach_timebase_info_data_t tbi;
+    mach_timebase_info(&tbi);
+
+    /* Benchmark CPU */
+    for (int i = 0; i < WARMUP; i++) cpu_gemm(A, B, C, M, N, K, 1.0f);
+    uint64_t cpu_start = mach_absolute_time();
+    for (int i = 0; i < ITERS; i++) cpu_gemm(A, B, C, M, N, K, 1.0f);
+    uint64_t cpu_end = mach_absolute_time();
+    double cpu_ns = (double)(cpu_end - cpu_start) * tbi.numer / tbi.denom;
+
+    /* Benchmark GPU (use internal Metal path directly, bypass threshold) */
+    /* We need to allocate fp16 buffers and do conversions like the real path */
+    size_t page = 16384;
+    size_t a_bytes = a_sz * sizeof(__fp16);
+    size_t b_bytes = b_sz * sizeof(__fp16);
+    size_t c_bytes = c_sz * sizeof(__fp16);
+    size_t a_alloc = (a_bytes + page - 1) & ~(page - 1);
+    size_t b_alloc = (b_bytes + page - 1) & ~(page - 1);
+    size_t c_alloc = (c_bytes + page - 1) & ~(page - 1);
+
+    void *a16 = NULL, *b16 = NULL, *c16 = NULL;
+    posix_memalign(&a16, page, a_alloc);
+    posix_memalign(&b16, page, b_alloc);
+    posix_memalign(&c16, page, c_alloc);
+
+    if (!a16 || !b16 || !c16) {
+        free(A); free(B); free(C);
+        free(a16); free(b16); free(c16);
+        return -1;
+    }
+
+    memset(a16, 0, a_alloc);
+    memset(b16, 0, b_alloc);
+    memset(c16, 0, c_alloc);
+    f32_to_f16(A, (__fp16 *)a16, (int)a_sz);
+    f32_to_f16(B, (__fp16 *)b16, (int)b_sz);
+
+    for (int i = 0; i < WARMUP; i++)
+        metal_gemm_f16(g_metal, a16, b16, c16, (uint32_t)M, (uint32_t)N, (uint32_t)K, 1.0f);
+    uint64_t gpu_start = mach_absolute_time();
+    for (int i = 0; i < ITERS; i++)
+        metal_gemm_f16(g_metal, a16, b16, c16, (uint32_t)M, (uint32_t)N, (uint32_t)K, 1.0f);
+    uint64_t gpu_end = mach_absolute_time();
+    double gpu_ns = (double)(gpu_end - gpu_start) * tbi.numer / tbi.denom;
+
+    free(A); free(B); free(C);
+    free(a16); free(b16); free(c16);
+
+    double cpu_avg = cpu_ns / ITERS;
+    double gpu_avg = gpu_ns / ITERS;
+
+    fprintf(stderr, "[metal_dispatch] Benchmark %dx%dx%d: CPU=%.1fus GPU=%.1fus → %s\n",
+            M, K, N, cpu_avg / 1000.0, gpu_avg / 1000.0,
+            cpu_avg <= gpu_avg ? "CPU wins" : "GPU wins");
+
+    return (gpu_avg < cpu_avg) ? 1 : 0;
+}
+
 void metal_dispatch_cleanup(void) {
     if (g_metal) {
         metal_kernels_destroy(g_metal);
         g_metal = NULL;
     }
     g_initialized = 0;
+    g_has_tensorops = -1;
 }

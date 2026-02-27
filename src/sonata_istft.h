@@ -28,6 +28,17 @@ void sonata_istft_destroy(SonataISTFT *dec);
 void sonata_istft_reset(SonataISTFT *dec);
 
 /*
+ * Enable streaming mode with ring buffer caching.
+ * In streaming mode, the overlap-add accumulator uses a ring buffer
+ * (zero memmove) instead of linear shift — ~50% less memory bandwidth
+ * for typical hop/window ratios (MS-Wavehax, Interspeech 2025).
+ *
+ * Both modes produce bit-identical output.
+ * enable: nonzero to enable, 0 to disable.
+ */
+void sonata_istft_set_streaming(SonataISTFT *dec, int enable);
+
+/*
  * Decode one frame: magnitude + phase → audio samples.
  *
  * magnitude: n_fft/2+1 positive values (linear scale)
