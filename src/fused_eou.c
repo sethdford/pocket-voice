@@ -97,18 +97,23 @@ static float compute_prosody_prob(const FusedEOU *eou) {
     for (int i = 0; i < n; i++) {
         int idx = (eou->prosody_write - n + i + PROSODY_BUF_SIZE)
                 % PROSODY_BUF_SIZE;
+        float p = eou->pitch_buf[idx];
+        float e = eou->energy_buf[idx];
+        /* Guard against NaN/Inf propagation from upstream */
+        if (isnan(p) || isinf(p)) p = 0.0f;
+        if (isnan(e) || isinf(e)) e = 0.0f;
         if (i < half) {
-            if (eou->pitch_buf[idx] > 0.0f) {
-                pitch_first += eou->pitch_buf[idx];
+            if (p > 0.0f) {
+                pitch_first += p;
                 voiced_first++;
             }
-            energy_first += eou->energy_buf[idx];
+            energy_first += e;
         } else {
-            if (eou->pitch_buf[idx] > 0.0f) {
-                pitch_second += eou->pitch_buf[idx];
+            if (p > 0.0f) {
+                pitch_second += p;
                 voiced_second++;
             }
-            energy_second += eou->energy_buf[idx];
+            energy_second += e;
         }
     }
 
@@ -120,7 +125,9 @@ static float compute_prosody_prob(const FusedEOU *eou) {
         if (avg1 > 1.0f) {
             float ratio = avg2 / avg1;
             /* Sigmoid centered at 1.0: ratio < 1 (falling) → high score */
-            pitch_score = 1.0f / (1.0f + expf((ratio - 1.0f) * 10.0f));
+            float exponent = (ratio - 1.0f) * 10.0f;
+            if (exponent > 88.0f) exponent = 88.0f; /* Prevent expf overflow */
+            pitch_score = 1.0f / (1.0f + expf(exponent));
         }
     }
 
@@ -128,7 +135,10 @@ static float compute_prosody_prob(const FusedEOU *eou) {
     float e1 = energy_first / (float)(half > 0 ? half : 1);
     float e2 = energy_second / (float)((n - half) > 0 ? (n - half) : 1);
     float drop = e1 - e2; /* Positive = energy dropping (in dB) */
-    float energy_score = 1.0f / (1.0f + expf(-drop * 0.3f));
+    float clamped_drop = drop * 0.3f;
+    if (clamped_drop > 88.0f) clamped_drop = 88.0f;
+    if (clamped_drop < -88.0f) clamped_drop = -88.0f;
+    float energy_score = 1.0f / (1.0f + expf(-clamped_drop));
 
     /* Combine: 60% pitch, 40% energy (pitch is primary turn-taking cue) */
     return 0.6f * pitch_score + 0.4f * energy_score;
@@ -205,22 +215,28 @@ EOUResult fused_eou_process(FusedEOU *eou, EOUSignals sig) {
             eou->frames_since_speech = 100000;
     }
 
+    /* ── Context-adjusted threshold ───────────────────── */
+    float ctx = eou->context_adj;
+
     /* ── Early Exit: single-signal high-confidence ────── */
+    /* Solo thresholds are offset by context_adj so that conversational
+     * context (e.g. trailing conjunction → ctx > 0) makes solo triggers
+     * harder, and questions (ctx < 0) make them easier. */
     int src = 0;
 
-    if (sig.energy_signal >= eou->solo_energy && eou->speech_detected) {
+    if (sig.energy_signal >= eou->solo_energy + ctx && eou->speech_detected) {
         src |= EOU_SRC_ENERGY;
     }
-    if (sig.mimi_eot_prob >= eou->solo_mimi && eou->speech_detected) {
+    if (sig.mimi_eot_prob >= eou->solo_mimi + ctx && eou->speech_detected) {
         src |= EOU_SRC_MIMI;
     }
-    if (sig.stt_eou_prob >= eou->solo_stt && eou->speech_detected) {
+    if (sig.stt_eou_prob >= eou->solo_stt + ctx && eou->speech_detected) {
         src |= EOU_SRC_STT;
     }
 
     /* ── Prosody signal (4th signal) ─────────────────── */
     eou->prosody_prob = compute_prosody_prob(eou);
-    if (eou->prosody_prob >= eou->solo_prosody && eou->speech_detected &&
+    if (eou->prosody_prob >= eou->solo_prosody + ctx && eou->speech_detected &&
         eou->w_prosody > 0.0f) {
         src |= EOU_SRC_PROSODY;
     }
@@ -250,8 +266,8 @@ EOUResult fused_eou_process(FusedEOU *eou, EOUSignals sig) {
         should_trigger = 1;
     }
 
-    /* ── Context-adjusted threshold ───────────────────── */
-    float eff_threshold = eou->threshold + eou->context_adj;
+    /* Effective fused threshold (ctx already applied to solo thresholds above) */
+    float eff_threshold = eou->threshold + ctx;
     if (eff_threshold < 0.1f) eff_threshold = 0.1f;
     if (eff_threshold > 0.99f) eff_threshold = 0.99f;
 
@@ -375,8 +391,14 @@ void fused_eou_set_context(FusedEOU *eou, const char *last_transcript) {
 
 void fused_eou_feed_prosody(FusedEOU *eou, ProsodyFrame frame) {
     if (!eou) return;
-    eou->pitch_buf[eou->prosody_write]  = frame.pitch_hz;
-    eou->energy_buf[eou->prosody_write] = frame.energy_db;
+    /* Sanitize inputs — NaN/Inf from upstream audio analysis must not
+     * contaminate the ring buffer (would propagate through all scores). */
+    float pitch = frame.pitch_hz;
+    float energy = frame.energy_db;
+    if (isnan(pitch) || isinf(pitch)) pitch = 0.0f;
+    if (isnan(energy) || isinf(energy)) energy = 0.0f;
+    eou->pitch_buf[eou->prosody_write]  = pitch;
+    eou->energy_buf[eou->prosody_write] = energy;
     eou->prosody_write = (eou->prosody_write + 1) % PROSODY_BUF_SIZE;
     eou->prosody_count++;
     if (eou->prosody_count > 1000000)

@@ -517,6 +517,93 @@ static void test_new_functions_null_safety(void) {
     CHECK(fused_eou_context_adjustment(NULL) == 0.0f, "context_adj(NULL) should be 0");
 }
 
+/* ── Audit Bug-Fix Tests ───────────────────────────────── */
+
+static void test_nan_prosody_guard(void) {
+    TEST("NaN prosody frames are sanitized to 0");
+    FusedEOU *eou = fused_eou_create(0.6f, 2, 80.0f);
+    fused_eou_set_prosody_weight(eou, 0.15f);
+
+    /* Feed mix of valid and NaN frames */
+    for (int i = 0; i < 8; i++) {
+        ProsodyFrame f = { .pitch_hz = 180.0f, .energy_db = -25.0f };
+        fused_eou_feed_prosody(eou, f);
+    }
+    ProsodyFrame nan_frame = { .pitch_hz = NAN, .energy_db = NAN };
+    fused_eou_feed_prosody(eou, nan_frame);
+    for (int i = 0; i < 7; i++) {
+        ProsodyFrame f = { .pitch_hz = 120.0f, .energy_db = -30.0f };
+        fused_eou_feed_prosody(eou, f);
+    }
+
+    /* Process — should NOT produce NaN */
+    EOUSignals sig = { .energy_signal = 0.5f, .mimi_eot_prob = 0.5f, .stt_eou_prob = 0.5f };
+    EOUResult res = fused_eou_process(eou, sig);
+    CHECK(!isnan(res.fused_prob) && !isinf(res.fused_prob),
+          "fused_prob must not be NaN/Inf with NaN input frames");
+    float pp = fused_eou_prosody_prob(eou);
+    CHECK(!isnan(pp) && !isinf(pp), "prosody_prob must not be NaN/Inf");
+
+    fused_eou_destroy(eou);
+}
+
+static void test_inf_prosody_guard(void) {
+    TEST("Inf prosody frames are sanitized to 0");
+    FusedEOU *eou = fused_eou_create(0.6f, 2, 80.0f);
+    fused_eou_set_prosody_weight(eou, 0.15f);
+
+    for (int i = 0; i < 16; i++) {
+        ProsodyFrame f = { .pitch_hz = INFINITY, .energy_db = -INFINITY };
+        fused_eou_feed_prosody(eou, f);
+    }
+
+    EOUSignals sig = { .energy_signal = 0.5f, .mimi_eot_prob = 0.5f, .stt_eou_prob = 0.5f };
+    EOUResult res = fused_eou_process(eou, sig);
+    CHECK(!isnan(res.fused_prob) && !isinf(res.fused_prob),
+          "fused_prob must not be NaN/Inf with Inf input frames");
+
+    fused_eou_destroy(eou);
+}
+
+static void test_context_adj_on_solo_triggers(void) {
+    TEST("context_adj raises solo thresholds (conjunction blocks solo trigger)");
+    FusedEOU *eou = fused_eou_create(0.6f, 2, 80.0f);
+
+    /* Set context to trailing conjunction → +0.10 adjustment */
+    fused_eou_set_context(eou, "I was thinking and");
+    float adj = fused_eou_context_adjustment(eou);
+    CHECK(adj > 0.05f, "conjunction should raise threshold");
+
+    /* Feed speech to enable speech_detected */
+    EOUSignals speech = { .energy_signal = 0.5f, .mimi_eot_prob = 0.3f, .stt_eou_prob = 0.3f };
+    for (int i = 0; i < 5; i++) fused_eou_process(eou, speech);
+
+    /* STT solo threshold is 0.85 default; with +0.10 adj → effective 0.95.
+     * A signal at 0.90 should NOT solo-trigger when context_adj raises it. */
+    fused_eou_reset(eou);
+    fused_eou_set_context(eou, "I was thinking and");
+    /* Re-establish speech */
+    for (int i = 0; i < 5; i++) fused_eou_process(eou, speech);
+
+    EOUSignals high_stt = { .energy_signal = 0.3f, .mimi_eot_prob = 0.3f, .stt_eou_prob = 0.90f };
+    EOUResult res = fused_eou_process(eou, high_stt);
+    /* 0.90 < 0.85 + 0.10 = 0.95, so solo should NOT trigger */
+    int solo_blocked = !(res.trigger_source & 0x04); /* EOU_SRC_STT = 0x04 */
+    CHECK(solo_blocked, "STT at 0.90 should not solo-trigger with +0.10 context_adj");
+
+    /* Now with question context → -0.10 adj, same signal should solo-trigger */
+    fused_eou_reset(eou);
+    fused_eou_set_context(eou, "What do you think?");
+    for (int i = 0; i < 5; i++) fused_eou_process(eou, speech);
+
+    res = fused_eou_process(eou, high_stt);
+    /* 0.90 >= 0.85 + (-0.10) = 0.75, so solo SHOULD trigger */
+    int solo_fired = (res.trigger_source & 0x04) != 0;
+    CHECK(solo_fired, "STT at 0.90 should solo-trigger with -0.10 context_adj");
+
+    fused_eou_destroy(eou);
+}
+
 /* ── Main ─────────────────────────────────────────────── */
 
 int main(void) {
@@ -559,6 +646,11 @@ int main(void) {
 
     printf("\n[NULL Safety Tests]\n");
     test_new_functions_null_safety();
+
+    printf("\n[Audit Bug-Fix Tests]\n");
+    test_nan_prosody_guard();
+    test_inf_prosody_guard();
+    test_context_adj_on_solo_triggers();
 
     printf("\n==================================================================\n");
     printf("  Total: %d passed, %d failed (out of %d)\n",

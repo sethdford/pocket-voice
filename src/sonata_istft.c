@@ -251,8 +251,8 @@ int sonata_istft_decode_batch(
     for (int f = 0; f < n_frames; f++) {
         int n = sonata_istft_decode_frame(
             dec,
-            magnitudes + f * dec->n_bins,
-            phases + f * dec->n_bins,
+            magnitudes + (size_t)f * dec->n_bins,
+            phases + (size_t)f * dec->n_bins,
             out_audio + total_samples
         );
         total_samples += n;

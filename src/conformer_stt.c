@@ -3280,7 +3280,21 @@ float *conformer_stt_get_logits_buf(ConformerSTT *stt, int *out_vocab) {
 
 void conformer_stt_set_conmer_mode(ConformerSTT *stt, int enable) {
     if (!stt) return;
+    int was = stt->conmer_mode;
     stt->conmer_mode = enable ? 1 : 0;
+    /* Clear MHSA K/V caches on mode switch to prevent stale data:
+     * standard→Conmer leaves orphaned MHSA cache, Conmer→standard
+     * would read uninitialized MHSA cache from the Conmer period. */
+    if (was != stt->conmer_mode && stt->layer_caches) {
+        int n = (int)stt->header.n_layers;
+        for (int i = 0; i < n; i++) {
+            stt->layer_caches[i].k_len = 0;
+            stt->layer_caches[i].v_len = 0;
+            stt->layer_caches[i].conv_state_len = 0;
+        }
+        stt->total_frames_processed = 0;
+        fprintf(stderr, "[conformer_stt] Mode switch — layer caches cleared\n");
+    }
     if (enable) {
         fprintf(stderr, "[conformer_stt] Conmer mode ENABLED — MHSA skipped in all blocks\n");
     }

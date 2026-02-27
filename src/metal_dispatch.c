@@ -16,13 +16,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <stdatomic.h>
 #include <Accelerate/Accelerate.h>
 #include <arm_neon.h>
 #include <mach/mach_time.h>
 
 /* Singleton state */
 static MetalKernels *g_metal = NULL;
-static int g_initialized = 0;
+static atomic_int g_initialized = 0;
 
 /* Chip-aware dispatch threshold (min dimension for GPU path) */
 static int g_threshold = 0;        /* 0 = not yet configured */
@@ -30,8 +31,9 @@ static int g_threshold_set = 0;    /* 1 = user override via set_threshold */
 static int g_has_tensorops = -1;   /* -1 = not checked, 0 = no, 1 = yes */
 
 int metal_dispatch_init(const char *metallib_path) {
-    if (g_initialized) return metal_dispatch_available();
-    g_initialized = 1;
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&g_initialized, &expected, 1))
+        return metal_dispatch_available(); /* Another thread already initialized */
 
     /* Auto-configure threshold if not manually set */
     if (!g_threshold_set) {
@@ -352,6 +354,6 @@ void metal_dispatch_cleanup(void) {
         metal_kernels_destroy(g_metal);
         g_metal = NULL;
     }
-    g_initialized = 0;
+    atomic_store(&g_initialized, 0);
     g_has_tensorops = -1;
 }
