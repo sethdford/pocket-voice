@@ -1,16 +1,16 @@
-# Makefile — Build pocket-voice: zero-Python voice pipeline for Apple Silicon.
+# Makefile — Build Sonata: real-time voice pipeline for Apple Silicon.
 #
 # Targets:
 #   all              Build everything
-#   pocket-voice     Standalone pipeline binary (mic → STT → Claude → TTS → speaker)
+#   sonata           Standalone pipeline binary (mic → STT → Claude → TTS → speaker)
 #   libs             Build all shared libraries
 #   clean            Remove build artifacts
 #
 # Usage:
 #   make                 # Build all
-#   make pocket-voice    # Build just the binary
+#   make sonata          # Build just the binary
 #   make clean           # Clean everything
-#   ANTHROPIC_API_KEY=sk-... ./pocket-voice  # Run
+#   ANTHROPIC_API_KEY=sk-... ./sonata  # Run
 
 CC      := cc
 CFLAGS  := -O3 -flto -mcpu=native -arch arm64 -Wall -Wextra -Wno-unused-parameter \
@@ -68,9 +68,9 @@ BUILD := build
 # Rust release output directories
 STT_DYLIB   := src/stt/target/release/libpocket_stt.dylib
 
-.PHONY: all clean libs pocket-voice
+.PHONY: all clean libs sonata pocket-voice
 
-all: libs pocket-voice
+all: libs sonata
 
 # ─── Shared Libraries ──────────────────────────────────────────────────────
 
@@ -360,7 +360,7 @@ $(BUILD)/cJSON.o: src/cJSON.c src/cJSON.h | $(BUILD)
 
 # ─── Main pipeline binary ─────────────────────────────────────────────────
 
-pocket-voice: src/pocket_voice_pipeline.c libs $(STT_DYLIB) $(LLM_DYLIB) $(SONATA_LM_DYLIB) $(SONATA_FLOW_DYLIB) $(SONATA_STORM_DYLIB)
+sonata: src/pocket_voice_pipeline.c libs $(STT_DYLIB) $(LLM_DYLIB) $(SONATA_LM_DYLIB) $(SONATA_FLOW_DYLIB) $(SONATA_STORM_DYLIB)
 	$(CC) $(CFLAGS) $(CURL_CFLAGS) \
 	  -DACCELERATE_NEW_LAPACK \
 	  -Isrc \
@@ -386,6 +386,10 @@ pocket-voice: src/pocket_voice_pipeline.c libs $(STT_DYLIB) $(LLM_DYLIB) $(SONAT
 	  -Wl,-rpath,$(HOMEBREW_PREFIX)/lib \
 	  $(ORT_RPATH) \
 	  -o $@ src/pocket_voice_pipeline.c
+
+# Backward-compat alias
+pocket-voice: sonata
+	ln -sf sonata pocket-voice
 
 # ─── Quality Benchmark Suite ───────────────────────────────────────────────
 
@@ -795,6 +799,26 @@ test-web-remote: tests/test_web_remote.c $(BUILD)/libweb_remote.dylib | $(BUILD)
 	  -o $(BUILD)/test-web-remote tests/test_web_remote.c
 	./$(BUILD)/test-web-remote
 
+test-security-audit: tests/test_security_audit.c | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc \
+	  -Wl,-rpath,$(CURDIR)/$(BUILD) \
+	  -o $(BUILD)/test-security-audit tests/test_security_audit.c
+	./$(BUILD)/test-security-audit
+
+test-assumptions: tests/test_assumptions.c | $(BUILD)
+	$(CC) $(CFLAGS) -DACCELERATE_NEW_LAPACK -Isrc -framework Accelerate \
+	  -Wl,-rpath,$(CURDIR)/$(BUILD) -lm \
+	  -o $(BUILD)/test-assumptions tests/test_assumptions.c
+	./$(BUILD)/test-assumptions
+
+bench-audit: tests/bench_audit.c $(BUILD)/libmel_spectrogram.dylib $(BUILD)/libsonata_istft.dylib $(BUILD)/libmetal_dispatch.dylib | $(BUILD)
+	$(CC) $(CFLAGS) -DACCELERATE_NEW_LAPACK -Isrc -framework Accelerate \
+	  -L$(BUILD) -lmel_spectrogram -lsonata_istft -lmetal_dispatch -lmetal_loader \
+	  -framework Metal -framework Foundation \
+	  -Wl,-rpath,$(CURDIR)/$(BUILD) -lm \
+	  -o $(BUILD)/bench-audit tests/bench_audit.c
+	./$(BUILD)/bench-audit
+
 test-opus-codec: tests/test_opus_codec.c $(BUILD)/libpocket_opus.dylib | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc $(OPUS_CFLAGS) \
 	  -L$(BUILD) -lpocket_opus $(OPUS_LDFLAGS) -lopus \
@@ -841,11 +865,53 @@ test-bnns-convnext: tests/test_bnns_convnext.c $(BUILD)/libbnns_convnext_decoder
 	  -o $(BUILD)/test-bnns-convnext tests/test_bnns_convnext.c
 	./$(BUILD)/test-bnns-convnext
 
-.PHONY: test test-eou test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-roundtrip test-llm-prosody test-websocket test-optimizations test-sonata test-sonata-quality test-sonata-stt test-sonata-v3 test-beam-search bench-sonata bench-quality bench-live bench-industry test-apple-perf test-quality-improvements test-real-models test-native-vad bench-vad test-speech-detector test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-sonata-storm test-audio-emotion test-sonata-flow-ffi test-sonata-lm-ffi test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-sonata-refiner test-tdt-decoder test-web-remote test-opus-codec test-audio-converter test-spatial-audio test-metal-loader test-metal-dispatch test-bnns-convnext bench
+test-coverage-gaps: tests/test_coverage_gaps.c \
+                    $(BUILD)/libbreath_synthesis.dylib \
+                    $(BUILD)/libnoise_gate.dylib \
+                    $(BUILD)/liblufs.dylib | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc -framework Accelerate \
+	  -L$(BUILD) -lbreath_synthesis -lnoise_gate -llufs \
+	  -Wl,-rpath,@executable_path \
+	  -lm -o $(BUILD)/test-coverage-gaps tests/test_coverage_gaps.c
+	./$(BUILD)/test-coverage-gaps
 
-bench: libs pocket-voice
+test-correctness-audit: tests/test_correctness_audit.c $(BUILD)/libmel_spectrogram.dylib | $(BUILD)
+	$(CC) $(CFLAGS) -DACCELERATE_NEW_LAPACK -Isrc -framework Accelerate \
+	  -L$(BUILD) -lmel_spectrogram \
+	  -Wl,-rpath,$(CURDIR)/$(BUILD) -lm \
+	  -o $(BUILD)/test-correctness-audit tests/test_correctness_audit.c
+	./$(BUILD)/test-correctness-audit
+
+test-integration-audit: tests/test_integration_audit.c \
+                        $(BUILD)/libsonata_istft.dylib $(BUILD)/libmel_spectrogram.dylib \
+                        $(BUILD)/libtext_normalize.dylib $(BUILD)/libsentence_buffer.dylib \
+                        $(BUILD)/libssml_parser.dylib $(BUILD)/libsonata_stt.dylib \
+                        $(BUILD)/libsonata_refiner.dylib $(BUILD)/libconformer_stt.dylib \
+                        $(BUILD)/libctc_beam_decoder.dylib $(BUILD)/libtdt_decoder.dylib | $(BUILD)
+	$(CC) $(CFLAGS) -DACCELERATE_NEW_LAPACK -Isrc -framework Accelerate \
+	  -L$(BUILD) -lsonata_istft -lmel_spectrogram \
+	  -ltext_normalize -lsentence_buffer -lssml_parser \
+	  -lsonata_stt -lsonata_refiner -lconformer_stt \
+	  -lctc_beam_decoder -ltdt_decoder \
+	  -Wl,-rpath,$(CURDIR)/$(BUILD) -lm \
+	  -o $(BUILD)/test-integration-audit tests/test_integration_audit.c
+	./$(BUILD)/test-integration-audit
+
+bench-audit: tests/bench_audit.c \
+             $(BUILD)/libmel_spectrogram.dylib $(BUILD)/libsonata_istft.dylib \
+             $(BUILD)/libmetal_dispatch.dylib $(BUILD)/libmetal_loader.dylib | $(BUILD)
+	$(CC) $(CFLAGS) -DACCELERATE_NEW_LAPACK -Isrc \
+	  -framework Accelerate -framework Metal -framework Foundation \
+	  -L$(BUILD) -lmel_spectrogram -lsonata_istft -lmetal_dispatch -lmetal_loader \
+	  -Wl,-rpath,$(CURDIR)/$(BUILD) -lm \
+	  -o $(BUILD)/bench-audit tests/bench_audit.c
+	./$(BUILD)/bench-audit
+
+.PHONY: test test-eou test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-roundtrip test-llm-prosody test-websocket test-optimizations test-sonata test-sonata-quality test-sonata-stt test-sonata-v3 test-beam-search bench-sonata bench-quality bench-live bench-industry test-apple-perf test-quality-improvements test-real-models test-native-vad bench-vad test-speech-detector test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-sonata-storm test-audio-emotion test-sonata-flow-ffi test-sonata-lm-ffi test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-sonata-refiner test-tdt-decoder test-web-remote test-opus-codec test-audio-converter test-spatial-audio test-metal-loader test-metal-dispatch test-bnns-convnext test-coverage-gaps test-correctness-audit test-integration-audit test-security-audit test-assumptions bench-audit bench
+
+bench: libs sonata
 	@bash scripts/benchmark.sh --all
-test: bench-quality test-quality test-eou test-roundtrip test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-llm-prosody test-optimizations test-beam-search test-sonata test-sonata-v3 test-sonata-quality test-sonata-stt test-real-models test-websocket test-native-vad test-speech-detector test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-quality-improvements test-sonata-storm test-audio-emotion test-sonata-flow-ffi test-sonata-lm-ffi test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-sonata-refiner test-tdt-decoder test-web-remote test-opus-codec test-audio-converter test-spatial-audio test-metal-loader test-metal-dispatch test-bnns-convnext
+test: bench-quality test-quality test-eou test-roundtrip test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-llm-prosody test-optimizations test-beam-search test-sonata test-sonata-v3 test-sonata-quality test-sonata-stt test-real-models test-websocket test-native-vad test-speech-detector test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-quality-improvements test-sonata-storm test-audio-emotion test-sonata-flow-ffi test-sonata-lm-ffi test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-sonata-refiner test-tdt-decoder test-web-remote test-opus-codec test-audio-converter test-spatial-audio test-metal-loader test-metal-dispatch test-bnns-convnext test-coverage-gaps test-integration-audit test-correctness-audit test-security-audit test-assumptions
 	@echo ""
 	@echo "═══ Quality Benchmark Self-Tests ═══"
 	./$(BUILD)/bench-quality
@@ -855,7 +921,7 @@ test: bench-quality test-quality test-eou test-roundtrip test-pipeline test-new-
 # ─── Clean ─────────────────────────────────────────────────────────────────
 
 clean:
-	rm -rf $(BUILD) pocket-voice
+	rm -rf $(BUILD) sonata pocket-voice
 	cd src/stt && cargo clean
 	cd src/llm && cargo clean 2>/dev/null || true
 	cd src/sonata_lm && cargo clean 2>/dev/null || true

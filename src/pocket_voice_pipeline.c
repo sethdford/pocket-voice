@@ -718,12 +718,19 @@ static int sonatav2_set_text_done(void *e) {
 
     /* Grow pre-allocated mag/phase buffers if needed */
     if (n_frames > ev->istft_buf_cap) {
+        int new_cap = n_frames + 64;
+        float *new_mag = (float *)malloc((size_t)new_cap * n_bins * sizeof(float));
+        float *new_phase = (float *)malloc((size_t)new_cap * n_bins * sizeof(float));
+        if (!new_mag || !new_phase) {
+            free(new_mag);
+            free(new_phase);
+            return -1;
+        }
         free(ev->mag_buf);
         free(ev->phase_buf);
-        ev->istft_buf_cap = n_frames + 64;
-        ev->mag_buf = (float *)malloc((size_t)ev->istft_buf_cap * n_bins * sizeof(float));
-        ev->phase_buf = (float *)malloc((size_t)ev->istft_buf_cap * n_bins * sizeof(float));
-        if (!ev->mag_buf || !ev->phase_buf) return -1;
+        ev->mag_buf = new_mag;
+        ev->phase_buf = new_phase;
+        ev->istft_buf_cap = new_cap;
     }
 
     /* Reset phase accumulator for this utterance */
@@ -810,6 +817,8 @@ static void sonatav2_destroy(void *e) {
     free(ev->audio_buf);
     free(ev->phase_accum_buf);
     free(ev->mel_buf);
+    free(ev->mag_buf);
+    free(ev->phase_buf);
     free(ev);
 }
 
