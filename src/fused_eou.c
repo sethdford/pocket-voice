@@ -76,7 +76,7 @@ FusedEOU *fused_eou_create(float threshold, int consec_frames, float frame_ms) {
     eou->consec_required = consec_frames;
     eou->frame_ms = frame_ms;
 
-    eou->w_prosody    = 0.15f;   /* Enabled — provides 4th signal with zero latency */
+    eou->w_prosody    = 0.0f;    /* Disabled — enable after integrating pitch extraction (see Wave 3) */
     eou->solo_prosody = 0.92f;
 
     eou->w_semantic    = 0.0f;  /* Off by default — backward compatible */

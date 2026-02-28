@@ -737,11 +737,13 @@ impl SonataLM {
 
     /// Like forward_hidden() but also computes acoustic latents if acoustic_head is enabled.
     /// Returns: (logits, hidden, acoustic) where acoustic is Some if enabled, None otherwise.
+    /// The `acoustic_enabled` flag gates computation so no work is done when disabled at runtime.
     fn forward_with_acoustic(
         &self, sem_tok: u32, pos: usize,
         kv_caches: &mut [(Tensor, Tensor)],
         prosody: Option<&Tensor>,
         text_encoding: Option<&Tensor>,
+        acoustic_enabled: bool,
     ) -> Result<(Tensor, Tensor, Option<Tensor>)> {
         let device = self.rope_cos.device();
         let sem_t = Tensor::from_vec(vec![sem_tok], (1, 1), device)?;
@@ -767,8 +769,16 @@ impl SonataLM {
 
         let hidden = self.output_norm.forward(&x)?;
         let logits = self.semantic_head.forward(&hidden)?;
-        let acoustic = if let Some(ref ah) = self.acoustic_head {
-            Some(ah.forward(&hidden)?)
+        // Gate: only compute acoustic head when both the head exists AND runtime flag is enabled
+        let acoustic = if acoustic_enabled {
+            if let Some(ref ah) = self.acoustic_head {
+                let raw = ah.forward(&hidden)?;
+                // RMSNorm: normalize to unit variance so Flow decoder receives N(0,1) input
+                let norm_sq = (raw.sqr()?.mean_keepdim(D::Minus1)? + 1e-5f64)?;
+                Some((raw / norm_sq.sqrt()?)?)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -2476,12 +2486,13 @@ pub extern "C" fn sonata_lm_step_dual(
             None
         };
 
-        // Forward pass with acoustic output
+        // Forward pass with acoustic output (gated by runtime flag)
         let (logits, hidden, acoustic) = match eng.model.forward_with_acoustic(
             sem_tok, pos,
             &mut eng.kv_caches,
             prosody_tensor.as_ref(),
             eng.text_encoding.as_ref(),
+            eng.acoustic_head_enabled,
         ) {
             Ok(res) => res,
             Err(_) => return -1,
@@ -2532,16 +2543,20 @@ pub extern "C" fn sonata_lm_step_dual(
             eng.consecutive_pad = 0;
         }
 
-        // Copy acoustic latents if available
-        if !out_acoustic.is_null() && acoustic_dim > 0 {
-            if let Some(ac) = acoustic {
-                if let Ok(a1) = ac.squeeze(0) {
-                    if let Ok(a2) = a1.to_dtype(DType::F32) {
-                        if let Ok(av) = a2.to_vec1::<f32>() {
+        // Copy acoustic latents if available and store in internal buffer
+        if let Some(ac) = acoustic {
+            if let Ok(a1) = ac.squeeze(0) {
+                if let Ok(a2) = a1.to_dtype(DType::F32) {
+                    if let Ok(av) = a2.to_vec1::<f32>() {
+                        // Store in internal buffer (overwrite with latest vector)
+                        eng.acoustic_buffer.clear();
+                        eng.acoustic_buffer.extend_from_slice(&av);
+
+                        // Copy to caller's output buffer if provided
+                        if !out_acoustic.is_null() && acoustic_dim > 0 {
                             let copy_len = std::cmp::min(av.len(), acoustic_dim as usize);
                             unsafe {
                                 std::ptr::copy_nonoverlapping(av.as_ptr(), out_acoustic, copy_len);
-                                // Zero pad if output buffer is larger
                                 for i in copy_len..acoustic_dim as usize {
                                     *out_acoustic.add(i) = 0.0;
                                 }
@@ -2549,12 +2564,12 @@ pub extern "C" fn sonata_lm_step_dual(
                         }
                     }
                 }
-            } else {
-                // No acoustic head, zero the buffer
-                unsafe {
-                    for i in 0..acoustic_dim as usize {
-                        *out_acoustic.add(i) = 0.0;
-                    }
+            }
+        } else if !out_acoustic.is_null() && acoustic_dim > 0 {
+            // No acoustic output (head disabled or missing), zero the caller's buffer
+            unsafe {
+                for i in 0..acoustic_dim as usize {
+                    *out_acoustic.add(i) = 0.0;
                 }
             }
         }
@@ -2584,4 +2599,36 @@ pub extern "C" fn sonata_lm_get_acoustic_dim(engine: *mut c_void) -> c_int {
     if engine.is_null() { return -1; }
     let eng = unsafe { &*(engine as *const LmEngine) };
     eng.acoustic_dim as c_int
+}
+
+/// Copy the latest acoustic vector from the internal buffer to the caller's buffer.
+/// Returns: number of floats copied on success, 0 if buffer is empty, -1 on error.
+/// The internal buffer holds the most recent acoustic vector produced by step_dual.
+#[no_mangle]
+pub extern "C" fn sonata_lm_get_acoustic_buffer(
+    engine: *mut c_void, out_buf: *mut c_float, buf_len: c_int,
+) -> c_int {
+    if engine.is_null() || out_buf.is_null() || buf_len <= 0 { return -1; }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let eng = unsafe { &*(engine as *const LmEngine) };
+        if eng.acoustic_buffer.is_empty() {
+            return 0;
+        }
+        let copy_len = std::cmp::min(eng.acoustic_buffer.len(), buf_len as usize);
+        unsafe {
+            std::ptr::copy_nonoverlapping(eng.acoustic_buffer.as_ptr(), out_buf, copy_len);
+            // Zero-pad remainder if caller buffer is larger
+            for i in copy_len..buf_len as usize {
+                *out_buf.add(i) = 0.0;
+            }
+        }
+        copy_len as c_int
+    }));
+    match result {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[sonata_lm] panic in get_acoustic_buffer: {}", panic_message(e));
+            -1
+        }
+    }
 }

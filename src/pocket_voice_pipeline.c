@@ -631,6 +631,7 @@ extern int   sonata_flow_v2_generate(void *engine, const char *text,
 extern void  sonata_flow_v2_set_cfg_scale(void *engine, float scale);
 extern void  sonata_flow_v2_set_n_steps(void *engine, int steps);
 extern void  sonata_flow_v2_set_speaker(void *engine, int speaker_id);
+extern int   sonata_flow_v2_set_quality_mode(void *engine, int mode);
 
 /* Sonata Flow v3 + Vocoder (Rust FFI) */
 extern void *sonata_flow_v3_create(const char *weights, const char *config);
@@ -639,6 +640,7 @@ extern int   sonata_flow_v3_set_cfg_scale(void *engine, float scale);
 extern int   sonata_flow_v3_set_n_steps(void *engine, int steps);
 extern int   sonata_flow_v3_set_speaker(void *engine, int speaker_id);
 extern int   sonata_flow_v3_set_solver(void *engine, int use_heun);
+extern int   sonata_flow_v3_set_quality_mode(void *engine, int mode);
 extern int   sonata_flow_v3_set_reference(void *engine, const float *ref_mel_data,
     int n_frames, int mel_dim);
 extern void  sonata_flow_v3_clear_reference(void *engine);
@@ -1185,6 +1187,7 @@ extern void  sonata_flow_reset_streaming(void *engine);
 extern int   sonata_flow_generate_streaming_chunk(void *engine, const int *semantic_tokens,
     int n_frames, int chunk_offset, float *out_magnitude, float *out_phase);
 extern int   sonata_flow_set_solver(void *engine, int use_heun);
+extern int   sonata_flow_set_quality_mode(void *engine, int mode);
 extern int   sonata_flow_set_speaker_embedding(void *engine, const float *embedding, int dim);
 extern void  sonata_flow_clear_speaker_embedding(void *engine);
 
@@ -1458,6 +1461,8 @@ typedef struct {
     int             text_finalized;
     int             use_speculative;
     int             use_storm;       /* 1 = use SoundStorm instead of AR LM */
+    int             tts_quality_mode;   /* 0=FAST, 1=BALANCED, 2=HIGH */
+    int             tts_first_chunk_fast; /* 1 = FAST for first chunk, then revert */
     float          *collect_buf;
     float          *mag_scratch;
     float          *phase_scratch;
@@ -1725,6 +1730,11 @@ static void sonata_flush_chunk(SonataEngine *e) {
     if (e->n_semantic_tokens <= 0) return;
     int n = e->n_semantic_tokens;
 
+    /* First-chunk-fast: use FAST mode for first chunk, then revert to configured quality */
+    if (e->tts_first_chunk_fast && e->is_first_chunk && e->flow_engine) {
+        sonata_flow_set_quality_mode(e->flow_engine, 0 /* FAST */);
+    }
+
     if (e->flow_worker) {
         sonata_collect_parallel(e);
         flow_worker_submit(e->flow_worker, e->semantic_tokens, n);
@@ -1820,7 +1830,12 @@ static void sonata_flush_chunk(SonataEngine *e) {
         }
     }
     e->n_semantic_tokens = 0;
-    if (e->is_first_chunk) e->is_first_chunk = 0;
+    if (e->is_first_chunk) {
+        e->is_first_chunk = 0;
+        /* Revert from FAST to configured quality after first chunk */
+        if (e->tts_first_chunk_fast && e->flow_engine)
+            sonata_flow_set_quality_mode(e->flow_engine, e->tts_quality_mode);
+    }
 }
 
 static int sonata_step(void *engine) {
@@ -4934,7 +4949,10 @@ static PipelineState pipeline_tick(
             speech_detector_feed_semantic(pp->speech_detector, sem_prob);
         }
 
-        /* ── Fused EOU Detection (via SpeechDetector) ── */
+        /* ── Fused EOU Detection (via SpeechDetector) ──
+         * NOTE: fused_eou_process_partial() is available for Phase 2 parallel
+         * EOU — allows early detection from energy+mimi before STT is ready.
+         * Integration requires callback-driven parallelism refactoring. */
         int energy_vad = voice_engine_get_vad_state(audio);
         float stt_eou_prob = stt->has_vad(stt->engine)
             ? stt->get_vad_prob(stt->engine, 2) : 0.0f;
@@ -5404,6 +5422,7 @@ static void print_usage(const char *prog) {
         "  --flow-v3-config PATH  Sonata Flow v3 config JSON\n"
         "  --vocoder-weights PATH  Sonata Vocoder weights (for --tts-engine sonata-v3)\n"
         "  --vocoder-config PATH   Sonata Vocoder config JSON\n"
+        "  --quality MODE     TTS quality: fast (0), balanced (1, default), high (2)\n"
         "  --n-q N            Audio codebooks for TTS (default: 24)\n"
         "  --no-vad           Disable semantic VAD (use energy VAD only)\n"
         "  --vad-threshold F  Semantic VAD threshold (default: 0.7)\n"
@@ -5539,6 +5558,14 @@ static PipelineConfig parse_args_with_base(int argc, char **argv, PipelineConfig
             cfg.sonata_flow_steps = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--sonata-heun") == 0) {
             cfg.sonata_heun = 1;
+        } else if (strcmp(argv[i], "--quality") == 0 && i + 1 < argc) {
+            const char *q = argv[++i];
+            if (strcmp(q, "fast") == 0 || strcmp(q, "0") == 0)
+                cfg.tts_quality_mode = 0;
+            else if (strcmp(q, "balanced") == 0 || strcmp(q, "1") == 0)
+                cfg.tts_quality_mode = 1;
+            else if (strcmp(q, "high") == 0 || strcmp(q, "2") == 0)
+                cfg.tts_quality_mode = 2;
         } else if (strcmp(argv[i], "--sonata-self-draft") == 0) {
             cfg.sonata_self_draft = 1;
         } else if (strcmp(argv[i], "--sonata-draft") == 0 && i + 1 < argc) {
@@ -5966,7 +5993,10 @@ int main(int argc, char **argv) {
                 sonata_flow_set_n_steps(se->flow_engine, cfg.sonata_flow_steps);
             if (cfg.sonata_heun)
                 sonata_flow_set_solver(se->flow_engine, 1);
+            sonata_flow_set_quality_mode(se->flow_engine, cfg.tts_quality_mode);
         }
+        se->tts_quality_mode = cfg.tts_quality_mode;
+        se->tts_first_chunk_fast = cfg.tts_first_chunk_fast;
         if (se->lm_engine) {
             sonata_lm_set_params(se->lm_engine, 0.8f, 50, 0.92f, 1.15f);
             const char *draft_w = cfg.sonata_draft_weights;
@@ -6080,6 +6110,8 @@ int main(int argc, char **argv) {
             sonata_flow_v2_set_cfg_scale(sv2->flow_v2, cfg.sonata_cfg_scale);
         if (cfg.sonata_flow_steps > 0 && sv2->flow_v2)
             sonata_flow_v2_set_n_steps(sv2->flow_v2, cfg.sonata_flow_steps);
+        if (sv2->flow_v2)
+            sonata_flow_v2_set_quality_mode(sv2->flow_v2, cfg.tts_quality_mode);
     } else if (cfg.tts_engine == TTS_ENGINE_SONATA_V3) {
         const char *fl_w = cfg.flow_v3_weights ? cfg.flow_v3_weights : "models/sonata/flow_v3.safetensors";
         const char *fl_c = cfg.flow_v3_config ? cfg.flow_v3_config : "models/sonata/flow_v3_config.json";
@@ -6136,6 +6168,8 @@ int main(int argc, char **argv) {
             sonata_flow_v3_set_n_steps(sv3->flow_v3, cfg.sonata_flow_steps);
         if (cfg.sonata_heun && sv3->flow_v3)
             sonata_flow_v3_set_solver(sv3->flow_v3, 1);
+        if (sv3->flow_v3)
+            sonata_flow_v3_set_quality_mode(sv3->flow_v3, cfg.tts_quality_mode);
     } else {
         fprintf(stderr, "[pocket-voice] Unknown TTS engine, defaulting to Sonata\n");
         cfg.tts_engine = TTS_ENGINE_SONATA;
