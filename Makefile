@@ -270,6 +270,14 @@ $(BUILD)/libnoise_gate.dylib: src/noise_gate.c src/noise_gate.h | $(BUILD)
 	$(CC) $(CFLAGS) -shared -fPIC -DACCELERATE_NEW_LAPACK -framework Accelerate \
 	  -install_name @rpath/libnoise_gate.dylib -o $@ src/noise_gate.c
 
+$(BUILD)/libdeep_filter.dylib: src/deep_filter.c src/deep_filter.h | $(BUILD)
+	$(CC) $(CFLAGS) -shared -fPIC -DACCELERATE_NEW_LAPACK -framework Accelerate \
+	  -install_name @rpath/libdeep_filter.dylib -o $@ src/deep_filter.c
+
+$(BUILD)/libaudio_watermark.dylib: src/audio_watermark.c src/audio_watermark.h | $(BUILD)
+	$(CC) $(CFLAGS) -shared -fPIC -DACCELERATE_NEW_LAPACK -framework Accelerate \
+	  -install_name @rpath/libaudio_watermark.dylib -o $@ src/audio_watermark.c
+
 $(BUILD)/libweb_remote.dylib: src/web_remote.c src/web_remote.h | $(BUILD)
 	$(CC) $(CFLAGS) -shared -fPIC \
 	  -install_name @rpath/libweb_remote.dylib -o $@ src/web_remote.c
@@ -323,6 +331,8 @@ libs: $(BUILD)/libpocket_voice.dylib $(BUILD)/libvdsp_prosody.dylib \
       $(BUILD)/libemphasis_predict.dylib \
       $(BUILD)/libvoice_onboard.dylib \
       $(BUILD)/libnoise_gate.dylib \
+      $(BUILD)/libdeep_filter.dylib \
+      $(BUILD)/libaudio_watermark.dylib \
       $(BUILD)/libweb_remote.dylib \
       $(BUILD)/libapple_perf.dylib \
       $(BUILD)/libconversation_memory.dylib \
@@ -372,7 +382,7 @@ sonata: src/pocket_voice_pipeline.c libs $(STT_DYLIB) $(LLM_DYLIB) $(SONATA_LM_D
 	  -lmimi_endpointer -lfused_eou \
 	  -lmel_spectrogram -lconformer_stt -lctc_beam_decoder -ltdt_decoder \
 	  -lbnns_conformer -lbnns_convnext_decoder -lvoice_quality -llatency_profiler -lmetal_loader \
-	  -lspm_tokenizer -lnoise_gate \
+	  -lspm_tokenizer -lnoise_gate -ldeep_filter -laudio_watermark \
 	  -lspeaker_encoder -lnative_vad -lspeech_detector -lphonemizer -lprosody_predict \
 	  -lprosody_log -lemphasis_predict -lvoice_onboard -lsonata_istft -lsonata_stt -lsonata_refiner -lweb_remote -lwebsocket -lhttp_api -lapple_perf \
 	  -lbackchannel -laudio_emotion -lconversation_memory -lspeaker_diarizer \
@@ -678,6 +688,13 @@ test-quality-improvements: tests/test_quality_improvements.c \
 	  -o $(BUILD)/test-quality-improvements tests/test_quality_improvements.c
 	./$(BUILD)/test-quality-improvements
 
+test-deep-filter: tests/test_deep_filter.c $(BUILD)/libdeep_filter.dylib | $(BUILD)
+	$(CC) $(CFLAGS) -DACCELERATE_NEW_LAPACK -Isrc -framework Accelerate \
+	  -L$(BUILD) -ldeep_filter \
+	  -Wl,-rpath,$(CURDIR)/$(BUILD) -lm \
+	  -o $(BUILD)/test-deep-filter tests/test_deep_filter.c
+	./$(BUILD)/test-deep-filter
+
 test-vdsp-prosody: tests/test_vdsp_prosody.c $(BUILD)/libvdsp_prosody.dylib | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc -framework Accelerate \
 	  -L$(BUILD) -lvdsp_prosody \
@@ -943,11 +960,20 @@ test-research-metal: tests/test_research_metal.c \
 	  -o $(BUILD)/test-research-metal tests/test_research_metal.c
 	./$(BUILD)/test-research-metal
 
-.PHONY: test test-eou test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-roundtrip test-llm-prosody test-websocket test-optimizations test-sonata test-sonata-quality test-sonata-stt test-sonata-v3 test-beam-search bench-sonata bench-quality bench-live bench-industry test-apple-perf test-quality-improvements test-real-models test-native-vad bench-vad test-speech-detector test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-sonata-storm test-audio-emotion test-sonata-flow-ffi test-sonata-lm-ffi test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-sonata-refiner test-tdt-decoder test-web-remote test-opus-codec test-audio-converter test-spatial-audio test-metal-loader test-metal-dispatch test-bnns-convnext test-coverage-gaps test-correctness-audit test-integration-audit test-security-audit test-assumptions bench-audit bench test-research-stt test-research-eou test-research-istft test-research-metal
+test-audio-watermark: tests/test_audio_watermark.c \
+                      $(BUILD)/libaudio_watermark.dylib | $(BUILD)
+	$(CC) $(CFLAGS) -DACCELERATE_NEW_LAPACK -Isrc \
+	  -framework Accelerate \
+	  -L$(BUILD) -laudio_watermark \
+	  -Wl,-rpath,$(CURDIR)/$(BUILD) -lm \
+	  -o $(BUILD)/test-audio-watermark tests/test_audio_watermark.c
+	./$(BUILD)/test-audio-watermark
+
+.PHONY: test test-eou test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-roundtrip test-llm-prosody test-websocket test-optimizations test-sonata test-sonata-quality test-sonata-stt test-sonata-v3 test-beam-search bench-sonata bench-quality bench-live bench-industry test-apple-perf test-quality-improvements test-real-models test-native-vad bench-vad test-speech-detector test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-sonata-storm test-audio-emotion test-sonata-flow-ffi test-sonata-lm-ffi test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-sonata-refiner test-tdt-decoder test-web-remote test-opus-codec test-audio-converter test-spatial-audio test-metal-loader test-metal-dispatch test-bnns-convnext test-coverage-gaps test-correctness-audit test-integration-audit test-security-audit test-assumptions bench-audit bench test-research-stt test-research-eou test-research-istft test-research-metal test-audio-watermark test-deep-filter
 
 bench: libs sonata
 	@bash scripts/benchmark.sh --all
-test: bench-quality test-quality test-eou test-roundtrip test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-llm-prosody test-optimizations test-beam-search test-sonata test-sonata-v3 test-sonata-quality test-sonata-stt test-real-models test-websocket test-native-vad test-speech-detector test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-quality-improvements test-sonata-storm test-audio-emotion test-sonata-flow-ffi test-sonata-lm-ffi test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-sonata-refiner test-tdt-decoder test-web-remote test-opus-codec test-audio-converter test-spatial-audio test-metal-loader test-metal-dispatch test-bnns-convnext test-coverage-gaps test-integration-audit test-correctness-audit test-security-audit test-assumptions test-research-stt test-research-eou test-research-istft test-research-metal
+test: bench-quality test-quality test-eou test-roundtrip test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-llm-prosody test-optimizations test-beam-search test-sonata test-sonata-v3 test-sonata-quality test-sonata-stt test-real-models test-websocket test-native-vad test-speech-detector test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-quality-improvements test-sonata-storm test-audio-emotion test-sonata-flow-ffi test-sonata-lm-ffi test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-sonata-refiner test-tdt-decoder test-web-remote test-opus-codec test-audio-converter test-spatial-audio test-metal-loader test-metal-dispatch test-bnns-convnext test-coverage-gaps test-integration-audit test-correctness-audit test-security-audit test-assumptions test-research-stt test-research-eou test-research-istft test-research-metal test-audio-watermark test-deep-filter
 	@echo ""
 	@echo "═══ Quality Benchmark Self-Tests ═══"
 	./$(BUILD)/bench-quality

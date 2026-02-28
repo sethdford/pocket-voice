@@ -23,6 +23,7 @@
 #include <signal.h>
 #include <stdatomic.h>
 #include <unistd.h>
+#include <time.h>
 #include <stdbool.h>
 #include <math.h>
 #include <pthread.h>
@@ -37,8 +38,10 @@
 #include "prosody_log.h"
 #include "emphasis_predict.h"
 #include "breath_synthesis.h"
+#include "audio_watermark.h"
 #include "lufs.h"
 #include "noise_gate.h"
+#include "deep_filter.h"
 #include "arena.h"
 #include "spmc_ring.h"
 #include "speech_detector.h"
@@ -1186,6 +1189,8 @@ extern int   sonata_lm_ms_to_frames(int ms);
 extern int   sonata_lm_load_draft(void *engine, const char *weights, const char *config);
 extern int   sonata_lm_speculate_step(void *engine, int *out_tokens, int max_tokens, int *out_count);
 extern int   sonata_lm_set_speculate_k(void *engine, int k);
+extern int   sonata_lm_load_rnn_drafter(void *engine, const char *weights, const char *config);
+extern int   sonata_lm_set_tree_config(void *engine, int width, int depth);
 
 /* Sonata Flow prosody FFI */
 extern int   sonata_flow_set_emotion(void *engine, int emotion_id);
@@ -3634,6 +3639,7 @@ typedef struct {
     int                overlap_word_count; /* Word count when overlap was sent */
 
     NoiseGate         *noise_gate;      /* Spectral noise gate for STT input */
+    DeepFilter        *deep_filter;     /* Neural noise suppression (ERB-band GRU) */
     WebRemote         *web_remote;      /* Phone remote mic/speaker (NULL if unused) */
     float              seg_rate;        /* Current segment speech rate (1.0 = normal) */
 
@@ -3696,6 +3702,10 @@ typedef struct {
 
     /* Cached pitch shift context (avoids FFT setup/teardown per call) */
     void *pitch_ctx;
+
+    /* Audio watermarking for AI-generated speech detection */
+    AudioWatermark    *watermark;
+    int                enable_watermark;
 } AudioPostProcessor;
 
 static AudioPostProcessor *postproc_create(PipelineConfig *cfg) {
@@ -3759,12 +3769,15 @@ static AudioPostProcessor *postproc_create(PipelineConfig *cfg) {
     pp->enable_breath = 1;
 
     /* LUFS loudness normalization */
-    pp->lufs = lufs_create(48000, 400);  /* 400ms momentary window */
+    pp->lufs = lufs_create(24000, 400);  /* 400ms momentary window (24kHz pre-resample) */
     pp->target_lufs = -16.0f;  /* Podcast-friendly target */
     pp->enable_lufs = 1;
 
     /* Spectral noise gate for STT input (16kHz, 512-sample FFT, 50% overlap) */
     pp->noise_gate = noise_gate_create(16000, 512, 256);
+
+    /* Neural noise suppression (ERB-band GRU, replaces spectral gate when weights available) */
+    pp->deep_filter = deep_filter_create(16000, "models/denoiser.dnf");
 
     /* SPMC ring: 2 consumers (speaker=0, opus=1). 96000 floats = 2s @ 48kHz.
        When Opus is disabled, consumer 1 is deactivated so it doesn't block. */
@@ -3836,6 +3849,22 @@ static AudioPostProcessor *postproc_create(PipelineConfig *cfg) {
     pp->last_tts_emotion = EMOTION_NEUTRAL;
     pp->barge_in_energy_scale = 1.0f;
 
+    /* Audio watermarking for AI-generated speech detection (EU AI Act) */
+    {
+        static const uint8_t default_wm_key[] = "sonata-ai-watermark-v1";
+        pp->watermark = audio_watermark_create(24000, 960, default_wm_key,
+                                               (int)sizeof(default_wm_key));
+        if (pp->watermark) {
+            AudioWatermarkPayload wm_payload = {
+                .ai_generated = 1,
+                .timestamp    = (uint32_t)time(NULL),
+                .model_id     = 1  /* Sonata TTS */
+            };
+            audio_watermark_set_payload(pp->watermark, &wm_payload);
+            pp->enable_watermark = 1;
+        }
+    }
+
     return pp;
 }
 
@@ -3853,12 +3882,14 @@ static void postproc_destroy(AudioPostProcessor *pp) {
     if (pp->spmc)           { spmc_destroy(pp->spmc); free(pp->spmc); }
     if (pp->speech_detector) speech_detector_destroy(pp->speech_detector);
     if (pp->noise_gate)     noise_gate_destroy(pp->noise_gate);
+    if (pp->deep_filter)    deep_filter_destroy(pp->deep_filter);
     if (pp->emosteer_bank)  emosteer_destroy(pp->emosteer_bank);
     if (pp->pronunciation_dict) pronunciation_dict_destroy(pp->pronunciation_dict);
     if (pp->prosody_log)    prosody_log_close(pp->prosody_log);
     if (pp->backchannel)    backchannel_destroy(pp->backchannel);
     if (pp->audio_emotion)  audio_emotion_destroy(pp->audio_emotion);
     if (pp->pitch_ctx)      prosody_pitch_destroy(pp->pitch_ctx);
+    if (pp->watermark)      audio_watermark_destroy(pp->watermark);
     free(pp->rec_16k);
     free(pp);
 }
@@ -3871,8 +3902,10 @@ static void postproc_reset(AudioPostProcessor *pp) {
     if (pp->lufs)           lufs_reset(pp->lufs);
     if (pp->speech_detector) speech_detector_reset(pp->speech_detector);
     if (pp->noise_gate)     noise_gate_reset(pp->noise_gate);
+    if (pp->deep_filter)    deep_filter_reset(pp->deep_filter);
     if (pp->backchannel)    backchannel_reset(pp->backchannel);
     if (pp->audio_emotion)  audio_emotion_reset(pp->audio_emotion);
+    if (pp->watermark)      audio_watermark_reset(pp->watermark);
     pp->rec_16k_len = 0;
     pp->speculative_sent = 0;
     pp->streaming_overlap = 0;
@@ -4103,10 +4136,38 @@ static int feed_stt(SttInterface *stt, VoiceEngine *audio, SttAccum *accum,
         }
     }
 
-    /* Spectral noise gate: reduce stationary background noise before STT */
-    if (pp && pp->noise_gate && n_stt > 0) {
-        float *mutable_stt = (float *)(stt_audio == capture_16 ? capture_16 : capture_24);
-        noise_gate_process(pp->noise_gate, mutable_stt, n_stt);
+    /* Noise suppression before STT: prefer neural deep_filter, fall back to spectral gate.
+     * deep_filter and noise_gate operate at 16kHz. When STT is 24kHz, resample down
+     * to 16kHz, apply suppression, then resample back to 24kHz. */
+    if (pp && n_stt > 0) {
+        if (pp->deep_filter) {
+            if (stt->sample_rate == 16000) {
+                deep_filter_process(pp->deep_filter, capture_16, n_stt);
+            } else {
+                /* STT at 24kHz — resample to 16kHz for deep_filter, process, resample back */
+                int n_df16 = linear_resample(capture_24, n_stt, 24000,
+                                              capture_16, RESAMPLE_BUF_SIZE / 3 + 64, 16000);
+                if (n_df16 > 0) {
+                    deep_filter_process(pp->deep_filter, capture_16, n_df16);
+                    int n_back = linear_resample(capture_16, n_df16, 16000,
+                                                  capture_24, RESAMPLE_BUF_SIZE / 2, 24000);
+                    if (n_back > 0) n_stt = n_back;
+                }
+            }
+        } else if (pp->noise_gate) {
+            if (stt->sample_rate == 16000) {
+                noise_gate_process(pp->noise_gate, capture_16, n_stt);
+            } else {
+                int n_ng16 = linear_resample(capture_24, n_stt, 24000,
+                                              capture_16, RESAMPLE_BUF_SIZE / 3 + 64, 16000);
+                if (n_ng16 > 0) {
+                    noise_gate_process(pp->noise_gate, capture_16, n_ng16);
+                    int n_back = linear_resample(capture_16, n_ng16, 16000,
+                                                  capture_24, RESAMPLE_BUF_SIZE / 2, 24000);
+                    if (n_back > 0) n_stt = n_back;
+                }
+            }
+        }
     }
 
     /* Accumulate into STT frame buffer */
@@ -4145,8 +4206,9 @@ static int feed_stt(SttInterface *stt, VoiceEngine *audio, SttAccum *accum,
 
 /* Feed TTS audio (24kHz) through post-processing pipeline to speaker (48kHz).
  *
- * Pipeline: TTS → [pitch shift] → [formant EQ] → [volume] → [soft limit]
- *         → resample 24→48 → [spatial HRTF] → playback ring
+ * Pipeline: TTS → [pitch shift] → [formant EQ] → [volume] → [LUFS]
+ *         → [watermark] → [soft limit] → resample 24→48 → [spatial HRTF]
+ *         → playback ring
  *
  * Returns number of 24kHz samples transferred. */
 static int feed_speaker(TtsInterface *tts, VoiceEngine *audio, AudioPostProcessor *pp) {
@@ -4231,6 +4293,14 @@ static int feed_speaker(TtsInterface *tts, VoiceEngine *audio, AudioPostProcesso
         if (pp && pp->enable_lufs && pp->lufs && n >= 960) {
             if (src != processed) { memcpy(processed, src, n * sizeof(float)); src = processed; }
             lufs_normalize(pp->lufs, src, n, pp->target_lufs);
+        }
+
+        /* Audio watermark: embed imperceptible AI-generated marker (EU AI Act).
+         * After volume/LUFS normalization, before limiter — ensures consistent
+         * embedding level and the limiter won't clip the watermark. */
+        if (pp && pp->enable_watermark && pp->watermark) {
+            if (src != processed) { memcpy(processed, src, n * sizeof(float)); src = processed; }
+            audio_watermark_embed(pp->watermark, src, n);
         }
 
         /* Final safety limiter: gentle tanh at 0.95 to catch any overshoot
@@ -5863,7 +5933,15 @@ int main(int argc, char **argv) {
                 draft_c = NULL;
             }
             if (draft_w) {
-                if (sonata_lm_load_draft(se->lm_engine, draft_w, draft_c) == 0) {
+                /* Prefer RNN drafter (ReDrafter tree) if weights exist */
+                const char *rnn_drafter_w = "models/sonata/rnn_drafter.safetensors";
+                const char *rnn_drafter_c = "models/sonata/rnn_drafter_config.json";
+                if (access(rnn_drafter_w, R_OK) == 0 &&
+                    sonata_lm_load_rnn_drafter(se->lm_engine, rnn_drafter_w,
+                        access(rnn_drafter_c, R_OK) == 0 ? rnn_drafter_c : NULL) == 0) {
+                    se->use_speculative = 1;
+                    fprintf(stderr, "[sonata] ReDrafter tree speculative decoding enabled\n");
+                } else if (sonata_lm_load_draft(se->lm_engine, draft_w, draft_c) == 0) {
                     se->use_speculative = 1;
                     fprintf(stderr, "[sonata] Speculative decoding enabled (k=%d)%s\n",
                             cfg.sonata_speculate_k,

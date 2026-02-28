@@ -685,6 +685,63 @@ impl SonataLM {
         self.semantic_head.forward(&x)
     }
 
+    /// Like forward() but also returns the normalized hidden state (before semantic_head).
+    /// Used by the RNN drafter to condition on the main model's hidden representations.
+    fn forward_hidden(
+        &self, sem_tok: u32, pos: usize,
+        kv_caches: &mut [(Tensor, Tensor)],
+        prosody: Option<&Tensor>,
+        text_encoding: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor)> {
+        let device = self.rope_cos.device();
+        let sem_t = Tensor::from_vec(vec![sem_tok], (1, 1), device)?;
+        let mut x = self.semantic_emb.forward(&sem_t)?;
+
+        if let (Some(ref proj), Some(p)) = (&self.prosody_proj, prosody) {
+            x = (x + proj.forward(p)?)?;
+        }
+
+        if self.use_cross_attention {
+            let text_enc = text_encoding.ok_or_else(||
+                candle_core::Error::Msg("cross-attention requires text_encoding".into()))?;
+            for (i, layer) in self.decoder_layers.iter().enumerate() {
+                let (kc, vc) = &mut kv_caches[i];
+                x = layer.forward(&x, text_enc, &self.rope_cos, &self.rope_sin, pos, kc, vc)?;
+            }
+        } else {
+            for (i, layer) in self.layers.iter().enumerate() {
+                let (kc, vc) = &mut kv_caches[i];
+                x = layer.forward(&x, &self.rope_cos, &self.rope_sin, pos, kc, vc)?;
+            }
+        }
+
+        let hidden = self.output_norm.forward(&x)?;
+        let logits = self.semantic_head.forward(&hidden)?;
+        Ok((logits, hidden))
+    }
+
+    /// Forward pass with a custom attention mask for tree-structured verification.
+    /// mask: (1, 1, seq_len, total_len) where total_len = cached_len + seq_len.
+    /// Uses 0.0 for attend and -inf for mask (additive mask).
+    fn forward_tree(
+        &self, sem_toks: &[u32], start_pos: usize,
+        kv_caches: &mut [(Tensor, Tensor)],
+        mask: &Tensor,
+    ) -> Result<Tensor> {
+        let device = self.rope_cos.device();
+        let seq_len = sem_toks.len();
+        let sem_t = Tensor::from_vec(sem_toks.to_vec(), (1, seq_len), device)?;
+        let mut x = self.semantic_emb.forward(&sem_t)?;
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            let (kc, vc) = &mut kv_caches[i];
+            x = layer.forward_seq(&x, &self.rope_cos, &self.rope_sin, start_pos, seq_len, kc, vc, mask)?;
+        }
+
+        let x = self.output_norm.forward(&x)?;
+        self.semantic_head.forward(&x)
+    }
+
     fn forward_seq(
         &self, sem_toks: &[u32], start_pos: usize,
         kv_caches: &mut [(Tensor, Tensor)],
@@ -707,6 +764,277 @@ impl SonataLM {
 
         let x = self.output_norm.forward(&x)?;
         self.semantic_head.forward(&x)
+    }
+}
+
+// ─── ReDrafter: RNN Draft Model ──────────────────────────────────────────────
+//
+// Apple ReDrafter approach: small GRU conditioned on main LM hidden states,
+// generating a tree of candidate tokens for parallel verification.
+// ~3-4M params, runs on Metal alongside the main model.
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct RnnDraftConfig {
+    #[serde(default = "default_gru_hidden")]  gru_hidden: usize,
+    #[serde(default = "default_gru_layers")]  gru_layers: usize,
+    #[serde(default = "default_tree_width")]  tree_width: usize,
+    #[serde(default = "default_tree_depth")]  tree_depth: usize,
+    #[serde(default = "default_drafter_emb")] emb_dim: usize,
+    #[serde(default = "default_d_model")]     d_model: usize,
+    #[serde(default = "default_sem_v")]       vocab_size: usize,
+}
+
+fn default_gru_hidden() -> usize { 512 }
+fn default_gru_layers() -> usize { 2 }
+fn default_tree_width() -> usize { 4 }
+fn default_tree_depth() -> usize { 3 }
+fn default_drafter_emb() -> usize { 256 }
+
+impl Default for RnnDraftConfig {
+    fn default() -> Self {
+        Self {
+            gru_hidden: 512, gru_layers: 2, tree_width: 4, tree_depth: 3,
+            emb_dim: 256, d_model: 1024, vocab_size: 4096,
+        }
+    }
+}
+
+/// GRU cell: z = σ(Wz·x + Uz·h), r = σ(Wr·x + Ur·h), h' = tanh(Wh·x + Uh·(r⊙h))
+/// h_new = (1-z)⊙h + z⊙h'
+struct GruCell {
+    w_z: Linear, u_z: Linear,
+    w_r: Linear, u_r: Linear,
+    w_h: Linear, u_h: Linear,
+    hidden_dim: usize,
+}
+
+impl GruCell {
+    fn load(input_dim: usize, hidden_dim: usize, vb: VarBuilder) -> Result<Self> {
+        Ok(Self {
+            w_z: linear_no_bias(input_dim, hidden_dim, vb.pp("w_z"))?,
+            u_z: linear_no_bias(hidden_dim, hidden_dim, vb.pp("u_z"))?,
+            w_r: linear_no_bias(input_dim, hidden_dim, vb.pp("w_r"))?,
+            u_r: linear_no_bias(hidden_dim, hidden_dim, vb.pp("u_r"))?,
+            w_h: linear_no_bias(input_dim, hidden_dim, vb.pp("w_h"))?,
+            u_h: linear_no_bias(hidden_dim, hidden_dim, vb.pp("u_h"))?,
+            hidden_dim,
+        })
+    }
+
+    /// x: (1, input_dim), h: (1, hidden_dim) -> h_new: (1, hidden_dim)
+    fn forward(&self, x: &Tensor, h: &Tensor) -> Result<Tensor> {
+        let z = (self.w_z.forward(x)? + self.u_z.forward(h)?)?.sigmoid()?;
+        let r = (self.w_r.forward(x)? + self.u_r.forward(h)?)?.sigmoid()?;
+        let rh = (&r * h)?;
+        let h_cand = (self.w_h.forward(x)? + self.u_h.forward(&rh)?)?.tanh()?;
+        let ones = Tensor::ones_like(&z)?;
+        let one_minus_z = (ones - &z)?;
+        let h_new = (one_minus_z * h)? + (&z * &h_cand)?;
+        Ok(h_new)
+    }
+
+    fn zero_state(&self, device: &Device, dtype: DType) -> Result<Tensor> {
+        Tensor::zeros((1, self.hidden_dim), dtype, device)
+    }
+}
+
+/// Tree candidate structure: W beams × D depth.
+/// Each beam is a sequence of draft tokens starting from the same parent.
+struct TreeCandidates {
+    /// beams[i] = token IDs for beam i, length up to tree_depth
+    beams: Vec<Vec<u32>>,
+    width: usize,
+    depth: usize,
+}
+
+impl TreeCandidates {
+    /// Flatten tree into a token sequence for verification.
+    /// Returns (input_tokens, tree_mask_data, beam_map).
+    /// input_tokens: [last_tok, beam0_tok0, beam0_tok1, ..., beam1_tok0, ...].
+    /// beam_map[i] = (beam_idx, depth_idx) for position i in the flattened sequence.
+    fn flatten_for_verify(
+        &self, last_token: u32, cached_len: usize, device: &Device, dtype: DType,
+    ) -> Result<(Vec<u32>, Tensor, Vec<(usize, usize)>)> {
+        let mut tokens = Vec::new();
+        let mut beam_map = Vec::new();
+
+        // Position 0: the last verified token
+        tokens.push(last_token);
+        beam_map.push((usize::MAX, usize::MAX)); // sentinel for root
+
+        // Flatten beams: for each beam, push [last_tok, draft[0], draft[1], ...]
+        // but we already pushed last_tok once. For tree attention:
+        // beam i depth j input token = if j==0 { last_token } else { beams[i][j-1] }
+        // The verify position for beam i depth j checks draft[i][j].
+        for (bi, beam) in self.beams.iter().enumerate() {
+            for (di, _tok) in beam.iter().enumerate() {
+                let input_tok = if di == 0 { last_token } else { beam[di - 1] };
+                tokens.push(input_tok);
+                beam_map.push((bi, di));
+            }
+        }
+
+        let seq_len = tokens.len();
+        let total_len = cached_len + seq_len;
+
+        // Build tree attention mask: (seq_len × total_len)
+        // All positions attend to cached KV entries (columns 0..cached_len).
+        // Position 0 (root) only attends to itself + cached.
+        // Beam positions attend to cached + root + their ancestor chain.
+        let mut mask_data = vec![0.0f32; seq_len * total_len];
+        for i in 0..seq_len {
+            // Mask all positions after self in the draft sequence
+            for j in (cached_len + i + 1)..total_len {
+                mask_data[i * total_len + j] = f32::NEG_INFINITY;
+            }
+        }
+
+        // Now apply tree structure: mask out sibling beams
+        // Position 0 is root — standard causal (already correct)
+        // For position p (p>0): only attend to cached + root + same-beam ancestors
+        let mut pos = 1; // skip root
+        for (bi, beam) in self.beams.iter().enumerate() {
+            for di in 0..beam.len() {
+                let p = pos; // current position in flattened sequence
+
+                // Mask out ALL other draft positions, then un-mask ancestors
+                for j in (cached_len + 1)..(cached_len + seq_len) {
+                    mask_data[p * total_len + j] = f32::NEG_INFINITY;
+                }
+
+                // Un-mask: root (position cached_len + 0)
+                mask_data[p * total_len + cached_len] = 0.0;
+
+                // Un-mask: ancestors in same beam (positions for beam bi, depths < di)
+                // The start of beam bi in the flattened sequence is 1 + bi * max_depth
+                let beam_start = 1 + bi * beam.len();
+                for ancestor_di in 0..di {
+                    let ancestor_pos = cached_len + beam_start + ancestor_di;
+                    mask_data[p * total_len + ancestor_pos] = 0.0;
+                }
+
+                // Un-mask: self
+                mask_data[p * total_len + cached_len + p] = 0.0;
+
+                pos += 1;
+            }
+        }
+
+        let mask = Tensor::from_vec(mask_data, (1, 1, seq_len, total_len), device)?
+            .to_dtype(dtype)?;
+
+        Ok((tokens, mask, beam_map))
+    }
+}
+
+/// RNN draft model: projects main LM hidden state through GRU layers to generate
+/// a tree of candidate tokens.
+struct RnnDrafter {
+    /// Projects main LM hidden (d_model) to GRU initial state (gru_hidden)
+    hidden_proj: Linear,
+    /// Token embedding for draft input (vocab_size → emb_dim)
+    token_emb: Embedding,
+    /// Stacked GRU layers
+    gru_layers: Vec<GruCell>,
+    /// Output projection to vocabulary logits
+    output_head: Linear,
+    cfg: RnnDraftConfig,
+}
+
+impl RnnDrafter {
+    fn load(cfg: &RnnDraftConfig, vb: VarBuilder, _device: &Device, _dtype: DType) -> Result<Self> {
+        let hidden_proj = linear_no_bias(cfg.d_model, cfg.gru_hidden, vb.pp("hidden_proj"))?;
+        let token_emb = embedding(cfg.vocab_size, cfg.emb_dim, vb.pp("token_emb"))?;
+
+        let mut gru_layers = Vec::with_capacity(cfg.gru_layers);
+        let first_input_dim = cfg.emb_dim; // first layer takes token embedding
+        gru_layers.push(GruCell::load(first_input_dim, cfg.gru_hidden, vb.pp("gru.0"))?);
+        for i in 1..cfg.gru_layers {
+            // Subsequent layers take previous layer's hidden state
+            gru_layers.push(GruCell::load(cfg.gru_hidden, cfg.gru_hidden, vb.pp(format!("gru.{i}")))?);
+        }
+
+        let output_head = linear_no_bias(cfg.gru_hidden, cfg.vocab_size, vb.pp("output_head"))?;
+
+        Ok(Self { hidden_proj, token_emb, gru_layers, output_head, cfg })
+    }
+
+    /// Generate tree of candidate tokens from the main model's hidden state.
+    /// lm_hidden: (1, 1, d_model) — hidden state at the last verified position.
+    /// first_token: the token sampled from the main model's logits at this position.
+    /// Returns TreeCandidates with W beams × D depth.
+    fn draft_tree(
+        &self, lm_hidden: &Tensor, first_token: u32,
+        device: &Device, dtype: DType,
+    ) -> Result<TreeCandidates> {
+        let w = self.cfg.tree_width;
+        let d = self.cfg.tree_depth;
+
+        // Project LM hidden state to GRU initial state: (1, d_model) → (1, gru_hidden)
+        let h_squeezed = lm_hidden.squeeze(1)?; // (1, d_model)
+        let h0 = self.hidden_proj.forward(&h_squeezed)?;
+
+        // Initialize all GRU layers with the projected hidden state
+        let mut layer_states: Vec<Tensor> = Vec::with_capacity(self.cfg.gru_layers);
+        layer_states.push(h0);
+        for _ in 1..self.cfg.gru_layers {
+            layer_states.push(Tensor::zeros((1, self.cfg.gru_hidden), dtype, device)?);
+        }
+
+        // Depth 0: run GRU with first_token embedding, take top-W candidates
+        let tok_t = Tensor::from_vec(vec![first_token], (1,), device)?;
+        let emb = self.token_emb.forward(&tok_t)?; // (1, emb_dim)
+
+        let mut x = emb;
+        for (li, gru) in self.gru_layers.iter().enumerate() {
+            layer_states[li] = gru.forward(&x, &layer_states[li])?;
+            x = layer_states[li].clone();
+        }
+
+        let logits = self.output_head.forward(&x)?; // (1, vocab_size)
+        let logits_vec: Vec<f32> = logits.squeeze(0)?.to_dtype(DType::F32)?.to_vec1()?;
+
+        // Get top-W candidates at depth 0
+        let mut indexed: Vec<(usize, f32)> = logits_vec.iter().enumerate()
+            .map(|(i, &v)| (i, v)).collect();
+        indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let top_w: Vec<u32> = indexed.iter().take(w).map(|&(i, _)| i as u32).collect();
+
+        // Build beams: each starts with a top-W candidate, extends greedily for D-1 more
+        let mut beams: Vec<Vec<u32>> = Vec::with_capacity(w);
+        for &candidate in &top_w {
+            let mut beam = vec![candidate];
+
+            // Save GRU state for this branch (clone from depth-0 state)
+            let mut branch_states = layer_states.clone();
+
+            for _depth in 1..d {
+                let prev_tok = *beam.last().unwrap();
+                let tok_t = Tensor::from_vec(vec![prev_tok], (1,), device)?;
+                let emb = self.token_emb.forward(&tok_t)?;
+
+                let mut bx = emb;
+                for (li, gru) in self.gru_layers.iter().enumerate() {
+                    branch_states[li] = gru.forward(&bx, &branch_states[li])?;
+                    bx = branch_states[li].clone();
+                }
+
+                let logits = self.output_head.forward(&bx)?;
+                let lv: Vec<f32> = logits.squeeze(0)?.to_dtype(DType::F32)?.to_vec1()?;
+
+                // Greedy: take argmax for deeper levels
+                let next = lv.iter().enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i as u32).unwrap_or(0);
+
+                if next == 2 { break; } // EOS
+                beam.push(next);
+            }
+
+            beams.push(beam);
+        }
+
+        Ok(TreeCandidates { beams, width: w, depth: d })
     }
 }
 
@@ -739,6 +1067,8 @@ struct LmEngine {
     recent_tokens: VecDeque<u32>,
     consecutive_pad: usize,
     draft: Option<DraftModel>,
+    rnn_drafter: Option<RnnDrafter>,
+    last_hidden: Option<Tensor>,
     speculate_k: usize,
     mask_cache: CausalMaskCache,
 
@@ -857,6 +1187,8 @@ impl LmEngine {
             recent_tokens: VecDeque::with_capacity(64),
             consecutive_pad: 0,
             draft: None,
+            rnn_drafter: None,
+            last_hidden: None,
             speculate_k: 5,
             mask_cache: CausalMaskCache::new(),
             prosody_features: None,
@@ -1132,6 +1464,7 @@ impl LmEngine {
         self.consecutive_pad = 0;
         self.recent_tokens.clear();
         self.prosody_features = None;
+        self.last_hidden = None;
         if let Some(ref mut draft) = self.draft {
             draft.kv_caches = Self::new_kv_caches(&draft.model.cfg, &self.device, self.dtype, false)?;
         }
@@ -1157,10 +1490,229 @@ impl LmEngine {
         Ok(())
     }
 
+    fn load_rnn_drafter(&mut self, weights_path: &str, config_path: Option<&str>)
+        -> std::result::Result<(), Box<dyn std::error::Error>>
+    {
+        let cfg: RnnDraftConfig = if let Some(cp) = config_path {
+            let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(cp)?)?;
+            RnnDraftConfig {
+                gru_hidden: raw.get("gru_hidden").and_then(|v| v.as_u64()).unwrap_or(512) as usize,
+                gru_layers: raw.get("gru_layers").and_then(|v| v.as_u64()).unwrap_or(2) as usize,
+                tree_width: raw.get("tree_width").and_then(|v| v.as_u64()).unwrap_or(4) as usize,
+                tree_depth: raw.get("tree_depth").and_then(|v| v.as_u64()).unwrap_or(3) as usize,
+                emb_dim: raw.get("emb_dim").and_then(|v| v.as_u64()).unwrap_or(256) as usize,
+                d_model: self.model.cfg.d_model,
+                vocab_size: self.model.cfg.semantic_vocab_size,
+            }
+        } else {
+            RnnDraftConfig {
+                d_model: self.model.cfg.d_model,
+                vocab_size: self.model.cfg.semantic_vocab_size,
+                ..RnnDraftConfig::default()
+            }
+        };
+
+        eprintln!("[sonata_lm] Loading RNN drafter (GRU h={}, L={}, tree {}×{})...",
+                  cfg.gru_hidden, cfg.gru_layers, cfg.tree_width, cfg.tree_depth);
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&[weights_path], self.dtype, &self.device)?
+        };
+        let drafter = RnnDrafter::load(&cfg, vb, &self.device, self.dtype)?;
+        let params: usize = cfg.d_model * cfg.gru_hidden  // hidden_proj
+            + cfg.vocab_size * cfg.emb_dim                  // token_emb
+            + cfg.gru_layers * (cfg.emb_dim * cfg.gru_hidden * 3 + cfg.gru_hidden * cfg.gru_hidden * 3) // rough GRU
+            + cfg.gru_hidden * cfg.vocab_size;              // output_head
+        eprintln!("[sonata_lm] RNN drafter loaded (~{:.1}M params)", params as f64 / 1e6);
+        self.rnn_drafter = Some(drafter);
+        Ok(())
+    }
+
+    /// Tree-based speculative decoding using the RNN drafter (ReDrafter approach).
+    /// 1. Run main model to get hidden state + first token
+    /// 2. RNN generates tree of candidates from hidden state
+    /// 3. Verify tree in one forward pass through main model
+    /// Returns accepted tokens.
+    fn tree_speculative_step(&mut self) -> std::result::Result<Vec<u32>, Box<dyn std::error::Error>> {
+        if self.done || self.step_count >= self.max_tokens {
+            self.done = true;
+            return Ok(Vec::new());
+        }
+
+        // Tree spec decoding only works with legacy (non-cross-attention) models
+        let drafter = match self.rnn_drafter {
+            Some(ref d) if !self.model.use_cross_attention => d,
+            _ => {
+                let tok = self.step()?;
+                return Ok(tok.into_iter().collect());
+            }
+        };
+
+        let sem_tok = *self.semantic_tokens.last().unwrap_or(&1);
+        let pos = self.text_pos + self.step_count;
+
+        // Step 1: Run main model to get hidden state + logits for first token
+        let (logits, hidden) = self.model.forward_hidden(
+            sem_tok, pos, &mut self.kv_caches, None, self.text_encoding.as_ref(),
+        )?;
+        let logits = logits.squeeze(0)?.squeeze(0)?;
+        let mut logits_vec: Vec<f32> = logits.to_dtype(DType::F32)?.to_vec1()?;
+        Self::apply_repetition_penalty(&mut logits_vec, &self.recent_tokens, self.repetition_penalty);
+        let temp = if self.temperature > 1e-8 { self.temperature } else { 1e-8 };
+        let inv_temp = 1.0 / temp;
+        for v in logits_vec.iter_mut() { *v *= inv_temp; }
+        let first_token = Self::sample_top_k_top_p(&logits_vec, self.top_k, self.top_p,
+                                                    &mut self.sampling_buf);
+
+        if first_token == 2 {
+            self.done = true;
+            return Ok(Vec::new());
+        }
+
+        // Accept first token (always verified by main model)
+        self.semantic_tokens.push(first_token);
+        self.step_count += 1;
+        self.recent_tokens.push_back(first_token);
+        if self.recent_tokens.len() > 64 { self.recent_tokens.pop_front(); }
+        if first_token == 0 {
+            self.consecutive_pad += 1;
+            if self.consecutive_pad > 100 { self.done = true; return Ok(vec![first_token]); }
+        } else {
+            self.consecutive_pad = 0;
+        }
+
+        // Step 2: Generate tree candidates using RNN drafter
+        let tree = drafter.draft_tree(
+            &hidden, first_token, &self.device, self.dtype,
+        )?;
+
+        if tree.beams.is_empty() || tree.beams[0].is_empty() {
+            self.last_hidden = Some(hidden);
+            return Ok(vec![first_token]);
+        }
+
+        // Step 3: Build tree attention mask and verify all candidates
+        let cached_len = self.text_pos + self.step_count;
+        let (verify_tokens, mask, _beam_map) = tree.flatten_for_verify(
+            first_token, cached_len, &self.device, self.dtype,
+        )?;
+
+        let tree_logits = self.model.forward_tree(
+            &verify_tokens, cached_len, &mut self.kv_caches, &mask,
+        )?;
+        let tree_logits = tree_logits.squeeze(0)?; // (seq_len, vocab)
+
+        // Step 4: Walk the tree and accept the longest matching beam
+        // logits[0] = prediction after first_token (for all beams' depth 0)
+        let root_logits = tree_logits.i(0)?;
+        let mut rl: Vec<f32> = root_logits.to_dtype(DType::F32)?.to_vec1()?;
+        Self::apply_repetition_penalty(&mut rl, &self.recent_tokens, self.repetition_penalty);
+        for v in rl.iter_mut() { *v *= inv_temp; }
+        let verified_at_root = Self::sample_top_k_top_p(&rl, self.top_k, self.top_p,
+                                                         &mut self.sampling_buf);
+
+        let mut accepted = vec![first_token];
+        let mut best_beam: Option<usize> = None;
+
+        // Find which beam(s) match at depth 0
+        for (bi, beam) in tree.beams.iter().enumerate() {
+            if !beam.is_empty() {
+                let matches = if self.coarse_grained {
+                    Self::tokens_similar_static(self.similarity_groups.as_ref(), verified_at_root, beam[0])
+                } else {
+                    verified_at_root == beam[0]
+                };
+                if matches {
+                    best_beam = Some(bi);
+                    // best match at depth 0
+                    break;
+                }
+            }
+        }
+
+        if let Some(bi) = best_beam {
+            let beam = &tree.beams[bi];
+            accepted.push(beam[0]);
+
+            // Continue accepting deeper tokens in this beam
+            let beam_start_in_flat = 1 + bi * beam.len();
+            for di in 1..beam.len() {
+                let flat_pos = beam_start_in_flat + di - 1; // position of the parent in flat seq
+                if flat_pos >= tree_logits.dim(0)? { break; }
+
+                let pos_logits = tree_logits.i(flat_pos)?;
+                let mut lv: Vec<f32> = pos_logits.to_dtype(DType::F32)?.to_vec1()?;
+                Self::apply_repetition_penalty(&mut lv, &self.recent_tokens, self.repetition_penalty);
+                for v in lv.iter_mut() { *v *= inv_temp; }
+                let verified = Self::sample_top_k_top_p(&lv, self.top_k, self.top_p,
+                                                         &mut self.sampling_buf);
+
+                let matches = if self.coarse_grained {
+                    Self::tokens_similar_static(self.similarity_groups.as_ref(), verified, beam[di])
+                } else {
+                    verified == beam[di]
+                };
+
+                if matches {
+                    accepted.push(beam[di]);
+                    // accepted at depth di
+                } else {
+                    // Reject: use verified token instead
+                    accepted.push(verified);
+                    // accepted at depth di
+                    break;
+                }
+            }
+        } else {
+            // No beam matched at depth 0 — use the verified root token
+            accepted.push(verified_at_root);
+        }
+
+        // Update engine state for all additionally accepted tokens (skip first_token, already handled)
+        for &tok in &accepted[1..] {
+            self.semantic_tokens.push(tok);
+            self.step_count += 1;
+            self.recent_tokens.push_back(tok);
+            if self.recent_tokens.len() > 64 { self.recent_tokens.pop_front(); }
+            if tok == 2 { self.done = true; break; }
+            if tok == 0 {
+                self.consecutive_pad += 1;
+                if self.consecutive_pad > 100 { self.done = true; break; }
+            } else {
+                self.consecutive_pad = 0;
+            }
+        }
+
+        // Truncate KV cache: tree verification added entries for all candidates,
+        // but we only accepted some. Trim the cache to the actual position.
+        let target_kv_len = self.text_pos + self.step_count;
+        for (kc, vc) in self.kv_caches.iter_mut() {
+            let current_len = kc.dim(2)?;
+            if current_len > target_kv_len {
+                // For pre-allocated caches, entries beyond target are stale but
+                // narrow() in forward() excludes them. For dynamic caches, truncate.
+                let cache_cap = self.model.cfg.max_seq_len;
+                if current_len <= cache_cap {
+                    // Pre-allocated: no truncation needed, narrow handles it
+                } else {
+                    *kc = kc.narrow(2, 0, target_kv_len)?;
+                    *vc = vc.narrow(2, 0, target_kv_len)?;
+                }
+            }
+        }
+
+        self.last_hidden = Some(hidden);
+        Ok(accepted)
+    }
+
     fn speculative_step(&mut self) -> std::result::Result<Vec<u32>, Box<dyn std::error::Error>> {
         if self.done || self.step_count >= self.max_tokens {
             self.done = true;
             return Ok(Vec::new());
+        }
+
+        // Prefer RNN drafter (tree-based) over transformer draft model (linear)
+        if self.rnn_drafter.is_some() && !self.model.use_cross_attention {
+            return self.tree_speculative_step();
         }
 
         let k = self.speculate_k;
@@ -1729,3 +2281,62 @@ pub extern "C" fn sonata_lm_frame_rate() -> c_int { 50 }
 
 #[no_mangle]
 pub extern "C" fn sonata_lm_samples_per_frame() -> c_int { 480 }
+
+/// Load an RNN (GRU) draft model for ReDrafter-style tree speculative decoding.
+/// When loaded, speculate_step automatically uses tree-based drafting.
+/// weights_path: path to safetensors file with GRU weights.
+/// config_path: optional JSON config (gru_hidden, gru_layers, tree_width, tree_depth, emb_dim).
+/// Returns: 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn sonata_lm_load_rnn_drafter(
+    engine: *mut c_void, weights_path: *const c_char, config_path: *const c_char,
+) -> c_int {
+    if engine.is_null() || weights_path.is_null() { return -1; }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let eng = unsafe { &mut *(engine as *mut LmEngine) };
+        let wp = unsafe { CStr::from_ptr(weights_path) }.to_str().unwrap_or("");
+        let cp = if config_path.is_null() { None }
+                 else { unsafe { CStr::from_ptr(config_path) }.to_str().ok() };
+        match eng.load_rnn_drafter(wp, cp) {
+            Ok(()) => 0,
+            Err(e) => { eprintln!("[sonata_lm] rnn_drafter: {}", e); -1 }
+        }
+    }));
+    match result {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[sonata_lm] panic in load_rnn_drafter: {}", panic_message(e));
+            -1
+        }
+    }
+}
+
+/// Configure tree shape for RNN drafter speculative decoding.
+/// width: number of candidate beams (default 4).
+/// depth: maximum tokens per beam (default 3).
+/// Returns: 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn sonata_lm_set_tree_config(
+    engine: *mut c_void, width: c_int, depth: c_int,
+) -> c_int {
+    if engine.is_null() || width <= 0 || depth <= 0 { return -1; }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let eng = unsafe { &mut *(engine as *mut LmEngine) };
+        if let Some(ref mut drafter) = eng.rnn_drafter {
+            drafter.cfg.tree_width = width as usize;
+            drafter.cfg.tree_depth = depth as usize;
+            eprintln!("[sonata_lm] Tree config: {}×{}", width, depth);
+            0
+        } else {
+            eprintln!("[sonata_lm] No RNN drafter loaded");
+            -1
+        }
+    }));
+    match result {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[sonata_lm] panic in set_tree_config: {}", panic_message(e));
+            -1
+        }
+    }
+}
