@@ -179,6 +179,17 @@ extern int speaker_encoder_extract(SpeakerEncoder *enc, const float *audio, int 
 extern int speaker_encoder_embedding_dim(const SpeakerEncoder *enc);
 extern int speaker_encoder_extract_from_wav(SpeakerEncoder *enc, const char *wav_path, float *embedding_out);
 
+/* --- Speaker encoder (native Rust/ECAPA-TDNN) --- */
+typedef void* SpeakerEncoderNative;
+extern SpeakerEncoderNative speaker_encoder_native_create(const char *weights_path, const char *config_path);
+extern void speaker_encoder_native_destroy(SpeakerEncoderNative encoder);
+extern int speaker_encoder_native_embedding_dim(SpeakerEncoderNative encoder);
+extern int speaker_encoder_native_sample_rate(SpeakerEncoderNative encoder);
+extern int speaker_encoder_native_encode(SpeakerEncoderNative encoder, const float *mel_data,
+                                        int n_frames, int n_mels, float *out);
+extern int speaker_encoder_native_encode_audio(SpeakerEncoderNative encoder, const float *pcm,
+                                              int n_samples, int sample_rate, float *out);
+
 /* --- Speaker diarizer --- */
 typedef struct SpeakerDiarizer SpeakerDiarizer;
 extern SpeakerDiarizer *diarizer_create(const char *encoder_path, float threshold, int max_speakers);
