@@ -45,6 +45,7 @@
 #include "arena.h"
 #include "spmc_ring.h"
 #include "speech_detector.h"
+#include "semantic_eou.h"
 #include "conformer_stt.h"
 #include "latency_profiler.h"
 #include "bnns_conformer.h"
@@ -3305,6 +3306,7 @@ typedef struct {
     /* Audio post-processing */
     const char *silero_vad_path;  /* deprecated — kept for config compat */
     const char *native_vad_path; /* --vad: path to .nvad native weights */
+    const char *semantic_eou_path; /* --semantic-eou: path to .seou weights */
     const char *emosteer_path;   /* --emosteer: path to emotion directions JSON */
     const char *prosody_log_path; /* --prosody-log: JSONL prosody log file */
 
@@ -3405,6 +3407,7 @@ static PipelineConfig default_config(void) {
         .sonata_refiner_path  = NULL,
         .silero_vad_path      = NULL,
         .native_vad_path      = NULL,
+        .semantic_eou_path    = NULL,
         .emosteer_path        = NULL,
         .prosody_log_path     = NULL,
         .pitch        = 1.0f,
@@ -3586,6 +3589,7 @@ static void load_config_file(PipelineConfig *cfg, const char *path) {
     if (audio) {
         cfg->silero_vad_path = json_str(audio, "silero_vad", cfg->silero_vad_path);
         cfg->native_vad_path = json_str(audio, "vad", cfg->native_vad_path);
+        cfg->semantic_eou_path = json_str(audio, "semantic_eou", cfg->semantic_eou_path);
         cfg->emosteer_path = json_str(audio, "emosteer", cfg->emosteer_path);
         cfg->prosody_log_path = json_str(audio, "prosody_log", cfg->prosody_log_path);
         cfg->pitch = json_float(audio, "pitch", cfg->pitch);
@@ -3634,6 +3638,7 @@ typedef struct {
     int                enable_breath;   /* Insert breath noise at sentence gaps */
     int                enable_lufs;     /* LUFS normalization */
     SpeechDetector    *speech_detector;  /* Unified VAD + EOU (native_vad + mimi_ep + fused_eou) */
+    SemanticEOU       *semantic_eou;    /* Text-based sentence completion predictor (5th EOU signal) */
     int                speculative_sent; /* 1 if speculative Claude request in-flight */
     int                streaming_overlap; /* 1 if partial-transcript LLM warmup sent */
     int                overlap_word_count; /* Word count when overlap was sent */
@@ -3800,6 +3805,19 @@ static AudioPostProcessor *postproc_create(PipelineConfig *cfg) {
     };
     pp->speech_detector = speech_detector_create(&sd_cfg);
 
+    /* Semantic EOU: text-based sentence completion predictor (5th signal) */
+    pp->semantic_eou = semantic_eou_create();
+    if (pp->semantic_eou) {
+        if (cfg->semantic_eou_path && cfg->semantic_eou_path[0]) {
+            if (semantic_eou_load_weights(pp->semantic_eou, cfg->semantic_eou_path) == 0) {
+                /* Enable semantic signal in fused EOU with weight 0.15 */
+                speech_detector_set_semantic_weight(pp->speech_detector, 0.15f);
+            }
+        } else {
+            semantic_eou_init_random(pp->semantic_eou, 42);
+        }
+    }
+
     pp->speculative_sent = 0;
     pp->streaming_overlap = 0;
     pp->overlap_word_count = 0;
@@ -3881,6 +3899,7 @@ static void postproc_destroy(AudioPostProcessor *pp) {
     if (pp->lufs)           lufs_destroy(pp->lufs);
     if (pp->spmc)           { spmc_destroy(pp->spmc); free(pp->spmc); }
     if (pp->speech_detector) speech_detector_destroy(pp->speech_detector);
+    if (pp->semantic_eou)   semantic_eou_destroy(pp->semantic_eou);
     if (pp->noise_gate)     noise_gate_destroy(pp->noise_gate);
     if (pp->deep_filter)    deep_filter_destroy(pp->deep_filter);
     if (pp->emosteer_bank)  emosteer_destroy(pp->emosteer_bank);
@@ -3901,6 +3920,7 @@ static void postproc_reset(AudioPostProcessor *pp) {
     if (pp->resampler_24_16) hw_resampler_reset(pp->resampler_24_16);
     if (pp->lufs)           lufs_reset(pp->lufs);
     if (pp->speech_detector) speech_detector_reset(pp->speech_detector);
+    if (pp->semantic_eou)   semantic_eou_reset(pp->semantic_eou);
     if (pp->noise_gate)     noise_gate_reset(pp->noise_gate);
     if (pp->deep_filter)    deep_filter_reset(pp->deep_filter);
     if (pp->backchannel)    backchannel_reset(pp->backchannel);
@@ -4892,7 +4912,14 @@ static PipelineState pipeline_tick(
             }
         }
 
-        /* ── Fused 3-Signal EOU Detection (via SpeechDetector) ── */
+        /* ── Semantic EOU: feed transcript before fusion ── */
+        if (pp && pp->semantic_eou && *transcript_len > 0 &&
+            semantic_eou_word_count(transcript) >= 3) {
+            float sem_prob = semantic_eou_process(pp->semantic_eou, transcript);
+            speech_detector_feed_semantic(pp->speech_detector, sem_prob);
+        }
+
+        /* ── Fused EOU Detection (via SpeechDetector) ── */
         int energy_vad = voice_engine_get_vad_state(audio);
         float stt_eou_prob = stt->has_vad(stt->engine)
             ? stt->get_vad_prob(stt->engine, 2) : 0.0f;
@@ -5570,6 +5597,8 @@ static PipelineConfig parse_args_with_base(int argc, char **argv, PipelineConfig
             cfg.spatial_az = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--vad") == 0 && i + 1 < argc) {
             cfg.native_vad_path = argv[++i];
+        } else if (strcmp(argv[i], "--semantic-eou") == 0 && i + 1 < argc) {
+            cfg.semantic_eou_path = argv[++i];
         } else if (strcmp(argv[i], "--silero-vad") == 0 && i + 1 < argc) {
             fprintf(stderr, "[pocket-voice] --silero-vad is deprecated; use --vad with .nvad weights\n");
             ++i;

@@ -50,6 +50,11 @@ struct FusedEOU {
     int   prosody_count;    /* Total prosody frames accumulated */
     float prosody_prob;     /* Cached P(eot) from prosody */
 
+    /* Semantic completion signal (5th signal) */
+    float w_semantic;       /* Weight for semantic in fusion (default 0.0) */
+    float solo_semantic;    /* Solo threshold for semantic */
+    float semantic_prob;    /* Cached P(complete) from text model */
+
     /* Conversation context (LiveKit-inspired) */
     float context_adj;      /* Threshold adjustment: <0 = easier trigger */
     char  last_transcript[CONTEXT_MAX_LEN];
@@ -73,6 +78,9 @@ FusedEOU *fused_eou_create(float threshold, int consec_frames, float frame_ms) {
 
     eou->w_prosody    = 0.0f;   /* Off by default — backward compatible */
     eou->solo_prosody = 0.92f;
+
+    eou->w_semantic    = 0.0f;  /* Off by default — backward compatible */
+    eou->solo_semantic = 0.88f;
 
     return eou;
 }
@@ -241,14 +249,25 @@ EOUResult fused_eou_process(FusedEOU *eou, EOUSignals sig) {
         src |= EOU_SRC_PROSODY;
     }
 
-    /* ── Weighted Fusion (3-signal core + optional prosody) ── */
+    /* ── Semantic signal (5th signal) ────────────────── */
+    if (eou->semantic_prob >= eou->solo_semantic + ctx && eou->speech_detected &&
+        eou->w_semantic > 0.0f) {
+        src |= EOU_SRC_SEMANTIC;
+    }
+
+    /* ── Weighted Fusion (3-signal core + optional prosody + optional semantic) ── */
     float core = eou->w_energy * sig.energy_signal
                + eou->w_mimi  * sig.mimi_eot_prob
                + eou->w_stt   * sig.stt_eou_prob;
     float fused;
-    if (eou->w_prosody > 0.0f) {
-        fused = (1.0f - eou->w_prosody) * core
-              + eou->w_prosody * eou->prosody_prob;
+    float aux_weight = eou->w_prosody + eou->w_semantic;
+    if (aux_weight > 0.0f) {
+        float aux = 0.0f;
+        if (eou->w_prosody > 0.0f)
+            aux += eou->w_prosody * eou->prosody_prob;
+        if (eou->w_semantic > 0.0f)
+            aux += eou->w_semantic * eou->semantic_prob;
+        fused = (1.0f - aux_weight) * core + aux;
     } else {
         fused = core;
     }
@@ -325,6 +344,9 @@ void fused_eou_reset(FusedEOU *eou) {
     eou->prosody_write = 0;
     eou->prosody_count = 0;
     eou->prosody_prob = 0.0f;
+
+    /* Clear semantic state */
+    eou->semantic_prob = 0.0f;
 }
 
 void fused_eou_set_weights(FusedEOU *eou, float w_energy, float w_mimi, float w_stt) {
@@ -358,19 +380,21 @@ void fused_eou_print_status(const FusedEOU *eou) {
     if (!eou) return;
 
     const char *src_str = "none";
-    if (eou->trigger_source & EOU_SRC_FUSED)    src_str = "FUSED";
-    else if (eou->trigger_source & EOU_SRC_PROSODY) src_str = "PROSODY";
-    else if (eou->trigger_source & EOU_SRC_MIMI)    src_str = "MIMI";
-    else if (eou->trigger_source & EOU_SRC_STT)     src_str = "STT";
-    else if (eou->trigger_source & EOU_SRC_ENERGY)   src_str = "ENERGY";
+    if (eou->trigger_source & EOU_SRC_FUSED)      src_str = "FUSED";
+    else if (eou->trigger_source & EOU_SRC_SEMANTIC) src_str = "SEMANTIC";
+    else if (eou->trigger_source & EOU_SRC_PROSODY)  src_str = "PROSODY";
+    else if (eou->trigger_source & EOU_SRC_MIMI)     src_str = "MIMI";
+    else if (eou->trigger_source & EOU_SRC_STT)      src_str = "STT";
+    else if (eou->trigger_source & EOU_SRC_ENERGY)    src_str = "ENERGY";
 
     fprintf(stderr, "[fused_eou] prob=%.3f trig=%d src=%s consec=%d "
-            "latency=%.0fms frames=%d prosody=%.3f ctx_adj=%+.2f\n",
+            "latency=%.0fms frames=%d prosody=%.3f semantic=%.3f ctx_adj=%+.2f\n",
             eou->smoothed_prob, eou->triggered, src_str,
             eou->consec_count,
             (float)eou->frames_since_speech * eou->frame_ms,
             eou->total_frames,
             eou->prosody_prob,
+            eou->semantic_prob,
             eou->context_adj);
 }
 
@@ -418,4 +442,26 @@ float fused_eou_prosody_prob(const FusedEOU *eou) {
 
 float fused_eou_context_adjustment(const FusedEOU *eou) {
     return eou ? eou->context_adj : 0.0f;
+}
+
+/* ── Semantic Completion Signal ────────────────────────────── */
+
+void fused_eou_feed_semantic(FusedEOU *eou, float prob) {
+    if (!eou) return;
+    /* Sanitize — clamp to [0, 1] and reject NaN/Inf */
+    if (isnan(prob) || isinf(prob)) prob = 0.5f;
+    if (prob < 0.0f) prob = 0.0f;
+    if (prob > 1.0f) prob = 1.0f;
+    eou->semantic_prob = prob;
+}
+
+void fused_eou_set_semantic_weight(FusedEOU *eou, float w_semantic) {
+    if (!eou) return;
+    if (w_semantic < 0.0f) w_semantic = 0.0f;
+    if (w_semantic > 0.4f) w_semantic = 0.4f; /* Cap to preserve core signals */
+    eou->w_semantic = w_semantic;
+}
+
+float fused_eou_semantic_prob(const FusedEOU *eou) {
+    return eou ? eou->semantic_prob : 0.0f;
 }

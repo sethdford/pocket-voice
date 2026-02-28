@@ -60,6 +60,7 @@ typedef struct {
 #define EOU_SRC_STT      (1 << 2)
 #define EOU_SRC_FUSED    (1 << 3)
 #define EOU_SRC_PROSODY  (1 << 4)
+#define EOU_SRC_SEMANTIC (1 << 5)
 
 /* Prosodic features for turn-taking detection (Krisp-inspired) */
 typedef struct {
@@ -151,6 +152,27 @@ float fused_eou_prosody_prob(const FusedEOU *eou);
  * Get the current context threshold adjustment.
  */
 float fused_eou_context_adjustment(const FusedEOU *eou);
+
+/**
+ * Feed the latest semantic completion probability.
+ * Call whenever new STT transcript text is available.
+ * The semantic signal only contributes to fusion when the weight > 0
+ * and the transcript has sufficient context (3+ words).
+ *
+ * @param prob  P(sentence complete) from semantic_eou_process() [0, 1]
+ */
+void fused_eou_feed_semantic(FusedEOU *eou, float prob);
+
+/**
+ * Set the semantic signal weight (default 0.0 for backward compatibility).
+ * Recommended value: 0.15. Capped at 0.4 to preserve core signals.
+ */
+void fused_eou_set_semantic_weight(FusedEOU *eou, float w_semantic);
+
+/**
+ * Get the current semantic-derived completion probability.
+ */
+float fused_eou_semantic_prob(const FusedEOU *eou);
 
 #ifdef __cplusplus
 }

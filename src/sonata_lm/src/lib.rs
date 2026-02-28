@@ -37,6 +37,8 @@ struct LmConfig {
     #[serde(default = "default_theta")]     rope_theta: f64,
     #[serde(default = "default_eps")]       norm_eps: f64,
     #[serde(default)]                       use_prosody: bool,
+    #[serde(default)]                       use_acoustic_head: bool,
+    #[serde(default = "default_acoustic_dim")] acoustic_dim: usize,
 }
 
 const PROSODY_DIM: usize = 3; // (log_pitch, energy, speaking_rate)
@@ -209,15 +211,16 @@ impl GQAttention {
     ) -> Result<Tensor> {
         let (b, _t, _d) = x.dims3()?;
 
+        // Skip .contiguous() — RoPE creates new contiguous tensors, SDPA Metal kernel handles strides
         let q = self.wq.forward(x)?
             .reshape((b, 1, self.n_heads, self.head_dim))?
-            .transpose(1, 2)?.contiguous()?;
+            .transpose(1, 2)?;
         let k = self.wk.forward(x)?
             .reshape((b, 1, self.n_kv_heads, self.head_dim))?
-            .transpose(1, 2)?.contiguous()?;
+            .transpose(1, 2)?;
         let v = self.wv.forward(x)?
             .reshape((b, 1, self.n_kv_heads, self.head_dim))?
-            .transpose(1, 2)?.contiguous()?;
+            .transpose(1, 2)?;
 
         let (q, k) = apply_rope(&q, &k, cos, sin, pos)?;
 
@@ -232,13 +235,9 @@ impl GQAttention {
             (k_cache.clone(), v_cache.clone())
         };
 
-        let k_exp = repeat_kv(&k_full, self.n_rep)?;
-        let v_exp = repeat_kv(&v_full, self.n_rep)?;
-
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let scores = (q.matmul(&k_exp.t()?)? * scale)?;
-        let attn = candle_nn::ops::softmax_last_dim(&scores)?;
-        let out = attn.matmul(&v_exp)?;
+        // Fused SDPA Metal kernel — handles GQA natively (no repeat_kv needed)
+        let scale = (self.head_dim as f32).powf(-0.5);
+        let out = candle_nn::ops::sdpa(&q, &k_full, &v_full, scale, 1.0)?;
         let out = out.transpose(1, 2)?.contiguous()?.reshape((b, 1, ()))?;
         self.wo.forward(&out)
     }
@@ -251,15 +250,16 @@ impl GQAttention {
         mask: &Tensor,
     ) -> Result<Tensor> {
         let (b, t, _d) = x.dims3()?;
+        // Skip .contiguous() — apply_rope_seq creates new contiguous tensors via Tensor::cat
         let q = self.wq.forward(x)?
             .reshape((b, t, self.n_heads, self.head_dim))?
-            .transpose(1, 2)?.contiguous()?;
+            .transpose(1, 2)?;
         let k = self.wk.forward(x)?
             .reshape((b, t, self.n_kv_heads, self.head_dim))?
-            .transpose(1, 2)?.contiguous()?;
+            .transpose(1, 2)?;
         let v = self.wv.forward(x)?
             .reshape((b, t, self.n_kv_heads, self.head_dim))?
-            .transpose(1, 2)?.contiguous()?;
+            .transpose(1, 2)?;
 
         let (q, k) = apply_rope_seq(&q, &k, cos, sin, pos, seq_len)?;
 
@@ -384,13 +384,9 @@ impl CrossAttention {
             .reshape((b, t_c, self.n_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        let k = if self.n_rep > 1 { repeat_kv(&k, self.n_rep)? } else { k };
-        let v = if self.n_rep > 1 { repeat_kv(&v, self.n_rep)? } else { v };
-
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let scores = (q.matmul(&k.t()?)? * scale)?;
-        let attn = candle_nn::ops::softmax_last_dim(&scores)?;
-        let out = attn.matmul(&v)?;
+        // Fused SDPA Metal kernel — handles GQA natively (no repeat_kv needed)
+        let scale = (self.head_dim as f32).powf(-0.5);
+        let out = candle_nn::ops::sdpa(&q, &k, &v, scale, 1.0)?;
         let out = out.transpose(1, 2)?.contiguous()?.reshape((b, t_a, ()))?;
         self.wo.forward(&out)
     }
@@ -467,10 +463,9 @@ impl TextEncoderBlock {
         let q = self.attn_q.forward(&h)?.reshape((b, t, self.n_heads, self.head_dim))?.transpose(1, 2)?;
         let k = self.attn_k.forward(&h)?.reshape((b, t, self.n_heads, self.head_dim))?.transpose(1, 2)?;
         let v = self.attn_v.forward(&h)?.reshape((b, t, self.n_heads, self.head_dim))?.transpose(1, 2)?;
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let scores = (q.matmul(&k.t()?)? * scale)?;
-        let attn = candle_nn::ops::softmax_last_dim(&scores)?;
-        let out = attn.matmul(&v)?;
+        // Fused SDPA Metal kernel — bidirectional (no mask needed for text encoder)
+        let scale = (self.head_dim as f32).powf(-0.5);
+        let out = candle_nn::ops::sdpa(&q, &k, &v, scale, 1.0)?;
         let out = out.transpose(1, 2)?.contiguous()?.reshape((b, t, ()))?;
         let out = self.attn_o.forward(&out)?;
         let x = (x + out)?;

@@ -326,3 +326,13 @@ int speech_detector_has_vad(const SpeechDetector *sd) {
 int speech_detector_has_endpointer(const SpeechDetector *sd) {
     return sd && sd->mimi_ep;
 }
+
+void speech_detector_feed_semantic(SpeechDetector *sd, float prob) {
+    if (sd && sd->fused_eou)
+        fused_eou_feed_semantic(sd->fused_eou, prob);
+}
+
+void speech_detector_set_semantic_weight(SpeechDetector *sd, float w) {
+    if (sd && sd->fused_eou)
+        fused_eou_set_semantic_weight(sd->fused_eou, w);
+}

@@ -113,6 +113,17 @@ int speech_detector_has_vad(const SpeechDetector *sd);
  */
 int speech_detector_has_endpointer(const SpeechDetector *sd);
 
+/**
+ * Feed semantic completion probability from SemanticEOU into the fused EOU.
+ * Call whenever new STT transcript text has been processed.
+ */
+void speech_detector_feed_semantic(SpeechDetector *sd, float prob);
+
+/**
+ * Set the semantic signal weight in fused EOU (default 0, recommended 0.15).
+ */
+void speech_detector_set_semantic_weight(SpeechDetector *sd, float w);
+
 #ifdef __cplusplus
 }
 #endif
