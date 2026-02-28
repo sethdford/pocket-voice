@@ -76,7 +76,7 @@ FusedEOU *fused_eou_create(float threshold, int consec_frames, float frame_ms) {
     eou->consec_required = consec_frames;
     eou->frame_ms = frame_ms;
 
-    eou->w_prosody    = 0.0f;   /* Off by default — backward compatible */
+    eou->w_prosody    = 0.15f;   /* Enabled — provides 4th signal with zero latency */
     eou->solo_prosody = 0.92f;
 
     eou->w_semantic    = 0.0f;  /* Off by default — backward compatible */
@@ -206,7 +206,9 @@ static float compute_context_adj(const char *transcript) {
     return 0.0f;
 }
 
-EOUResult fused_eou_process(FusedEOU *eou, EOUSignals sig) {
+/* ── Internal: fused processing with renormalized weights for available signals ── */
+static EOUResult fused_eou_process_impl(FusedEOU *eou, EOUSignals sig,
+                                       int signals_valid, int is_partial) {
     EOUResult res = {0};
     if (!eou) return res;
 
@@ -232,17 +234,20 @@ EOUResult fused_eou_process(FusedEOU *eou, EOUSignals sig) {
      * harder, and questions (ctx < 0) make them easier. */
     int src = 0;
 
-    if (sig.energy_signal >= eou->solo_energy + ctx && eou->speech_detected) {
+    if ((signals_valid & EOU_SRC_ENERGY) &&
+        sig.energy_signal >= eou->solo_energy + ctx && eou->speech_detected) {
         src |= EOU_SRC_ENERGY;
     }
-    if (sig.mimi_eot_prob >= eou->solo_mimi + ctx && eou->speech_detected) {
+    if ((signals_valid & EOU_SRC_MIMI) &&
+        sig.mimi_eot_prob >= eou->solo_mimi + ctx && eou->speech_detected) {
         src |= EOU_SRC_MIMI;
     }
-    if (sig.stt_eou_prob >= eou->solo_stt + ctx && eou->speech_detected) {
+    if ((signals_valid & EOU_SRC_STT) &&
+        sig.stt_eou_prob >= eou->solo_stt + ctx && eou->speech_detected) {
         src |= EOU_SRC_STT;
     }
 
-    /* ── Prosody signal (4th signal) ─────────────────── */
+    /* ── Prosody signal (4th signal) — always computed ─────────────────── */
     eou->prosody_prob = compute_prosody_prob(eou);
     if (eou->prosody_prob >= eou->solo_prosody + ctx && eou->speech_detected &&
         eou->w_prosody > 0.0f) {
@@ -255,10 +260,38 @@ EOUResult fused_eou_process(FusedEOU *eou, EOUSignals sig) {
         src |= EOU_SRC_SEMANTIC;
     }
 
-    /* ── Weighted Fusion (3-signal core + optional prosody + optional semantic) ── */
-    float core = eou->w_energy * sig.energy_signal
-               + eou->w_mimi  * sig.mimi_eot_prob
-               + eou->w_stt   * sig.stt_eou_prob;
+    /* ── Weighted Fusion with renormalized weights (for partial mode) ── */
+    float core;
+    if (is_partial && signals_valid != (EOU_SRC_ENERGY | EOU_SRC_MIMI | EOU_SRC_STT)) {
+        /* Partial processing: renormalize to available signals only.
+         * If only some signals are valid, scale their weights to sum to (1 - aux_weight)
+         * so prosody/semantic still contribute properly. */
+        float valid_weight_sum = 0.0f;
+        float w_energy_norm = 0.0f, w_mimi_norm = 0.0f, w_stt_norm = 0.0f;
+
+        if (signals_valid & EOU_SRC_ENERGY) valid_weight_sum += eou->w_energy;
+        if (signals_valid & EOU_SRC_MIMI) valid_weight_sum += eou->w_mimi;
+        if (signals_valid & EOU_SRC_STT) valid_weight_sum += eou->w_stt;
+
+        if (valid_weight_sum < 1e-6f) valid_weight_sum = 1.0f;
+
+        /* Renormalize to original scale: assume aux weights stay same */
+        float scale = (1.0f - (eou->w_prosody + eou->w_semantic)) / valid_weight_sum;
+
+        if (signals_valid & EOU_SRC_ENERGY) w_energy_norm = eou->w_energy * scale;
+        if (signals_valid & EOU_SRC_MIMI) w_mimi_norm = eou->w_mimi * scale;
+        if (signals_valid & EOU_SRC_STT) w_stt_norm = eou->w_stt * scale;
+
+        core = w_energy_norm * sig.energy_signal
+             + w_mimi_norm  * sig.mimi_eot_prob
+             + w_stt_norm   * sig.stt_eou_prob;
+    } else {
+        /* Full processing: use original weights */
+        core = eou->w_energy * sig.energy_signal
+             + eou->w_mimi  * sig.mimi_eot_prob
+             + eou->w_stt   * sig.stt_eou_prob;
+    }
+
     float fused;
     float aux_weight = eou->w_prosody + eou->w_semantic;
     if (aux_weight > 0.0f) {
@@ -326,6 +359,16 @@ EOUResult fused_eou_process(FusedEOU *eou, EOUSignals sig) {
     res.latency_ms = (float)eou->frames_since_speech * eou->frame_ms;
 
     return res;
+}
+
+EOUResult fused_eou_process(FusedEOU *eou, EOUSignals sig) {
+    /* Full processing: all 3 core signals valid */
+    return fused_eou_process_impl(eou, sig, EOU_SRC_ENERGY | EOU_SRC_MIMI | EOU_SRC_STT, 0);
+}
+
+EOUResult fused_eou_process_partial(FusedEOU *eou, EOUSignals signals, int signals_valid) {
+    /* Partial processing: only specified signals valid, renormalize weights */
+    return fused_eou_process_impl(eou, signals, signals_valid, 1);
 }
 
 void fused_eou_reset(FusedEOU *eou) {

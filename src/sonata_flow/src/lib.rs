@@ -18,6 +18,11 @@ use serde::Deserialize;
 use std::ffi::{c_char, c_float, c_int, c_void, CStr};
 use std::path::Path;
 
+// ─── Quality Mode Constants ──────────────────────────────────────────────────
+const FLOW_QUALITY_FAST: i32 = 0;      // 4 steps, Euler only
+const FLOW_QUALITY_BALANCED: i32 = 1;  // 6 steps, Euler only
+const FLOW_QUALITY_HIGH: i32 = 2;      // 8 steps, Heun
+
 fn panic_message(e: Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = e.downcast_ref::<&str>() {
         s.to_string()
@@ -1162,6 +1167,7 @@ struct SonataFlowEngine {
     cfg_scale: f32,
     n_steps: usize,
     use_heun: bool,
+    quality_mode: i32,
     last_phase: Vec<f32>,
     speaker_embedding_override: Option<Tensor>,
     emotion_id: Option<u32>,
@@ -1309,6 +1315,7 @@ pub extern "C" fn sonata_flow_create(
             cfg_scale: 1.0,
             n_steps,
             use_heun: false,
+            quality_mode: FLOW_QUALITY_BALANCED,
             last_phase: Vec::new(),
             speaker_embedding_override: None,
             emotion_id: None,
@@ -1375,6 +1382,36 @@ pub extern "C" fn sonata_flow_set_n_steps(engine: *mut c_void, n_steps: c_int) -
         eng.n_steps = n_steps as usize;
     }
     0
+}
+
+/// Set quality mode (FAST=0, BALANCED=1, HIGH=2).
+/// Automatically configures n_steps and use_heun based on mode.
+/// Manual set_n_steps() calls override the quality mode.
+#[no_mangle]
+pub extern "C" fn sonata_flow_set_quality_mode(engine: *mut c_void, mode: c_int) -> c_int {
+    if engine.is_null() { return -1; }
+    let eng = unsafe { &mut *(engine as *mut SonataFlowEngine) };
+    match mode {
+        0 => { // FAST
+            eng.quality_mode = FLOW_QUALITY_FAST;
+            eng.n_steps = 4;
+            eng.use_heun = false;
+            0
+        }
+        1 => { // BALANCED
+            eng.quality_mode = FLOW_QUALITY_BALANCED;
+            eng.n_steps = 6;
+            eng.use_heun = false;
+            0
+        }
+        2 => { // HIGH
+            eng.quality_mode = FLOW_QUALITY_HIGH;
+            eng.n_steps = 8;
+            eng.use_heun = true;
+            0
+        }
+        _ => -1, // Invalid mode
+    }
 }
 
 #[no_mangle]
@@ -2137,7 +2174,7 @@ struct FlowV2Config {
 fn default_ff_mult() -> f64 { 4.0 }
 fn default_norm_eps() -> f64 { 1e-5 }
 fn default_char_vocab() -> usize { 256 }
-fn default_n_steps() -> usize { 8 }
+fn default_n_steps() -> usize { 6 }
 fn default_sway() -> f64 { -1.0 }
 fn default_prosody_dim_v2() -> usize { 3 }
 
@@ -2552,6 +2589,7 @@ struct SonataFlowV2Engine {
     cfg_scale: f32,
     n_steps: usize,
     use_heun: bool,
+    quality_mode: i32,
     prosody_features: Option<Tensor>,
 }
 
@@ -2601,6 +2639,7 @@ pub extern "C" fn sonata_flow_v2_create(
                 cfg_scale: 2.0f32,
                 n_steps: config.n_steps_inference,
                 use_heun: false,
+                quality_mode: FLOW_QUALITY_BALANCED,
                 prosody_features: None,
             })
         })()
@@ -2642,6 +2681,34 @@ pub extern "C" fn sonata_flow_v2_set_n_steps(engine: *mut c_void, steps: c_int) 
         eng.n_steps = steps as usize;
     }
     0
+}
+
+/// Set quality mode for Flow v2 (FAST=0, BALANCED=1, HIGH=2).
+#[no_mangle]
+pub extern "C" fn sonata_flow_v2_set_quality_mode(engine: *mut c_void, mode: c_int) -> c_int {
+    if engine.is_null() { return -1; }
+    let eng = unsafe { &mut *(engine as *mut SonataFlowV2Engine) };
+    match mode {
+        0 => { // FAST
+            eng.quality_mode = FLOW_QUALITY_FAST;
+            eng.n_steps = 4;
+            eng.use_heun = false;
+            0
+        }
+        1 => { // BALANCED
+            eng.quality_mode = FLOW_QUALITY_BALANCED;
+            eng.n_steps = 6;
+            eng.use_heun = false;
+            0
+        }
+        2 => { // HIGH
+            eng.quality_mode = FLOW_QUALITY_HIGH;
+            eng.n_steps = 8;
+            eng.use_heun = true;
+            0
+        }
+        _ => -1,
+    }
 }
 
 #[no_mangle]
@@ -3558,6 +3625,7 @@ struct SonataFlowV3Engine {
     n_steps: usize,
     cfg_scale: f32,
     use_heun: bool,
+    quality_mode: i32,
     speaker_id: Option<u32>,
     ref_mel: Option<Tensor>,
     current_emotion_id: Option<i32>,
@@ -3615,6 +3683,7 @@ pub extern "C" fn sonata_flow_v3_create(
                 n_steps: config.n_steps_inference,
                 cfg_scale: 2.0f32,
                 use_heun: false,
+                quality_mode: FLOW_QUALITY_BALANCED,
                 speaker_id: None,
                 ref_mel: None,
                 current_emotion_id: None,
@@ -3665,6 +3734,34 @@ pub extern "C" fn sonata_flow_v3_set_n_steps(engine: *mut c_void, steps: c_int) 
     let eng = unsafe { &mut *(engine as *mut SonataFlowV3Engine) };
     eng.n_steps = steps as usize;
     0
+}
+
+/// Set quality mode for Flow v3 (FAST=0, BALANCED=1, HIGH=2).
+#[no_mangle]
+pub extern "C" fn sonata_flow_v3_set_quality_mode(engine: *mut c_void, mode: c_int) -> c_int {
+    if engine.is_null() { return -1; }
+    let eng = unsafe { &mut *(engine as *mut SonataFlowV3Engine) };
+    match mode {
+        0 => { // FAST
+            eng.quality_mode = FLOW_QUALITY_FAST;
+            eng.n_steps = 4;
+            eng.use_heun = false;
+            0
+        }
+        1 => { // BALANCED
+            eng.quality_mode = FLOW_QUALITY_BALANCED;
+            eng.n_steps = 6;
+            eng.use_heun = false;
+            0
+        }
+        2 => { // HIGH
+            eng.quality_mode = FLOW_QUALITY_HIGH;
+            eng.n_steps = 8;
+            eng.use_heun = true;
+            0
+        }
+        _ => -1,
+    }
 }
 
 #[no_mangle]

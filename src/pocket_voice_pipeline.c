@@ -3290,6 +3290,8 @@ typedef struct {
     float       sonata_cfg_scale;    /* Classifier-free guidance scale (1.0 = off, 2.0+ = stronger) */
     int         sonata_flow_steps;   /* ODE steps for flow (4=fast, 8=default, 16=quality) */
     int         sonata_heun;         /* 1 = Heun's 2nd-order solver, 0 = Euler */
+    int         tts_quality_mode;    /* TTS quality mode: 0=FAST, 1=BALANCED (default), 2=HIGH */
+    int         tts_first_chunk_fast; /* 1 = use FAST mode for first sentence, BALANCED for rest */
     const char *sonata_draft_weights; /* Draft model for speculative decoding (optional) */
     const char *sonata_draft_config;  /* Draft model config (optional) */
     int         sonata_speculate_k;   /* Tokens to speculate per step (default: 5) */
@@ -3401,6 +3403,8 @@ static PipelineConfig default_config(void) {
         .sonata_cfg_scale    = 1.5f,
         .sonata_flow_steps   = 8,
         .sonata_heun         = 0,
+        .tts_quality_mode    = 1,   /* BALANCED */
+        .tts_first_chunk_fast = 1,  /* Enabled by default */
         .sonata_draft_weights = NULL,
         .sonata_draft_config  = NULL,
         .sonata_speculate_k   = 5,

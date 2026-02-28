@@ -73,6 +73,7 @@ fn default_sem_v() -> usize { 4096 }
 fn default_n_sp() -> usize { 4 }
 fn default_theta() -> f64 { 10000.0 }
 fn default_eps() -> f64 { 1e-5 }
+fn default_acoustic_dim() -> usize { 512 }
 
 impl Default for LmConfig {
     fn default() -> Self {
@@ -81,6 +82,7 @@ impl Default for LmConfig {
             d_ff: 2560, max_seq_len: 4096, text_vocab_size: 32000,
             semantic_vocab_size: 4096, n_special_tokens: 4,
             rope_theta: 10000.0, norm_eps: 1e-5, use_prosody: false,
+            use_acoustic_head: false, acoustic_dim: 512,
         }
     }
 }
@@ -508,6 +510,7 @@ struct SonataLM {
     use_cross_attention: bool,
     output_norm: RmsNorm,
     semantic_head: Linear,
+    acoustic_head: Option<Linear>,  // Projects d_model(1024) -> acoustic_dim(512)
     rope_cos: Tensor,
     rope_sin: Tensor,
     cfg: LmConfig,
@@ -585,6 +588,22 @@ impl SonataLM {
             cfg.d_model,
         );
 
+        // Try to load acoustic head if enabled, fall back to None if weights missing
+        let acoustic_head = if cfg.use_acoustic_head {
+            match linear_no_bias(cfg.d_model, cfg.acoustic_dim, vb.pp("acoustic_head")) {
+                Ok(head) => {
+                    eprintln!("[sonata_lm] Acoustic head loaded ({} -> {})", cfg.d_model, cfg.acoustic_dim);
+                    Some(head)
+                }
+                Err(_) => {
+                    eprintln!("[sonata_lm] use_acoustic_head=true but weights not found, disabled");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             text_emb: embedding(text_total, cfg.d_model, vb.pp("text_emb"))?,
             semantic_emb,
@@ -597,6 +616,7 @@ impl SonataLM {
             use_cross_attention,
             output_norm: rms_norm(cfg.d_model, cfg.norm_eps, vb.pp("output_norm"))?,
             semantic_head: linear_no_bias(cfg.d_model, cfg.semantic_vocab_size, vb.pp("semantic_head"))?,
+            acoustic_head,
             rope_cos, rope_sin,
             cfg: cfg.clone(),
         })
@@ -713,6 +733,46 @@ impl SonataLM {
         let hidden = self.output_norm.forward(&x)?;
         let logits = self.semantic_head.forward(&hidden)?;
         Ok((logits, hidden))
+    }
+
+    /// Like forward_hidden() but also computes acoustic latents if acoustic_head is enabled.
+    /// Returns: (logits, hidden, acoustic) where acoustic is Some if enabled, None otherwise.
+    fn forward_with_acoustic(
+        &self, sem_tok: u32, pos: usize,
+        kv_caches: &mut [(Tensor, Tensor)],
+        prosody: Option<&Tensor>,
+        text_encoding: Option<&Tensor>,
+    ) -> Result<(Tensor, Tensor, Option<Tensor>)> {
+        let device = self.rope_cos.device();
+        let sem_t = Tensor::from_vec(vec![sem_tok], (1, 1), device)?;
+        let mut x = self.semantic_emb.forward(&sem_t)?;
+
+        if let (Some(ref proj), Some(p)) = (&self.prosody_proj, prosody) {
+            x = (x + proj.forward(p)?)?;
+        }
+
+        if self.use_cross_attention {
+            let text_enc = text_encoding.ok_or_else(||
+                candle_core::Error::Msg("cross-attention requires text_encoding".into()))?;
+            for (i, layer) in self.decoder_layers.iter().enumerate() {
+                let (kc, vc) = &mut kv_caches[i];
+                x = layer.forward(&x, text_enc, &self.rope_cos, &self.rope_sin, pos, kc, vc)?;
+            }
+        } else {
+            for (i, layer) in self.layers.iter().enumerate() {
+                let (kc, vc) = &mut kv_caches[i];
+                x = layer.forward(&x, &self.rope_cos, &self.rope_sin, pos, kc, vc)?;
+            }
+        }
+
+        let hidden = self.output_norm.forward(&x)?;
+        let logits = self.semantic_head.forward(&hidden)?;
+        let acoustic = if let Some(ref ah) = self.acoustic_head {
+            Some(ah.forward(&hidden)?)
+        } else {
+            None
+        };
+        Ok((logits, hidden, acoustic))
     }
 
     /// Forward pass with a custom attention mask for tree-structured verification.
@@ -1075,6 +1135,11 @@ struct LmEngine {
     coarse_grained: bool,
 
     sampling_buf: Vec<(usize, f32)>,
+
+    // Acoustic head support
+    acoustic_buffer: Vec<f32>,     // accumulated acoustic vectors (acoustic_dim per step)
+    acoustic_head_enabled: bool,   // runtime toggle
+    acoustic_dim: usize,
 }
 
 fn resolve_hf_path(path: &str, candidates: &[&str]) -> std::result::Result<String, Box<dyn std::error::Error>> {
@@ -1133,6 +1198,8 @@ impl LmEngine {
                 rope_theta: raw.get("rope_theta").and_then(|v| v.as_f64()).unwrap_or(10000.0),
                 norm_eps: raw.get("norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-5),
                 use_prosody: raw.get("use_prosody").and_then(|v| v.as_bool()).unwrap_or(false),
+                use_acoustic_head: raw.get("use_acoustic_head").and_then(|v| v.as_bool()).unwrap_or(false),
+                acoustic_dim: raw.get("acoustic_dim").and_then(|v| v.as_u64()).unwrap_or(512) as usize,
             }
         } else {
             LmConfig::default()
@@ -1166,6 +1233,10 @@ impl LmEngine {
         // Precompute acoustic similarity groups from semantic embedding weights
         let similarity_groups = Self::compute_similarity_groups(&model, &device);
 
+        // Acoustic head support: check before moving model
+        let acoustic_head_enabled = cfg.use_acoustic_head && model.acoustic_head.is_some();
+        let acoustic_dim = if cfg.use_acoustic_head { cfg.acoustic_dim } else { 0 };
+
         Ok(Self {
             model, kv_caches, device, dtype,
             text_tokens: Vec::new(),
@@ -1191,6 +1262,9 @@ impl LmEngine {
             similarity_groups,
             coarse_grained: false,
             sampling_buf: Vec::with_capacity(cfg.semantic_vocab_size),
+            acoustic_buffer: Vec::new(),
+            acoustic_head_enabled,
+            acoustic_dim,
         })
     }
 
@@ -2334,4 +2408,180 @@ pub extern "C" fn sonata_lm_set_tree_config(
             -1
         }
     }
+}
+
+/// Enable or disable acoustic head output (if configured).
+/// Returns: 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn sonata_lm_enable_acoustic_head(engine: *mut c_void, enable: c_int) -> c_int {
+    if engine.is_null() { return -1; }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let eng = unsafe { &mut *(engine as *mut LmEngine) };
+        if eng.acoustic_dim == 0 {
+            eprintln!("[sonata_lm] Acoustic head not configured");
+            return -1;
+        }
+        eng.acoustic_head_enabled = enable != 0;
+        eprintln!("[sonata_lm] Acoustic head: {}", if eng.acoustic_head_enabled { "enabled" } else { "disabled" });
+        0
+    }));
+    match result {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[sonata_lm] panic in enable_acoustic_head: {}", panic_message(e));
+            -1
+        }
+    }
+}
+
+/// Step with acoustic head output (if enabled).
+/// Writes semantic token to *out_token and acoustic vector to *out_acoustic.
+/// Returns: 0 = more, 1 = done, -1 = error
+#[no_mangle]
+pub extern "C" fn sonata_lm_step_dual(
+    engine: *mut c_void, out_token: *mut u32, out_acoustic: *mut c_float, acoustic_dim: c_int,
+) -> c_int {
+    if engine.is_null() || out_token.is_null() { return -1; }
+    if !out_acoustic.is_null() && acoustic_dim <= 0 { return -1; }
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let eng = unsafe { &mut *(engine as *mut LmEngine) };
+        if eng.done || eng.step_count >= eng.max_tokens {
+            eng.done = true;
+            return 1;
+        }
+
+        // Get current semantic token and compute position
+        let sem_tok = *eng.semantic_tokens.last().unwrap_or(&1);
+        let pos = if eng.model.use_cross_attention {
+            eng.step_count
+        } else {
+            eng.text_pos + eng.step_count
+        };
+
+        // Prepare prosody tensor if available
+        let prosody_tensor = if let Some(ref pf) = eng.prosody_features {
+            let idx = eng.step_count.min(pf.len().saturating_sub(1));
+            let data = pf[idx];
+            match Tensor::from_vec(
+                data.to_vec(), (1, 1, PROSODY_DIM), &eng.device,
+            ) {
+                Ok(t) => match t.to_dtype(eng.dtype) {
+                    Ok(t2) => Some(t2),
+                    Err(_) => None,
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        // Forward pass with acoustic output
+        let (logits, hidden, acoustic) = match eng.model.forward_with_acoustic(
+            sem_tok, pos,
+            &mut eng.kv_caches,
+            prosody_tensor.as_ref(),
+            eng.text_encoding.as_ref(),
+        ) {
+            Ok(res) => res,
+            Err(_) => return -1,
+        };
+
+        // Save hidden state for drafter
+        eng.last_hidden = Some(hidden);
+
+        // Process logits and sample token
+        let logits_2d = match logits.squeeze(0) {
+            Ok(l) => l,
+            Err(_) => return -1,
+        };
+
+        let mut logits_vec: Vec<f32> = match logits_2d.to_dtype(DType::F32) {
+            Ok(l) => match l.to_vec1() {
+                Ok(v) => v,
+                Err(_) => return -1,
+            }
+            Err(_) => return -1,
+        };
+
+        // Apply repetition penalty
+        LmEngine::apply_repetition_penalty(&mut logits_vec, &eng.recent_tokens, eng.repetition_penalty);
+
+        // Apply temperature
+        let temp = if eng.temperature > 1e-8 { eng.temperature } else { 1e-8 };
+        let inv_temp = 1.0 / temp;
+        for v in logits_vec.iter_mut() { *v *= inv_temp; }
+
+        // Sample token
+        let next_token = LmEngine::sample_top_k_top_p(&logits_vec, eng.top_k, eng.top_p, &mut eng.sampling_buf);
+
+        // Check for end-of-sequence or too many pad tokens
+        if next_token == 2 {
+            eng.done = true;
+            unsafe { *out_token = next_token; }
+            return 1;
+        }
+        if next_token == 0 {
+            eng.consecutive_pad += 1;
+            if eng.consecutive_pad > 100 {
+                eng.done = true;
+                unsafe { *out_token = next_token; }
+                return 1;
+            }
+        } else {
+            eng.consecutive_pad = 0;
+        }
+
+        // Copy acoustic latents if available
+        if !out_acoustic.is_null() && acoustic_dim > 0 {
+            if let Some(ac) = acoustic {
+                if let Ok(a1) = ac.squeeze(0) {
+                    if let Ok(a2) = a1.to_dtype(DType::F32) {
+                        if let Ok(av) = a2.to_vec1::<f32>() {
+                            let copy_len = std::cmp::min(av.len(), acoustic_dim as usize);
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(av.as_ptr(), out_acoustic, copy_len);
+                                // Zero pad if output buffer is larger
+                                for i in copy_len..acoustic_dim as usize {
+                                    *out_acoustic.add(i) = 0.0;
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // No acoustic head, zero the buffer
+                unsafe {
+                    for i in 0..acoustic_dim as usize {
+                        *out_acoustic.add(i) = 0.0;
+                    }
+                }
+            }
+        }
+
+        // Update state
+        eng.semantic_tokens.push(next_token);
+        eng.step_count += 1;
+        eng.recent_tokens.push_back(next_token);
+        if eng.recent_tokens.len() > 64 { eng.recent_tokens.pop_front(); }
+
+        unsafe { *out_token = next_token; }
+        0
+    }));
+    match result {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[sonata_lm] panic in step_dual: {}", panic_message(e));
+            -1
+        }
+    }
+}
+
+/// Get the acoustic dimension configured for this engine.
+/// Returns: acoustic_dim if enabled, 0 if not configured, -1 if engine is NULL.
+#[no_mangle]
+pub extern "C" fn sonata_lm_get_acoustic_dim(engine: *mut c_void) -> c_int {
+    if engine.is_null() { return -1; }
+    let eng = unsafe { &*(engine as *const LmEngine) };
+    eng.acoustic_dim as c_int
 }

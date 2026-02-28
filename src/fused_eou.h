@@ -86,6 +86,23 @@ void fused_eou_destroy(FusedEOU *eou);
 EOUResult fused_eou_process(FusedEOU *eou, EOUSignals signals);
 
 /**
+ * Process partial signals when not all are available yet.
+ *
+ * Enables parallel EOU detection by processing energy + mimi before STT completes.
+ * Weights are renormalized to only valid signals, then prosody/semantic are added.
+ *
+ * @param eou           Detector instance
+ * @param signals       EOUSignals struct (only valid fields are used)
+ * @param signals_valid Bitmask: EOU_SRC_ENERGY | EOU_SRC_MIMI | EOU_SRC_STT
+ *                      Only signals in this bitmask contribute to fusion
+ * @return Fusion result with triggered flag
+ *
+ * When all signals become valid (energy|mimi|stt), call fused_eou_process() instead
+ * to use the full normalized weights.
+ */
+EOUResult fused_eou_process_partial(FusedEOU *eou, EOUSignals signals, int signals_valid);
+
+/**
  * Reset state for a new utterance.
  */
 void fused_eou_reset(FusedEOU *eou);

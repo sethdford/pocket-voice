@@ -572,6 +572,14 @@ test-speech-detector: tests/test_speech_detector.c $(BUILD)/libspeech_detector.d
 	  -o $(BUILD)/test-speech-detector tests/test_speech_detector.c
 	./$(BUILD)/test-speech-detector
 
+test-fused-eou-parallel: tests/test_fused_eou_parallel.c $(BUILD)/libfused_eou.dylib | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc \
+	  -L$(BUILD) -lfused_eou \
+	  -Wl,-rpath,$(CURDIR)/$(BUILD) \
+	  -lm -framework Accelerate \
+	  -o $(BUILD)/test-fused-eou-parallel tests/test_fused_eou_parallel.c
+	./$(BUILD)/test-fused-eou-parallel
+
 bench-vad: tests/test_bench_vad.c $(BUILD)/libnative_vad.dylib | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc \
 	  -L$(BUILD) -lnative_vad \
@@ -761,6 +769,14 @@ test-sonata-flow-ffi: tests/test_sonata_flow_ffi.c $(SONATA_FLOW_DYLIB) | $(BUIL
 	  -o $(BUILD)/test-sonata-flow-ffi tests/test_sonata_flow_ffi.c
 	./$(BUILD)/test-sonata-flow-ffi
 
+test-flow-quality-modes: tests/test_flow_quality_modes.c $(SONATA_FLOW_DYLIB) | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc \
+	  -Lsrc/sonata_flow/target/release \
+	  -Wl,-rpath,$(CURDIR)/src/sonata_flow/target/release \
+	  -lsonata_flow -lm \
+	  -o $(BUILD)/test-flow-quality-modes tests/test_flow_quality_modes.c
+	./$(BUILD)/test-flow-quality-modes
+
 test-sonata-v3: tests/test_sonata_v3.c $(SONATA_FLOW_DYLIB) | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc \
 	  -Lsrc/sonata_flow/target/release \
@@ -776,6 +792,14 @@ test-sonata-lm-ffi: tests/test_sonata_lm_ffi.c $(SONATA_LM_DYLIB) | $(BUILD)
 	  -lsonata_lm -lm \
 	  -o $(BUILD)/test-sonata-lm-ffi tests/test_sonata_lm_ffi.c
 	./$(BUILD)/test-sonata-lm-ffi
+
+test-sonata-lm-dual-head: tests/test_sonata_lm_dual_head.c $(SONATA_LM_DYLIB) | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc \
+	  -Lsrc/sonata_lm/target/release \
+	  -Wl,-rpath,$(CURDIR)/src/sonata_lm/target/release \
+	  -lsonata_lm -lm \
+	  -o $(BUILD)/test-sonata-lm-dual-head tests/test_sonata_lm_dual_head.c
+	./$(BUILD)/test-sonata-lm-dual-head
 
 test-pipeline-threading: tests/test_pipeline_threading.c $(BUILD)/libvm_ring.dylib | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc \
@@ -993,11 +1017,11 @@ test-speaker-encoder: tests/test_speaker_encoder.c $(SONATA_SPEAKER_DYLIB) | $(B
 	  -o $(BUILD)/test-speaker-encoder tests/test_speaker_encoder.c
 	./$(BUILD)/test-speaker-encoder
 
-.PHONY: test test-eou test-semantic-eou test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-roundtrip test-llm-prosody test-websocket test-optimizations test-sonata test-sonata-quality test-sonata-stt test-sonata-v3 test-beam-search bench-sonata bench-quality bench-live bench-industry test-apple-perf test-quality-improvements test-real-models test-native-vad bench-vad test-speech-detector test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-sonata-storm test-audio-emotion test-sonata-flow-ffi test-sonata-lm-ffi test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-sonata-refiner test-tdt-decoder test-web-remote test-opus-codec test-audio-converter test-spatial-audio test-metal-loader test-metal-dispatch test-bnns-convnext test-coverage-gaps test-correctness-audit test-integration-audit test-security-audit test-assumptions bench-audit bench test-research-stt test-research-eou test-research-istft test-research-metal test-audio-watermark test-deep-filter test-speaker-encoder
+.PHONY: test test-eou test-semantic-eou test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-roundtrip test-llm-prosody test-websocket test-optimizations test-sonata test-sonata-quality test-sonata-stt test-sonata-v3 test-beam-search bench-sonata bench-quality bench-live bench-industry test-apple-perf test-quality-improvements test-real-models test-native-vad bench-vad test-speech-detector test-fused-eou-parallel test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-sonata-storm test-audio-emotion test-sonata-flow-ffi test-flow-quality-modes test-sonata-lm-ffi test-sonata-lm-dual-head test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-sonata-refiner test-tdt-decoder test-web-remote test-opus-codec test-audio-converter test-spatial-audio test-metal-loader test-metal-dispatch test-bnns-convnext test-coverage-gaps test-correctness-audit test-integration-audit test-security-audit test-assumptions bench-audit bench test-research-stt test-research-eou test-research-istft test-research-metal test-audio-watermark test-deep-filter test-speaker-encoder
 
 bench: libs sonata
 	@bash scripts/benchmark.sh --all
-test: bench-quality test-quality test-eou test-semantic-eou test-roundtrip test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-llm-prosody test-optimizations test-beam-search test-sonata test-sonata-v3 test-sonata-quality test-sonata-stt test-real-models test-websocket test-native-vad test-speech-detector test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-quality-improvements test-sonata-storm test-audio-emotion test-sonata-flow-ffi test-sonata-lm-ffi test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-sonata-refiner test-tdt-decoder test-web-remote test-opus-codec test-audio-converter test-spatial-audio test-metal-loader test-metal-dispatch test-bnns-convnext test-coverage-gaps test-integration-audit test-correctness-audit test-security-audit test-assumptions test-research-stt test-research-eou test-research-istft test-research-metal test-audio-watermark test-deep-filter test-speaker-encoder
+test: bench-quality test-quality test-eou test-semantic-eou test-roundtrip test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-llm-prosody test-optimizations test-beam-search test-sonata test-sonata-v3 test-sonata-quality test-sonata-stt test-real-models test-websocket test-native-vad test-speech-detector test-fused-eou-parallel test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-quality-improvements test-sonata-storm test-audio-emotion test-sonata-flow-ffi test-flow-quality-modes test-sonata-lm-ffi test-sonata-lm-dual-head test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-sonata-refiner test-tdt-decoder test-web-remote test-opus-codec test-audio-converter test-spatial-audio test-metal-loader test-metal-dispatch test-bnns-convnext test-coverage-gaps test-integration-audit test-correctness-audit test-security-audit test-assumptions test-research-stt test-research-eou test-research-istft test-research-metal test-audio-watermark test-deep-filter test-speaker-encoder
 	@echo ""
 	@echo "═══ Quality Benchmark Self-Tests ═══"
 	./$(BUILD)/bench-quality
