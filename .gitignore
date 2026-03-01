@@ -1,8 +1,8 @@
 # Build artifacts
 build/
 target/
-sonata
-pocket-voice
+/sonata
+/pocket-voice
 *.o
 *.dylib
 
@@ -44,10 +44,11 @@ models/*.arpa
 models/*.bin
 third_party/
 
-# Training artifacts (but not train/ source code)
+# Training artifacts (data & checkpoints)
 train/checkpoints/
 train/data/
 train/logs/
+train/**/__pycache__/
 *.pt
 *.safetensors
 *.ckpt
