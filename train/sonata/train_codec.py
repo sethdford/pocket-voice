@@ -386,6 +386,8 @@ def train(args):
 
                 if not torch.isfinite(reconstructed).all():
                     opt_g.zero_grad()
+                    if use_gan:
+                        opt_d.zero_grad()
                     nan_skip_count[0] += 1
                     if nan_skip_count[0] % 50 == 1:
                         print(f"  [WARN] step {step}: NaN in model output, skipping batch (total skips: {nan_skip_count[0]})")
@@ -412,7 +414,7 @@ def train(args):
                 scaler_d.scale(d_loss).backward() if use_amp and device.type == "cuda" else d_loss.backward()
                 accum_step += 1
 
-                if accum_step % args.grad_accum == 0 or not use_gan:
+                if accum_step % args.grad_accum == 0:
                     if use_amp and device.type == "cuda":
                         scaler_d.unscale_(opt_d)
                     torch.nn.utils.clip_grad_norm_(disc.parameters(), args.clip_grad)

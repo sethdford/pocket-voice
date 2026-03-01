@@ -410,7 +410,7 @@ class LibriTTSRDataset(torch.utils.data.Dataset):
             return waveform, spk_label
         except Exception as e:
             logger.warning(f"Error loading {wav_path}: {e}")
-            return torch.randn(self.segment_samples), spk_label
+            return torch.zeros(self.segment_samples), spk_label
 
 
 # ── Training ────────────────────────────────────────────────────────────────
