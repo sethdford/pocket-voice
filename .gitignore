@@ -43,8 +43,10 @@ models/*.arpa
 models/*.bin
 third_party/
 
-# Training artifacts
-train/
+# Training artifacts (but not train/ source code)
+train/checkpoints/
+train/data/
+train/logs/
 *.pt
 *.safetensors
 *.ckpt
