@@ -401,7 +401,7 @@ class LibriTTSRDataset(torch.utils.data.Dataset):
                 waveform = waveform.mean(dim=0, keepdim=True)
             waveform = waveform.squeeze(0)
 
-            if waveform.shape[0] >= self.segment_samples:
+            if waveform.shape[0] > self.segment_samples:
                 start = np.random.randint(0, waveform.shape[0] - self.segment_samples)
                 waveform = waveform[start:start + self.segment_samples]
             else:

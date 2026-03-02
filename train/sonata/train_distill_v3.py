@@ -215,7 +215,7 @@ def collate_fn(batch):
 def build_text_cond(model: SonataFlowV3, char_ids: torch.Tensor, mel_len: int) -> torch.Tensor:
     """Build text conditioning aligned to mel length (uniform alignment for distillation)."""
     if char_ids.numel() == 0 or mel_len <= 0:
-        D = model.interleaved_enc.dim if hasattr(model.interleaved_enc, 'dim') else 512
+        D = model.cfg.d_model
         B = char_ids.shape[0] if char_ids.dim() > 1 else 1
         return torch.zeros(B, mel_len, D, device=char_ids.device)
     text_enc = model.interleaved_enc.encode_text(char_ids)
