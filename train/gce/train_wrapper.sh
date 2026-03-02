@@ -121,7 +121,14 @@ while [ $RETRY -lt $MAX_RETRIES ]; do
             GCS_CKPT_DIR="$BUCKET/checkpoints/speaker_encoder"
             mkdir -p "$JOB_CKPT_DIR"
 
-            echo "  Starting speaker encoder training"
+            RESUME=$(find_latest_checkpoint "$JOB_CKPT_DIR" "speaker_encoder_epoch*.pt")
+            RESUME_FLAG=""
+            if [ -n "$RESUME" ]; then
+                echo "  Resuming from: $RESUME"
+                RESUME_FLAG="--resume $RESUME"
+            else
+                echo "  Starting from scratch"
+            fi
 
             python3 -u train_speaker_encoder.py \
                 --data-dir "$DATA_DIR/libritts-r/LibriTTS_R" \
@@ -129,7 +136,8 @@ while [ $RETRY -lt $MAX_RETRIES ]; do
                 --device "$DEVICE" \
                 --batch-size 32 \
                 --n-epochs 100 \
-                --lr 0.001 &
+                --lr 0.001 \
+                $RESUME_FLAG &
             TRAIN_PID=$!
             ;;
 

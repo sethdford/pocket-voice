@@ -492,6 +492,8 @@ def main():
                        help='Device (cuda or cpu)')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed')
+    parser.add_argument('--resume', type=str, default='',
+                       help='Path to checkpoint to resume from')
 
     args = parser.parse_args()
 
@@ -541,8 +543,26 @@ def main():
     optimizer = Adam(list(model.parameters()) + list(criterion.parameters()), lr=args.lr)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.n_epochs)
 
+    start_epoch = 0
     best_loss = float('inf')
-    for epoch in range(args.n_epochs):
+
+    if args.resume:
+        logger.info(f"Resuming from {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        if isinstance(ckpt, dict) and 'model' in ckpt:
+            model.load_state_dict(ckpt['model'])
+            if 'optimizer' in ckpt:
+                optimizer.load_state_dict(ckpt['optimizer'])
+            if 'scheduler' in ckpt:
+                scheduler.load_state_dict(ckpt['scheduler'])
+            start_epoch = ckpt.get('epoch', 0)
+            best_loss = ckpt.get('best_loss', float('inf'))
+            logger.info(f"  Resumed at epoch {start_epoch}, best_loss={best_loss:.4f}")
+        else:
+            model.load_state_dict(ckpt)
+            logger.info("  Loaded model weights only (legacy checkpoint)")
+
+    for epoch in range(start_epoch, args.n_epochs):
         logger.info(f"\nEpoch {epoch + 1}/{args.n_epochs}")
 
         train_loss = train_epoch(model, mel_extractor, train_loader, criterion, optimizer, device)
@@ -560,7 +580,13 @@ def main():
         if track_loss < best_loss:
             best_loss = track_loss
             checkpoint_path = output_dir / f"speaker_encoder_epoch{epoch + 1}.pt"
-            torch.save(model.state_dict(), checkpoint_path)
+            torch.save({
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'epoch': epoch + 1,
+                'best_loss': best_loss,
+            }, checkpoint_path)
             logger.info(f"Saved checkpoint to {checkpoint_path}")
 
     logger.info("Exporting to safetensors...")
