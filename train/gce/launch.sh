@@ -51,9 +51,12 @@ exec > /var/log/sonata-startup.log 2>&1
 echo "=== Sonata Training VM Startup ==="
 echo "Date: $(date)"
 
-# Metadata
-BUCKET=$(curl -sH "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/attributes/bucket)
-JOB=$(curl -sH "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/attributes/job)
+# Metadata (retry up to 3 times)
+BUCKET=$(curl -s --retry 3 --max-time 5 -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/attributes/bucket)
+JOB=$(curl -s --retry 3 --max-time 5 -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/attributes/job)
+
+[ -z "$BUCKET" ] && { echo "FATAL: Failed to fetch bucket from metadata"; exit 1; }
+[ -z "$JOB" ] && { echo "FATAL: Failed to fetch job from metadata"; exit 1; }
 
 echo "Bucket: $BUCKET"
 echo "Job: $JOB"
@@ -68,26 +71,26 @@ echo "deb [signed-by=/usr/share/keyrings/cloud.google.asc] https://packages.clou
 curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
     | tee /usr/share/keyrings/cloud.google.asc > /dev/null
 
-apt-get update -qq
-apt-get install -y -qq gcsfuse espeak-ng sox libsndfile1
+apt-get update -qq || { echo "FATAL: apt-get update failed"; exit 1; }
+apt-get install -y -qq gcsfuse espeak-ng sox libsndfile1 || { echo "FATAL: apt-get install failed"; exit 1; }
 
 # Install extra Python packages into the pre-installed environment
-pip install --quiet soundfile safetensors
+pip install --quiet soundfile safetensors || { echo "FATAL: pip install failed"; exit 1; }
 
 # ─── Mount GCS ────────────────────────────────────────────────────────────────
 mkdir -p /mnt/sonata
 # Enable allow_other so non-root users can access mount
-echo "user_allow_other" >> /etc/fuse.conf
+grep -q "user_allow_other" /etc/fuse.conf || echo "user_allow_other" >> /etc/fuse.conf
 gcsfuse --implicit-dirs --file-mode=666 --dir-mode=777 -o allow_other \
-    "$(echo $BUCKET | sed 's|gs://||')" /mnt/sonata
+    "$(echo $BUCKET | sed 's|gs://||')" /mnt/sonata || { echo "FATAL: gcsfuse mount failed"; exit 1; }
 
 echo "GCS mounted at /mnt/sonata"
-ls /mnt/sonata/
+ls /mnt/sonata/ || { echo "FATAL: GCS mount not accessible"; exit 1; }
 
 # ─── Clone training code ─────────────────────────────────────────────────────
 # Copy training scripts from GCS (uploaded by launch.sh)
 mkdir -p /opt/sonata/train/sonata
-gsutil -m cp "$BUCKET/code/train/sonata/*.py" /opt/sonata/train/sonata/
+gsutil -m cp "$BUCKET/code/train/sonata/*.py" /opt/sonata/train/sonata/ || { echo "FATAL: Failed to download training code"; exit 1; }
 
 # ─── Symlink data ────────────────────────────────────────────────────────────
 ln -sf /mnt/sonata/data /opt/sonata/train/data

@@ -14,13 +14,22 @@ DEVICE="cuda"
 
 # ─── Detect preemption ────────────────────────────────────────────────────────
 PREEMPTED=false
-trap 'echo "[$(date)] SIGTERM received (preemption)"; PREEMPTED=true' SIGTERM
+TRAIN_PID=""
+trap 'echo "[$(date)] SIGTERM received (preemption)"; PREEMPTED=true; [ -n "$TRAIN_PID" ] && kill -TERM $TRAIN_PID 2>/dev/null || true' SIGTERM
 
 sync_checkpoints() {
     local job_ckpt_dir="$1"
     local gcs_ckpt_dir="$2"
     echo "[$(date)] Syncing checkpoints to GCS..."
-    gsutil -m rsync -r "$job_ckpt_dir" "$gcs_ckpt_dir"
+    # Only sync files not modified in the last 30s to avoid copying partial checkpoint writes
+    local tmp_sync_dir=$(mktemp -d)
+    find "$job_ckpt_dir" -name '*.pt' -mmin +0.5 -exec cp {} "$tmp_sync_dir/" \;
+    if [ -n "$(ls -A "$tmp_sync_dir" 2>/dev/null)" ]; then
+        if ! gsutil -m rsync -r "$tmp_sync_dir" "$gcs_ckpt_dir"; then
+            echo "[$(date)] WARNING: Checkpoint sync to GCS failed"
+        fi
+    fi
+    rm -rf "$tmp_sync_dir"
     echo "[$(date)] Checkpoint sync complete"
 }
 
