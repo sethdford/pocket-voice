@@ -309,17 +309,17 @@ class EcapaTdnn(nn.Module):
                                      padding=2, stride=1)
         self.input_bn = BatchNorm1d(channels[0])
 
-        # SE-Res2Net blocks
+        # SE-Res2Net blocks (N-1 blocks for N channel specs)
         self.blocks = nn.ModuleList()
-        for i in range(len(channels)):
-            in_ch = channels[i - 1] if i > 0 else channels[0]
-            out_ch = channels[i]
+        for i in range(len(channels) - 1):
             self.blocks.append(
-                SERes2NetBlock(in_ch, out_ch, kernel_sizes[i], dilations[i],
-                              scale=scale, se_channels=se_channels)
+                SERes2NetBlock(channels[i], channels[i + 1], kernel_sizes[i + 1],
+                              dilations[i + 1], scale=scale, se_channels=se_channels)
             )
 
-        # Multi-frame aggregation (concatenate all block outputs)
+        # Multi-layer feature aggregation
+        # features = [input_conv_out(channels[0])] + [block_i_out for i in range(N-1)]
+        # = channels[0] + channels[1] + ... + channels[-1] = sum(channels)
         total_channels = sum(channels)
 
         # Conv after aggregation

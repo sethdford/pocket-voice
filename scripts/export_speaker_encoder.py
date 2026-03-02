@@ -26,232 +26,195 @@ import torch.nn.functional as F
 
 # ============================================================================
 # Model Architecture Classes (ECAPA-TDNN)
+# Must exactly match train/train_speaker_encoder.py for checkpoint loading.
 # ============================================================================
 
 
 class BatchNorm1d(nn.Module):
-    """Wrapper around nn.BatchNorm1d for consistency."""
+    """Wrapper around nn.BatchNorm1d with consistent initialization."""
 
-    def __init__(self, channels: int):
+    def __init__(self, num_features: int):
         super().__init__()
-        self.bn = nn.BatchNorm1d(channels)
+        self.bn = nn.BatchNorm1d(num_features)
+        nn.init.constant_(self.bn.weight, 1.0)
+        nn.init.constant_(self.bn.bias, 0.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.bn(x)
 
 
 class SEBlock(nn.Module):
-    """Squeeze-and-Excitation block for channel attention."""
+    """Squeeze-and-Excitation block for channel-wise attention."""
 
-    def __init__(self, channels: int):
+    def __init__(self, channels: int, se_channels: int = 128):
         super().__init__()
-        self.conv1 = nn.Conv1d(channels, 128, kernel_size=1, bias=True)
-        self.conv2 = nn.Conv1d(128, channels, kernel_size=1, bias=True)
+        self.fc1 = nn.Linear(channels, se_channels)
+        self.fc2 = nn.Linear(se_channels, channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Global average pooling
-        s = x.mean(dim=2, keepdim=True)
-        # Squeeze-excitation
-        s = F.relu(self.conv1(s))
-        s = torch.sigmoid(self.conv2(s))
-        # Scale input
-        return x * s
+        se = x.mean(dim=2)
+        se = F.relu(self.fc1(se))
+        se = torch.sigmoid(self.fc2(se))
+        return x * se.unsqueeze(2)
 
 
 class Res2NetBlock(nn.Module):
-    """Multi-branch residual block with dilated convolutions."""
+    """Res2Net block with multi-branch dilated convolutions."""
 
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int = 3,
-        dilation: int = 1,
-        scale: int = 8,
-    ):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int,
+                 dilation: int, scale: int = 8):
         super().__init__()
         self.scale = scale
-        self.kernel_size = kernel_size
-        self.dilation = dilation
+        self.branch_channels = out_channels // scale
 
-        # Split channels across branches
-        width = out_channels // scale
+        self.conv1x1_in = nn.Conv1d(in_channels, out_channels, kernel_size=1)
+        self.bn1 = BatchNorm1d(out_channels)
 
-        self.branches = nn.ModuleList([
-            nn.Conv1d(
-                width if i > 0 else in_channels,
-                width,
-                kernel_size=kernel_size,
-                dilation=dilation,
-                padding=(kernel_size - 1) * dilation // 2,
-                bias=True,
+        self.branches = nn.ModuleList()
+        for i in range(scale - 1):
+            self.branches.append(
+                nn.Sequential(
+                    nn.Conv1d(self.branch_channels, self.branch_channels, kernel_size,
+                              padding=(kernel_size - 1) // 2 * dilation, dilation=dilation),
+                    BatchNorm1d(self.branch_channels),
+                    nn.ReLU(inplace=True)
+                )
             )
-            for i in range(scale)
-        ])
+
+        self.conv1x1_out = nn.Conv1d(out_channels, out_channels, kernel_size=1)
+        self.bn2 = BatchNorm1d(out_channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Split input across branches
+        residual = x
+        x = self.conv1x1_in(x)
+        x = self.bn1(x)
+        x = F.relu(x)
+
         xs = torch.chunk(x, self.scale, dim=1)
-        out = []
+        ys = [xs[0]]
 
         for i, branch in enumerate(self.branches):
-            if i == 0:
-                # First branch processes original input
-                out.append(branch(xs[i]))
-            else:
-                # Other branches process output of previous branch + original input
-                out.append(branch(xs[i] + out[-1]))
+            y = branch(xs[i + 1] + ys[-1])
+            ys.append(y)
 
-        return torch.cat(out, dim=1)
+        x = torch.cat(ys, dim=1)
+        x = self.conv1x1_out(x)
+        x = self.bn2(x)
+
+        if residual.shape[1] != x.shape[1]:
+            residual = F.pad(residual, (0, 0, 0, x.shape[1] - residual.shape[1]))
+
+        return F.relu(x + residual)
 
 
 class SERes2NetBlock(nn.Module):
-    """Residual block with Res2Net + SE attention."""
+    """SE-Res2Net block combining Res2Net with squeeze-and-excitation."""
 
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int = 3,
-        dilation: int = 1,
-        scale: int = 8,
-    ):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int,
+                 dilation: int, scale: int = 8, se_channels: int = 128):
         super().__init__()
-        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=1, bias=True)
-        self.bn1 = BatchNorm1d(out_channels)
-        self.res2net = Res2NetBlock(
-            out_channels, out_channels, kernel_size, dilation, scale
-        )
-        self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=1, bias=True)
-        self.bn2 = BatchNorm1d(out_channels)
-        self.se = SEBlock(out_channels)
-
-        # Shortcut projection if needed
-        self.shortcut = (
-            nn.Sequential(
-                nn.Conv1d(in_channels, out_channels, kernel_size=1, bias=True),
-                BatchNorm1d(out_channels),
-            )
-            if in_channels != out_channels
-            else nn.Identity()
-        )
+        self.res2net = Res2NetBlock(in_channels, out_channels, kernel_size,
+                                     dilation, scale)
+        self.se = SEBlock(out_channels, se_channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = self.shortcut(x)
-
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.res2net(out)
-        out = F.relu(self.bn2(self.conv2(out)))
-        out = self.se(out)
-
-        return F.relu(out + residual)
+        x = self.res2net(x)
+        x = self.se(x)
+        return x
 
 
 class AttentiveStatisticsPooling(nn.Module):
-    """Attentive statistics pooling with learnable attention."""
+    """Attentive statistics pooling with channel-wise attention."""
 
-    def __init__(self, in_channels: int, bottleneck_dim: int = 128):
+    def __init__(self, channels: int, attention_channels: int = 128):
         super().__init__()
-        self.attention_conv = nn.Conv1d(
-            in_channels, 1, kernel_size=1, padding=0, bias=True
+        self.attention = nn.Sequential(
+            nn.Conv1d(channels, attention_channels, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(attention_channels, channels, kernel_size=1)
         )
-        self.attention_bn = BatchNorm1d(1)
-        self.attention_proj = nn.Linear(in_channels, bottleneck_dim, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [batch, channels, time]
-        Returns:
-            pooled: [batch, channels * 2]
-        """
-        # Compute attention weights
-        attn = self.attention_conv(x)  # [batch, 1, time]
-        attn = self.attention_bn(attn)
-        attn = torch.tanh(attn)
-        attn = F.softmax(attn, dim=2)  # [batch, 1, time]
-
-        # Compute weighted mean
-        mean = torch.sum(x * attn, dim=2)  # [batch, channels]
-
-        # Compute weighted variance
-        var = torch.sum(((x - mean.unsqueeze(2)) ** 2) * attn, dim=2)  # [batch, channels]
-        std = torch.sqrt(torch.clamp(var, min=1e-10))
-
-        # Concatenate mean and std
-        pooled = torch.cat([mean, std], dim=1)  # [batch, channels * 2]
+        attention = torch.softmax(self.attention(x), dim=2)
+        weighted_x = x * attention
+        mean = weighted_x.sum(dim=2)
+        weighted_var = ((x ** 2) * attention).sum(dim=2) - mean ** 2
+        std = torch.sqrt(weighted_var.clamp(min=1e-9))
+        pooled = torch.cat([mean, std], dim=1)
         return pooled
 
 
 class EcapaTdnn(nn.Module):
-    """ECAPA-TDNN speaker embedding model."""
+    """ECAPA-TDNN speaker encoder with multi-layer feature aggregation."""
 
-    def __init__(
-        self,
-        n_mels: int = 80,
-        embedding_dim: int = 256,
-        channels: List[int] = None,
-    ):
+    def __init__(self, n_mels: int = 80, embedding_dim: int = 256,
+                 channels: List[int] = None, kernel_sizes: List[int] = None,
+                 dilations: List[int] = None, scale: int = 8,
+                 se_channels: int = 128, attention_channels: int = 128):
         super().__init__()
+
         if channels is None:
             channels = [1024, 1024, 1024, 1024, 1536]
+        if kernel_sizes is None:
+            kernel_sizes = [5, 3, 3, 3, 1]
+        if dilations is None:
+            dilations = [1, 2, 3, 4, 1]
 
-        self.n_mels = n_mels
         self.embedding_dim = embedding_dim
-        self.channels = channels
 
-        # Initial convolution
-        self.conv1 = nn.Conv1d(n_mels, channels[0], kernel_size=5, padding=2, bias=True)
-        self.bn1 = BatchNorm1d(channels[0])
+        # Input convolution
+        self.input_conv = nn.Conv1d(n_mels, channels[0], kernel_size=5,
+                                     padding=2, stride=1)
+        self.input_bn = BatchNorm1d(channels[0])
 
-        # Residual blocks
+        # SE-Res2Net blocks (N-1 blocks for N channel specs)
         self.blocks = nn.ModuleList()
         for i in range(len(channels) - 1):
             self.blocks.append(
-                SERes2NetBlock(
-                    channels[i],
-                    channels[i + 1],
-                    kernel_size=3,
-                    dilation=2,
-                    scale=8,
-                )
+                SERes2NetBlock(channels[i], channels[i + 1], kernel_sizes[i + 1],
+                              dilations[i + 1], scale=scale, se_channels=se_channels)
             )
 
-        # Multi-layer feature aggregation (concatenate all block outputs)
-        feature_dim = sum(channels)
+        # Multi-layer feature aggregation
+        total_channels = sum(channels)
+        self.mfa_conv = nn.Conv1d(total_channels, channels[-1], kernel_size=1)
+        self.mfa_bn = BatchNorm1d(channels[-1])
 
         # Attentive statistics pooling
-        self.pool = AttentiveStatisticsPooling(channels[-1], bottleneck_dim=128)
+        self.asp = AttentiveStatisticsPooling(channels[-1],
+                                               attention_channels=attention_channels)
 
-        # Projection to embedding space
-        self.linear = nn.Linear(channels[-1] * 2, embedding_dim, bias=True)
-        self.bn_linear = BatchNorm1d(embedding_dim)
+        # Final linear layer to embedding
+        self.final_linear = nn.Linear(channels[-1] * 2, embedding_dim)
+        self.final_bn = BatchNorm1d(embedding_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [batch, n_mels, time]
-        Returns:
-            embedding: [batch, embedding_dim] with L2 normalization
-        """
-        # Initial convolution
-        x = F.relu(self.bn1(self.conv1(x)))
+        # Input processing
+        x = self.input_conv(x)
+        x = self.input_bn(x)
+        x = F.relu(x)
 
-        # Residual blocks
+        # Collect features from all blocks (multi-layer feature aggregation)
+        features = [x]
         for block in self.blocks:
             x = block(x)
+            features.append(x)
 
-        # Statistics pooling
-        x = self.pool(x)
+        # Concatenate all features and reduce
+        cat = torch.cat(features, dim=1)
+        x = self.mfa_conv(cat)
+        x = self.mfa_bn(x)
+        x = F.relu(x)
 
-        # Linear projection
-        x = self.linear(x)
-        x = self.bn_linear(x)
+        # Attentive pooling
+        x = self.asp(x)
+
+        # Final linear projection
+        x = self.final_linear(x)
+        x = self.final_bn(x)
 
         # L2 normalization
-        x = F.normalize(x, p=2, dim=1)
-
-        return x
+        return F.normalize(x, p=2, dim=1)
 
 
 # ============================================================================
@@ -269,9 +232,18 @@ def load_checkpoint(checkpoint_path: str) -> Tuple[EcapaTdnn, Dict]:
     n_mels = config.get("n_mels", 80)
     embedding_dim = config.get("embedding_dim", 256)
     channels = config.get("channels", [1024, 1024, 1024, 1024, 1536])
+    kernel_sizes = config.get("kernel_sizes", [5, 3, 3, 3, 1])
+    dilations = config.get("dilations", [1, 2, 3, 4, 1])
+    scale = config.get("scale", 8)
+    se_channels = config.get("se_channels", 128)
+    attention_channels = config.get("attention_channels", 128)
 
-    # Reconstruct model
-    model = EcapaTdnn(n_mels=n_mels, embedding_dim=embedding_dim, channels=channels)
+    # Reconstruct model with full config
+    model = EcapaTdnn(
+        n_mels=n_mels, embedding_dim=embedding_dim, channels=channels,
+        kernel_sizes=kernel_sizes, dilations=dilations, scale=scale,
+        se_channels=se_channels, attention_channels=attention_channels,
+    )
 
     # Load only encoder weights (skip classifier)
     encoder_state_dict = {}
@@ -330,8 +302,8 @@ def export_onnx(
     """Export model to ONNX format."""
     print(f"Exporting to ONNX: {output_path}...")
 
-    # Create dummy input: [batch=1, n_mels=80, time=16000] (1 second at 16kHz)
-    dummy_input = torch.randn(1, n_mels, 16000)
+    # Create dummy input: [batch=1, n_mels=80, time=100] (100 mel frames)
+    dummy_input = torch.randn(1, n_mels, 100)
 
     try:
         torch.onnx.export(
@@ -367,7 +339,7 @@ def export_onnx(
         sess = ort.InferenceSession(output_path)
 
         # Test with different time lengths
-        for time_length in [8000, 16000, 24000]:
+        for time_length in [50, 100, 200]:
             test_input = np.random.randn(1, n_mels, time_length).astype(np.float32)
             outputs = sess.run(None, {"input": test_input})
             embedding = outputs[0]
