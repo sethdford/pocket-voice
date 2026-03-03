@@ -21,4 +21,13 @@ tracing = { workspace = true }
 
 [features]
 default = []
-metal = ["candle-core/metal", "candle-nn/metal"]
+metal = [
+    "candle-core/metal",
+    "candle-nn/metal",
+    "sonata-common/metal",
+    "sonata-codec/metal",
+    "sonata-cam/metal",
+    "sonata-stt/metal",
+    "sonata-tts/metal",
+    "sonata-cfm/metal",
+]
