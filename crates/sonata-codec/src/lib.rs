@@ -60,9 +60,32 @@ impl SonataCodec {
         self.decoder.forward(&latent)
     }
 
+    /// Decode codes to continuous embeddings (RVQ reconstruction) without audio synthesis.
+    ///
+    /// Input: codes tensor of shape [batch, 8, T] (u32 codebook indices)
+    /// Output: embeddings tensor of shape [batch, 512, T]
+    ///
+    /// This performs the RVQ decode step (sum codebook lookups across books)
+    /// but does NOT run the audio decoder. Useful for feeding into STT/TTS.
+    pub fn codes_to_embeddings(&self, codes: &Tensor) -> Result<Tensor> {
+        self.quantizer.decode(codes)
+    }
+
     /// Split codes into semantic (books 1-2) and acoustic (books 3-8) components
     pub fn split_codes(&self, codes: &Tensor) -> Result<(Tensor, Tensor)> {
         self.quantizer.split_codes(codes)
+    }
+
+    /// Get the codebook embedding tensor for a specific codebook index.
+    ///
+    /// Returns the raw codebook tensor [CODEBOOK_SIZE, CODEBOOK_DIM].
+    pub fn get_codebook_embeddings(&self, book_idx: usize) -> Result<&Tensor> {
+        self.quantizer.get_codebook_embeddings(book_idx)
+    }
+
+    /// Number of codebooks in the quantizer.
+    pub fn num_codebooks(&self) -> usize {
+        self.quantizer.num_codebooks()
     }
 }
 
@@ -110,5 +133,61 @@ mod integration_tests {
         assert_eq!(codes.dim(0).unwrap(), 4);
         let reconstructed = codec.decode(&codes).unwrap();
         assert_eq!(reconstructed.dim(0).unwrap(), 4);
+    }
+
+    #[test]
+    fn test_codec_codes_to_embeddings_shape() {
+        let dev = &Device::Cpu;
+        let codec = SonataCodec::new(dev).unwrap();
+        let audio = Tensor::randn(0.0f32, 0.1, (1, 1, 24000), dev).unwrap();
+        let codes = codec.encode(&audio).unwrap();
+        let embeddings = codec.codes_to_embeddings(&codes).unwrap();
+        // Should be [B, 512, T] — same shape as encoder output
+        assert_eq!(embeddings.dim(0).unwrap(), 1);
+        assert_eq!(embeddings.dim(1).unwrap(), 512);
+        assert_eq!(embeddings.dim(2).unwrap(), codes.dim(2).unwrap());
+    }
+
+    #[test]
+    fn test_codec_codes_to_embeddings_deterministic() {
+        let dev = &Device::Cpu;
+        let codec = SonataCodec::new(dev).unwrap();
+        let audio = Tensor::randn(0.0f32, 0.1, (1, 1, 24000), dev).unwrap();
+        let codes = codec.encode(&audio).unwrap();
+        // Same codes should produce identical embeddings (not random)
+        let emb1 = codec.codes_to_embeddings(&codes).unwrap();
+        let emb2 = codec.codes_to_embeddings(&codes).unwrap();
+        let diff = (&emb1 - &emb2).unwrap().abs().unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap();
+        assert_eq!(diff, 0.0, "codes_to_embeddings should be deterministic (not random)");
+    }
+
+    #[test]
+    fn test_codec_get_codebook_embeddings() {
+        let dev = &Device::Cpu;
+        let codec = SonataCodec::new(dev).unwrap();
+        assert_eq!(codec.num_codebooks(), NUM_CODEBOOKS);
+        for i in 0..NUM_CODEBOOKS {
+            let cb = codec.get_codebook_embeddings(i).unwrap();
+            assert_eq!(cb.dim(0).unwrap(), CODEBOOK_SIZE);
+            assert_eq!(cb.dim(1).unwrap(), CODEBOOK_DIM);
+        }
+        // Out of range should error
+        assert!(codec.get_codebook_embeddings(NUM_CODEBOOKS).is_err());
+    }
+
+    #[test]
+    fn test_codec_encode_then_embeddings_roundtrip() {
+        // Encode audio → codes → embeddings, verify shapes match
+        let dev = &Device::Cpu;
+        let codec = SonataCodec::new(dev).unwrap();
+        let audio = Tensor::randn(0.0f32, 0.1, (2, 1, 12000), dev).unwrap();
+        let codes = codec.encode(&audio).unwrap();
+        let embeddings = codec.codes_to_embeddings(&codes).unwrap();
+        // Batch preserved
+        assert_eq!(embeddings.dim(0).unwrap(), 2);
+        // Channel dim = 512 (input_dim of RVQ)
+        assert_eq!(embeddings.dim(1).unwrap(), 512);
+        // Time dim matches codes
+        assert_eq!(embeddings.dim(2).unwrap(), codes.dim(2).unwrap());
     }
 }

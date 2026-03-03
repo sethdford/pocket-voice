@@ -31,6 +31,11 @@ impl VectorQuantizer {
         })
     }
 
+    /// Get the codebook embedding tensor [CODEBOOK_SIZE, CODEBOOK_DIM].
+    pub fn codebook(&self) -> &Tensor {
+        &self.codebook
+    }
+
     pub fn encode(&self, z: &Tensor) -> Result<(Tensor, Tensor)> {
         // z shape: [batch, channels, length]
         let z_t = z.transpose(1, 2)?; // [batch, length, channels]
@@ -121,6 +126,23 @@ impl ResidualVQ {
             )?);
         }
         Ok(Self { quantizers })
+    }
+
+    /// Get the codebook embedding tensor for a specific codebook index.
+    ///
+    /// Returns the raw codebook tensor [CODEBOOK_SIZE, CODEBOOK_DIM].
+    pub fn get_codebook_embeddings(&self, book_idx: usize) -> Result<&Tensor> {
+        self.quantizers
+            .get(book_idx)
+            .map(|vq| vq.codebook())
+            .ok_or_else(|| candle_core::Error::Msg(
+                format!("Codebook index {} out of range (have {})", book_idx, self.quantizers.len())
+            ))
+    }
+
+    /// Number of codebooks in this RVQ.
+    pub fn num_codebooks(&self) -> usize {
+        self.quantizers.len()
     }
 
     pub fn encode(&self, z: &Tensor) -> Result<(Tensor, Tensor)> {

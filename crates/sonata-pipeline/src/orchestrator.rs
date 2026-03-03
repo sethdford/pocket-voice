@@ -199,7 +199,7 @@ impl PipelineOrchestrator {
     ///
     /// # Flow
     /// 1. Raw audio [B,1,samples] → codec → [B,8,T]
-    /// 2. Codec codes → codec embeddings [B,512,T]
+    /// 2. Codec codes → RVQ codebook lookup → embeddings [B,512,T]
     /// 3. Codec embeddings → STT → text token sequences
     pub fn process_audio(&mut self, audio: &Tensor) -> Result<Vec<Vec<u32>>> {
         debug!("Processing audio, shape: {:?}", audio.dims());
@@ -210,10 +210,8 @@ impl PipelineOrchestrator {
             .map_err(|e| anyhow!("Codec encoding failed: {}", e))?;
         debug!("Codec encoded, shape: {:?}", codec_codes.dims());
 
-        // STT expects codec embeddings [B,512,T], not raw codes
-        // For now, use codes as proxy (actual codec would provide embeddings)
-        // In production, codec would expand codes to embeddings
-        let codec_embeddings = self._codec_codes_to_embeddings(&codec_codes)?;
+        // RVQ decode: look up codebook embeddings and sum across books
+        let codec_embeddings = self.codec_codes_to_embeddings(&codec_codes)?;
 
         // Decode via STT to get text tokens
         let text_tokens = self.stt.transcribe(&codec_embeddings)
@@ -281,22 +279,17 @@ impl PipelineOrchestrator {
         Ok(mel)
     }
 
-    // Helper: Convert codec codes to embeddings
-    // In real implementation, codec would have a method for this.
-    // For now, create placeholder embeddings matching STT input shape.
-    fn _codec_codes_to_embeddings(&self, codec_codes: &Tensor) -> Result<Tensor> {
-        let device = codec_codes.device();
-        let dims = codec_codes.dims();
-
-        // codec_codes: [B, 8, T]
-        // Need to produce: [B, 512, T]
-        let batch = dims[0];
-        let seq_len = dims[2];
-
-        // Create placeholder embeddings (in production, codec would expand codes properly)
-        let embeddings = Tensor::randn(0.0f32, 1.0, &[batch, 512, seq_len], &device)
-            .map_err(|e| anyhow!("Failed to create codec embeddings: {}", e))?;
-        Ok(embeddings)
+    /// Convert codec codes to continuous embeddings via RVQ codebook lookup.
+    ///
+    /// Performs real codebook embedding lookup (not random data):
+    /// For each codebook, look up the embedding for each code index,
+    /// then sum across codebooks (RVQ reconstruction).
+    ///
+    /// Input: codec_codes [B, 8, T] (u32 codebook indices)
+    /// Output: embeddings [B, 512, T] (continuous embeddings)
+    fn codec_codes_to_embeddings(&self, codec_codes: &Tensor) -> Result<Tensor> {
+        self.codec.codes_to_embeddings(codec_codes)
+            .map_err(|e| anyhow!("Codec codes_to_embeddings failed: {}", e))
     }
 
     /// Get model dimension information.

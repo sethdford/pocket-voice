@@ -1,34 +1,42 @@
 //! 1D Transposed ConvNet decoder: upsample 50Hz latent to 24kHz audio.
 
-use candle_core::{Device, Result, Tensor};
+use candle_core::{Device, DType, Module, Result, Tensor};
+use candle_nn::{ConvTranspose1d, ConvTranspose1dConfig, VarBuilder};
 use crate::snake::Snake;
 
 pub const DECODER_STRIDES: [usize; 4] = [3, 4, 5, 8];
 pub const DECODER_CHANNELS: [usize; 5] = [512, 256, 128, 64, 1];
 
 pub struct DecoderBlock {
-    weight: Tensor,
-    stride: usize,
+    conv_t: ConvTranspose1d,
     snake: Snake,
 }
 
 impl DecoderBlock {
-    pub fn new(in_ch: usize, out_ch: usize, stride: usize, dev: &Device) -> Result<Self> {
+    pub fn new(in_ch: usize, out_ch: usize, stride: usize, block_idx: usize, dev: &Device) -> Result<Self> {
         let kernel = stride * 2;
-        // TransposedConv weight shape: [in_channels, out_channels, kernel_size]
-        let weight = Tensor::randn(0.0f32, 0.02, (in_ch, out_ch, kernel), dev)?;
-        let snake = Snake::new(out_ch, dev)?;
-        Ok(Self {
-            weight,
+        let padding = stride / 2;
+        let cfg = ConvTranspose1dConfig {
             stride,
-            snake,
-        })
+            padding,
+            output_padding: 0,
+            ..Default::default()
+        };
+        let vb = VarBuilder::zeros(DType::F32, dev);
+        let conv_t = candle_nn::conv_transpose1d(
+            in_ch,
+            out_ch,
+            kernel,
+            cfg,
+            vb.pp(format!("decoder_block_{}", block_idx)),
+        )?;
+        let snake = Snake::new(out_ch, dev)?;
+        Ok(Self { conv_t, snake })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // x shape: [batch, in_channels, length]
-        let pad = self.stride / 2;
-        let x = x.conv_transpose1d(&self.weight, pad, 0, self.stride, 1, 1)?;
+        let x = self.conv_t.forward(x)?;
         self.snake.forward(&x)
     }
 }
@@ -45,6 +53,7 @@ impl CodecDecoder {
                 DECODER_CHANNELS[i],
                 DECODER_CHANNELS[i + 1],
                 DECODER_STRIDES[i],
+                i,
                 dev,
             )?);
         }
@@ -72,7 +81,6 @@ impl CodecDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::DType;
 
     #[test]
     fn test_decoder_upsampling_ratio() {
@@ -109,9 +117,25 @@ mod tests {
     fn test_decoder_batch_processing() {
         let dev = &Device::Cpu;
         let decoder = CodecDecoder::new(dev).unwrap();
-        let latent = Tensor::randn(0.0f32, 0.1, (2, 512, 25), dev).unwrap();
+        let latent = Tensor::zeros(&[2, 512, 25], DType::F32, dev).unwrap();
         let audio = decoder.forward(&latent).unwrap();
         assert_eq!(audio.dim(0).unwrap(), 2); // batch size preserved
         assert_eq!(audio.dim(1).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_decoder_uses_varbuilder_weights() {
+        // Verify that decoder blocks use VarBuilder (zero-initialized weights)
+        // instead of random weights. With VarBuilder::zeros, repeated forward
+        // passes with the same input should produce identical output.
+        let dev = &Device::Cpu;
+        let decoder1 = CodecDecoder::new(dev).unwrap();
+        let decoder2 = CodecDecoder::new(dev).unwrap();
+        let input = Tensor::ones(&[1, 512, 10], DType::F32, dev).unwrap();
+        let out1 = decoder1.forward(&input).unwrap();
+        let out2 = decoder2.forward(&input).unwrap();
+        // Both decoders created with VarBuilder::zeros should produce identical output
+        let diff = (&out1 - &out2).unwrap().abs().unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap();
+        assert_eq!(diff, 0.0, "Decoders with VarBuilder::zeros should be deterministic");
     }
 }
