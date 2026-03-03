@@ -2292,6 +2292,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "sonata-cam"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "candle-nn",
+ "safetensors 0.4.5",
+ "sonata-common",
+ "tracing",
+]
+
+[[package]]
+name = "sonata-codec"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "candle-nn",
+ "safetensors 0.4.5",
+ "sonata-common",
+ "tracing",
+]
+
+[[package]]
 name = "sonata-common"
 version = "0.2.0"
 dependencies = [

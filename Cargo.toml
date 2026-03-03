@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/sonata-common",
+    "crates/sonata-codec",
+    "crates/sonata-cam",
     # Legacy v1 crates:
     "src/stt",
     "src/sonata_lm",
