@@ -144,7 +144,6 @@ class MUSANAugmenter(nn.Module):
     def __init__(self, musan_dir: Optional[str] = None, sample_rate: int = 16000):
         super().__init__()
         self.sample_rate = sample_rate
-        self.cache = {}
         self.musan_files = {'noise': [], 'music': [], 'speech': []}
 
         if musan_dir:
@@ -250,18 +249,13 @@ class MUSANAugmenter(nn.Module):
         return self._mix_at_snr(waveform, babble, snr_db)
 
     def _load_audio(self, filepath: Path) -> Tuple[torch.Tensor, int]:
-        """Load audio with caching."""
-        filepath_str = str(filepath)
-        if filepath_str in self.cache:
-            return self.cache[filepath_str]
-
+        """Load audio on demand (no caching to avoid OOM in DataLoader workers)."""
         try:
-            waveform, sr = torchaudio.load(filepath_str)
+            waveform, sr = torchaudio.load(str(filepath))
             if sr != self.sample_rate:
                 resampler = T.Resample(sr, self.sample_rate)
                 waveform = resampler(waveform)
             waveform = waveform.squeeze(0)
-            self.cache[filepath_str] = (waveform, self.sample_rate)
             return waveform, self.sample_rate
         except Exception as e:
             logger.warning(f"Failed to load {filepath}: {e}")
@@ -1209,7 +1203,7 @@ def main():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--resume', type=str, default='',
                         help='Checkpoint path to resume from')
-    parser.add_argument('--num-workers', type=int, default=4,
+    parser.add_argument('--num-workers', type=int, default=2,
                         help='DataLoader workers')
 
     # New augmentation args
