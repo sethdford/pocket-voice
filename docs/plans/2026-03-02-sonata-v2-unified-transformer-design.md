@@ -2,16 +2,18 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Design a unified multimodal transformer that makes Sonata SOTA across all 4 pillars (STT, TTS, Full-Duplex, STS) — native C/Rust, on-device, incorporating the best innovations from Kokoro, F5-TTS, CosyVoice, Dia, Chatterbox, Moshi, CAM++, and PersonaPlex.
+**Goal:** Build a unified on-device AI voice agent: Sonata v2 (SOTA voice pipeline) + SeaClaw (C11 agent runtime) + LLM provider (reasoning). One binary. All 4 voice pillars (STT, TTS, Full-Duplex, STS). Native C/Rust. On-device. Incorporating the best innovations from Kokoro, F5-TTS, CosyVoice, Dia, Chatterbox, Moshi, CAM++, and PersonaPlex.
 
-**Architecture:** Single 400M-param unified transformer processing audio tokens natively via dual-stream full-duplex, with AdaIN voice conditioning, emotion control, nonverbal vocabulary, and Conditional Flow Matching decoder. Text sideband for reasoning/tools.
+**Architecture:** Sonata voice pipeline (~260M params) compiled as static library into SeaClaw agent runtime (349KB). SeaClaw provides LLM routing (50+ providers), 47 tools, memory, security. Sonata provides SOTA STT/TTS/full-duplex with AdaIN voice conditioning, emotion control, nonverbal vocabulary, CAM++ speaker encoder, and CFM decoder.
 
-**Tech Stack:** Rust (candle for ML, Metal GPU), C (vDSP/Accelerate for DSP), NAPI (TypeScript integration)
+**Tech Stack:** C11 (SeaClaw agent runtime), Rust (candle for ML, Metal GPU), C (vDSP/Accelerate for DSP)
 
 **Author:** Seth Ford + Claude
 **Date:** March 2, 2026
+**Updated:** March 2, 2026 (added SeaClaw integration)
 **Status:** Approved for implementation planning
 **Supersedes:** SONATA_V2_VISION.md Option B (Hybrid) — this design goes Full SOTA Rewrite
+**Integrates with:** [SeaClaw](https://github.com/sethdford/seaclaw) — autonomous AI agent runtime in C11
 
 ---
 
@@ -26,10 +28,11 @@
 7. [Full-Duplex Architecture](#7-full-duplex-architecture)
 8. [Speech-to-Speech (STS)](#8-speech-to-speech-sts-direct-path)
 9. [Training Strategy](#9-training-strategy)
-10. [Implementation Language Strategy](#10-implementation-language-strategy)
-11. [Comparison Matrix](#11-comparison-matrix)
-12. [Migration from v1](#12-migration-from-v1)
-13. [Risk Assessment](#13-risk-assessment)
+10. [SeaClaw Integration (Unified Binary)](#10-seaclaw-integration-unified-binary)
+11. [Implementation Language Strategy](#11-implementation-language-strategy)
+12. [Comparison Matrix](#12-comparison-matrix)
+13. [Migration from v1](#13-migration-from-v1)
+14. [Risk Assessment](#14-risk-assessment)
 
 ---
 
@@ -55,11 +58,14 @@ The existing `SONATA_V2_VISION.md` recommended Option B (Hybrid Dual-Stream, 4-6
 
 ### Design Decision
 
-**Chosen approach:** Unified Multimodal Transformer
+**Chosen approach:** Unified Binary — Sonata voice pipeline + SeaClaw agent runtime + LLM provider
+**Key evolution:** The original "unified transformer" design evolved to separate voice (Sonata ~260M) from reasoning (SeaClaw + LLM). Sonata focuses on being the BEST voice pipeline. SeaClaw provides the agent brain. LLM providers handle reasoning. This is more powerful than a single model trying to do everything.
 **Rejected alternatives:**
 - Option B Hybrid (SONATA_V2_VISION.md) — compromise, doesn't achieve SOTA across all pillars
 - Modular Best-of-Breed — cascade latency, full-duplex is bolted on
 - Codec-Unified — codec quality is single point of failure, too novel/risky
+- Sonata as separate process (IPC bridge) — adds latency, complexity
+- Sonata wrapping other providers — user wants Sonata to BE the best
 
 ---
 
@@ -609,39 +615,53 @@ When text is removed as intermediary:
 | **Target** | PESQ > 4.0, STOI > 0.95 |
 | **Output** | Codec encoder + decoder + quantizer weights |
 
-### Phase 2: Core Transformer Pre-training (4-6 weeks)
+### Phase 2: STT Model Training (2-3 weeks)
 
 | Aspect | Detail |
 |--------|--------|
-| **Data** | LibriLight (60K hours) + Multilingual LibriSpeech (50K hours) + text transcripts |
-| **Task** | Next-token prediction on interleaved audio+text tokens |
-| **Schedule** | Start audio-only (50K steps) -> add text sideband (50K steps) -> add dual-stream with synthetic pairs (100K steps) |
-| **Hardware** | 8x A100 80GB (or equivalent) |
-| **Duration** | 200K steps total, 4-6 weeks |
-| **Curriculum** | Progressively longer sequences: 2s -> 5s -> 10s -> 30s |
-| **Output** | Base Core Transformer weights |
+| **Data** | LibriSpeech (960h) + CommonVoice (2500h+) + GigaSpeech (10K hours) |
+| **Architecture** | Enhanced Conformer (~100M) with streaming CTC head |
+| **Task** | CTC loss on codec token -> text mapping |
+| **Hardware** | 4x A100 80GB (or equivalent) |
+| **Duration** | 100K steps, 2-3 weeks |
+| **Target** | WER < 3% on LibriSpeech test-clean |
+| **Output** | Streaming STT model weights |
 
-### Phase 3: Speaker + Style Fine-tuning (2-3 weeks)
+### Phase 3: CAM++ Speaker Encoder (2-3 weeks)
 
 | Aspect | Detail |
 |--------|--------|
-| **CAM++ training** | LibriTTS-R (2311 speakers) + VoxCeleb1+2 (7000+ speakers) |
-| **AdaIN integration** | Freeze Core, train AdaIN layers on multi-speaker data |
-| **Emotion labels** | RAVDESS, CREMA-D, IEMOCAP emotional speech datasets |
-| **Nonverbal annotations** | Manual annotation on subset + synthetic generation |
-| **Duration** | 2-3 weeks |
-| **Target** | EER < 0.6% (speaker), emotion accuracy > 80% |
+| **Data** | LibriTTS-R (2311 speakers) + VoxCeleb1+2 (7000+ speakers) |
+| **Architecture** | CAM++ (7.18M params) with context-aware masking |
+| **Loss** | AAM-Softmax + sub-center ArcFace K=2 |
+| **Augmentation** | MUSAN + RIR noise injection, speed perturbation |
+| **Hardware** | 1-2x A100 (smaller model) |
+| **Duration** | 2-3 weeks (v3 training already in progress on GCE!) |
+| **Target** | EER < 0.6% on VoxCeleb1-O |
 
-### Phase 4: Full-Duplex Conversation Training (2-3 weeks)
+### Phase 4: TTS Model Training (3-4 weeks)
+
+| Aspect | Detail |
+|--------|--------|
+| **Data** | LibriTTS-R (585h) + VCTK (44h) + emotional speech (RAVDESS, CREMA-D, IEMOCAP) |
+| **Architecture** | Transformer TTS (~100M) with AdaIN speaker conditioning, emotion style tokens, nonverbal vocabulary |
+| **AdaIN** | Freeze CAM++, inject 192-dim embedding at every layer |
+| **Emotion** | 64 learned style embeddings + exaggeration scalar (0-2) |
+| **Nonverbal** | 24 special tokens ([laugh], [sigh], [breath], [hmm], etc.) |
+| **Hardware** | 4x A100 80GB |
+| **Duration** | 150K steps, 3-4 weeks |
+| **Target** | PESQ > 3.8, emotion accuracy > 80%, natural nonverbal generation |
+
+### Phase 5: Full-Duplex Controller (1-2 weeks)
 
 | Aspect | Detail |
 |--------|--------|
 | **Data** | Fisher Corpus (2000h conversations), Switchboard (300h), CALLHOME (120h) |
-| **Synthetic data** | Generate dual-stream pairs from dialogue transcripts using v1 TTS |
-| **Task** | Dual-stream prediction — generate system tokens given user tokens |
-| **Backchanneling** | Annotated backchanneling datasets (manually + automatically labeled) |
-| **Duration** | 2-3 weeks |
-| **Target** | Natural turn-taking, contextual backchanneling |
+| **Synthetic data** | Generate backchanneling data from dialogue transcripts using v1 TTS |
+| **Architecture** | Lightweight controller (~10M) that decides: backchannel vs silence vs response |
+| **Integration** | Bridges Sonata STT streaming output with SeaClaw agent + Sonata TTS |
+| **Duration** | 1-2 weeks |
+| **Target** | Natural turn-taking, contextual backchanneling while waiting for LLM |
 
 ### Phase 5: CFM Decoder Training (1-2 weeks)
 
@@ -667,11 +687,13 @@ When text is removed as intermediary:
 ### Total Timeline: ~6-9 months
 
 ```
-Month 1-2:  Codec training + CAM++ training (parallel)
-Month 2-4:  Core Transformer pre-training
-Month 4-5:  Speaker/Style fine-tuning + CFM training (parallel)
-Month 5-6:  Full-duplex conversation training
-Month 6-9:  Native C/Rust implementation + optimization
+Month 1:    Codec training + CAM++ training (parallel, CAM++ v3 already started!)
+Month 2:    STT model training + CFM decoder training (parallel)
+Month 3-4:  TTS model training (depends on codec + CAM++)
+Month 4:    Full-duplex controller (depends on STT + TTS)
+Month 5-7:  Native C/Rust implementation + SeaClaw integration
+Month 7-8:  Optimization + testing + benchmarking
+Month 8-9:  Integration testing + release
 ```
 
 ### Compute Requirements
@@ -679,14 +701,328 @@ Month 6-9:  Native C/Rust implementation + optimization
 | Phase | Hardware | Duration | Estimated Cost |
 |-------|----------|----------|---------------|
 | Codec | 4x A100 | 3 weeks | ~$3K-5K |
-| Core Pre-training | 8x A100 | 6 weeks | ~$15K-25K |
-| Fine-tuning (all) | 4x A100 | 6 weeks | ~$5K-10K |
+| STT | 4x A100 | 3 weeks | ~$3K-5K |
+| CAM++ | 1-2x A100 | 3 weeks | ~$1K-2K |
+| TTS | 4x A100 | 4 weeks | ~$5K-8K |
 | CFM | 4x A100 | 2 weeks | ~$2K-3K |
-| **Total training** | | | **~$25K-43K** |
+| Full-duplex | 2x A100 | 2 weeks | ~$1K-2K |
+| **Total training** | | | **~$15K-25K** |
+
+**Note:** Compute cost is lower than original design because we're training separate specialized models (~100M each) instead of one 400M unified transformer. Each model trains faster and can be trained in parallel.
 
 ---
 
-## 10. Implementation Language Strategy
+## 10. SeaClaw Integration (Unified Binary)
+
+### Overview
+
+Sonata v2 integrates directly into [SeaClaw](https://github.com/sethdford/seaclaw), Seth's C11 autonomous AI agent runtime. The result is a **single binary** that is a complete on-device AI voice agent:
+
+- **Sonata** provides SOTA voice (STT, TTS, full-duplex, emotion, nonverbal)
+- **SeaClaw** provides agent intelligence (LLM routing, tools, memory, security)
+- **LLM Provider** provides reasoning (Claude, GPT-4, Gemini, Ollama, llama.cpp)
+
+### Unified Binary Architecture
+
+```
++===================================================================+
+|            UNIFIED BINARY (~50MB with models)                      |
+|                                                                    |
+|  +-- SEACLAW AGENT RUNTIME (C11, 349KB core) --+                  |
+|  |                                              |                  |
+|  |  Agent Loop ---------> LLM Provider ------+  |                  |
+|  |  (planner, dispatcher)  (50+ options)     |  |                  |
+|  |       |                   - Claude API    |  |                  |
+|  |       |                   - GPT-4 API     |  |                  |
+|  |       |                   - Gemini API    |  |                  |
+|  |       |                   - Ollama (local)|  |                  |
+|  |       |                   - llama.cpp     |  |                  |
+|  |       v                                   |  |                  |
+|  |  47 Tools    Memory      Security         |  |                  |
+|  |  (shell,     (SQLite,    (pairing,        |  |                  |
+|  |   web,       vectors,    sandbox,         |  |                  |
+|  |   file,      FTS5,       ChaCha20,        |  |                  |
+|  |   git,       hybrid)     Landlock)        |  |                  |
+|  |   hw...)                                  |  |                  |
+|  |                                           |  |                  |
+|  +-------------------------------------------+  |                  |
+|       ^                    |                     |                  |
+|       | text               | text                |                  |
+|       |                    v                     |                  |
+|  +-- SONATA VOICE PIPELINE (Rust/C, ~260M) -+   |                  |
+|  |                                           |   |                  |
+|  |  sc_channel_voice_t (new voice channel)   |   |                  |
+|  |       ^                    |               |   |                  |
+|  |       | user text          | response text |   |                  |
+|  |       |                    v               |   |                  |
+|  |  Sonata STT           Sonata TTS          |   |                  |
+|  |  (Conformer CTC)      (AdaIN + Emotion    |   |                  |
+|  |       ^                + Nonverbal)        |   |                  |
+|  |       |                    |               |   |                  |
+|  |  Sonata Codec          CFM Decoder         |   |                  |
+|  |  (audio->tokens)       (tokens->mel)       |   |                  |
+|  |       ^                    |               |   |                  |
+|  |       |                    v               |   |                  |
+|  |  CAM++ Speaker         iSTFT Vocoder       |   |                  |
+|  |  (voice identity)      (mel->audio)        |   |                  |
+|  |       ^                    |               |   |                  |
+|  |       |                    v               |   |                  |
+|  +------|--------------------|-----------+   |                  |
+|         |                    |               |                  |
+|    Microphone            Speaker             |                  |
+|    (24kHz in)            (24kHz out)         |                  |
++===================================================================+
+```
+
+### How the LLM Fits In the Middle
+
+The data flow for a voice conversation:
+
+```
+1. User speaks into microphone
+   |
+2. Sonata Codec encodes audio -> tokens (5ms)
+   |
+3. Sonata STT converts tokens -> text via CTC (80ms)
+   |
+4. sc_channel_voice_t delivers text to SeaClaw agent loop
+   |
+5. SeaClaw agent dispatches to LLM provider:
+   |   - Cloud: Claude API, GPT-4 API, Gemini API (~200-500ms)
+   |   - Local: llama.cpp, Ollama (~100-300ms on M-series)
+   |   LLM has access to SeaClaw's 47 tools, memory, context
+   |
+6. LLM response text flows back through voice channel
+   |
+7. Sonata TTS converts text -> audio tokens with:
+   |   - AdaIN speaker conditioning (from CAM++)
+   |   - Emotion style tokens (from Chatterbox)
+   |   - Nonverbal tags (from Dia)
+   |
+8. CFM Decoder converts tokens -> mel spectrogram (25ms)
+   |
+9. iSTFT converts mel -> 24kHz audio (<1ms)
+   |
+10. Audio plays through speaker
+```
+
+### Full-Duplex with LLM in the Middle
+
+Full-duplex requires Sonata to handle audio streaming independently of the LLM's response time:
+
+```
+SONATA LAYER (continuous, 20ms frames):
+  User audio -> Codec -> STT (streaming partial results)
+  While waiting for LLM:
+    Generate backchannels: [hmm], [right], [uh-huh]
+    Generate silence tokens
+    Mirror emotional state
+  When LLM response arrives:
+    Smoothly transition from backchannel to response
+    Apply AdaIN + emotion + nonverbal as generating
+
+SEACLAW LAYER (request-response with streaming):
+  Receive completed user utterance text
+  Route to LLM provider
+  Stream response tokens back to Sonata TTS
+  Handle tool calls inline (pause TTS, execute, resume)
+
+STREAMING BRIDGE (new):
+  sc_stream_callback_t from LLM provider
+  -> Feeds tokens to Sonata TTS in real-time
+  -> TTS generates audio as tokens arrive (no wait for full response)
+```
+
+### Three Integration Points in SeaClaw
+
+#### 1. `sc_channel_voice_t` — Voice as a Channel
+
+Sonata becomes a new channel type (like Telegram, Discord, but for voice):
+
+```c
+/* include/seaclaw/channel_voice.h */
+
+typedef struct sc_channel_voice_config {
+    /* Sonata model paths */
+    const char *codec_model_path;
+    const char *stt_model_path;
+    const char *tts_model_path;
+    const char *cam_model_path;
+    const char *cfm_model_path;
+
+    /* Voice settings */
+    const char *speaker_id;         /* Voice identity for TTS */
+    float emotion_exaggeration;     /* 0.0-2.0 (Chatterbox-style) */
+    const char *default_emotion;    /* "neutral", "warm", "excited" */
+
+    /* Audio I/O */
+    uint32_t sample_rate;           /* 24000 */
+    uint32_t channels;              /* 1 (mono) */
+    bool enable_full_duplex;        /* Enable dual-stream */
+    bool enable_backchanneling;     /* Generate hmm/right while waiting */
+
+    /* Hardware */
+    bool use_metal;                 /* Metal GPU acceleration */
+    bool use_ane;                   /* Apple Neural Engine */
+} sc_channel_voice_config_t;
+
+/* Channel vtable implementation */
+static const sc_channel_vtable_t voice_channel_vtable = {
+    .init     = sc_channel_voice_init,
+    .send     = sc_channel_voice_send,     /* TTS: text -> audio -> speaker */
+    .receive  = sc_channel_voice_receive,  /* STT: mic -> audio -> text */
+    .stream   = sc_channel_voice_stream,   /* Streaming TTS as LLM generates */
+    .deinit   = sc_channel_voice_deinit,
+    .get_name = sc_channel_voice_name,     /* "voice" */
+};
+```
+
+#### 2. Replace `sc_voice_stt/tts` — Native Voice Functions
+
+Replace SeaClaw's current API-based voice functions with Sonata native:
+
+```c
+/* Current SeaClaw voice (API-based, ~500ms latency): */
+sc_voice_stt(alloc, &config, audio, len, &text, &text_len);  /* Groq Whisper API */
+sc_voice_tts(alloc, &config, text, len, &audio, &audio_len);  /* OpenAI TTS API */
+
+/* New Sonata voice (native, ~80ms STT, ~100ms TTS): */
+sonata_stt(pipeline, audio, len, &text, &text_len);  /* On-device Conformer CTC */
+sonata_tts(pipeline, text, len, speaker, emotion, &audio, &audio_len);  /* On-device CFM */
+```
+
+#### 3. Streaming Provider Callback — Real-Time TTS
+
+Connect SeaClaw's LLM streaming to Sonata's streaming TTS:
+
+```c
+/* SeaClaw streams LLM tokens -> Sonata generates audio in real-time */
+
+void on_llm_token(const char *token, void *ctx) {
+    sonata_tts_stream_token(ctx, token);  /* Feed token to Sonata TTS */
+    /* Sonata generates audio for this token immediately */
+    /* Audio plays while next token is still being generated */
+}
+
+sc_chat_request_t req = {
+    .messages = messages,
+    .model = "claude-sonnet-4-20250514",
+    .stream_callback = on_llm_token,
+    .stream_ctx = sonata_pipeline,
+};
+provider->vtable->stream_chat(provider, alloc, &req, &response);
+```
+
+### Sonata's Revised Role (With SeaClaw)
+
+With SeaClaw providing the agent brain, Sonata v2 focuses purely on voice excellence:
+
+| Component | Params | Purpose | Status |
+|-----------|--------|---------|--------|
+| **Sonata Codec** | ~25M | Audio <-> discrete tokens | New (train) |
+| **CAM++ Speaker Encoder** | 7.18M | Voice identity -> AdaIN embedding | New (train, v3 in progress) |
+| **Sonata STT** | ~100M | Streaming Conformer CTC (text output) | Enhanced from v1 |
+| **Sonata TTS** | ~100M | Text -> audio tokens (AdaIN + emotion + nonverbal) | New (train) |
+| **CFM Decoder** | ~35M | Audio tokens -> mel spectrogram | New (train) |
+| **iSTFT Vocoder** | ~0 | Mel -> 24kHz waveform (vDSP) | Keep from v1 |
+| **Full-Duplex Controller** | ~0 | Streaming orchestration, backchanneling | New (code) |
+| **Total Sonata** | **~260M** | Complete voice pipeline | |
+
+**Note:** The 400M "Core Transformer" from the original design is replaced by the combination of:
+- Sonata STT (~100M) for speech understanding
+- SeaClaw + LLM for reasoning
+- Sonata TTS (~100M) for speech generation
+
+This is more efficient — each component is optimized for its task.
+
+### Dual-Path: Fast (STS) and Rich (Text)
+
+```
+FAST PATH (STS, ~160ms):
+  Audio -> Codec -> Lightweight response model -> Codec -> CFM -> Audio
+  For: backchannels, simple responses, emotional mirroring
+  No SeaClaw/LLM involved. Pure Sonata.
+
+RICH PATH (Text, ~300-600ms):
+  Audio -> Codec -> STT -> Text -> SeaClaw -> LLM -> Text -> TTS -> Audio
+  For: complex reasoning, tool use, factual answers, memory retrieval
+  Full SeaClaw agent intelligence.
+
+DECISION LOGIC:
+  If user utterance is short (<3 words) -> Fast path (backchannel)
+  If user utterance needs tools -> Rich path
+  If user utterance is emotional -> Fast path (emotional mirror)
+  If user utterance is a question -> Rich path
+  If user is interrupting -> Fast path (acknowledge)
+  Default -> Rich path
+```
+
+### Build Integration
+
+```cmake
+# SeaClaw CMakeLists.txt additions
+
+# Link Sonata as static library
+option(SC_ENABLE_SONATA "Enable native Sonata voice pipeline" ON)
+
+if(SC_ENABLE_SONATA)
+    # Sonata Rust crates compiled via cargo
+    add_custom_command(
+        OUTPUT ${CMAKE_BINARY_DIR}/libsonata.a
+        COMMAND cargo build --release --manifest-path ${SONATA_DIR}/Cargo.toml
+        COMMENT "Building Sonata voice pipeline"
+    )
+
+    add_library(sonata STATIC IMPORTED)
+    set_target_properties(sonata PROPERTIES
+        IMPORTED_LOCATION ${CMAKE_BINARY_DIR}/libsonata.a
+    )
+
+    # Link Sonata + Apple frameworks
+    target_link_libraries(seaclaw PRIVATE
+        sonata
+        "-framework Accelerate"
+        "-framework Metal"
+        "-framework CoreAudio"
+    )
+
+    target_compile_definitions(seaclaw PRIVATE SC_HAS_SONATA=1)
+endif()
+```
+
+### Binary Size Budget
+
+| Component | Size (stripped, LTO) |
+|-----------|---------------------|
+| SeaClaw core | ~349 KB |
+| Sonata voice code | ~2 MB |
+| Sonata models (quantized 4-bit) | ~40-50 MB |
+| **Total binary** | **~50 MB** |
+| **Total with llama.cpp** | **~55 MB** |
+
+For comparison: a Python venv with PyTorch + transformers is ~2 GB.
+
+### Fully On-Device Scenario
+
+With llama.cpp as the LLM provider, the entire system runs on-device with zero cloud:
+
+```
+Hardware: Apple M1 Pro (or better)
+Memory:  ~4 GB (Sonata models + 7B LLM quantized)
+
+User speaks -> Sonata STT (on-device, 80ms)
+           -> SeaClaw agent (on-device, <1ms routing)
+           -> llama.cpp (on-device, 100-300ms for 7B model)
+           -> Sonata TTS (on-device, 100ms)
+           -> Audio out
+
+Total latency: ~300-500ms (fully on-device, no cloud)
+Privacy: 100% — no data leaves the device
+```
+
+---
+
+## 11. Implementation Language Strategy
 
 ### Target Structure
 
@@ -754,7 +1090,7 @@ extern "C" {
 
 ---
 
-## 11. Comparison Matrix
+## 12. Comparison Matrix
 
 | Metric | Sonata v1 | **Sonata v2** | Moshi | GPT-4o RT | CosyVoice | Kokoro |
 |--------|-----------|---------------|-------|-----------|-----------|--------|
@@ -781,7 +1117,7 @@ extern "C" {
 
 ---
 
-## 12. Migration from v1
+## 13. Migration from v1
 
 ### What Gets Preserved
 
@@ -812,7 +1148,7 @@ extern "C" {
 
 ---
 
-## 13. Risk Assessment
+## 14. Risk Assessment
 
 ### Risk 1: Training Compute Cost
 
