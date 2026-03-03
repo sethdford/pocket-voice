@@ -1,9 +1,15 @@
 """Train Sonata Codec: audio encoder + RVQ + decoder.
 
 Trains a neural audio codec with:
-- 1D ConvNet encoder (24000 Hz → 50 Hz frames × 512 dim)
-- Residual Vector Quantizer (8 codebooks, 1024 codes each)
-- 1D transposed ConvNet decoder (512 dim → 24000 Hz)
+- 1D ConvNet encoder with Snake activation (24000 Hz → 50 Hz frames × 512 dim)
+- Residual Vector Quantizer (8 codebooks, 1024 codes each, 128-dim codebook vectors)
+- 1D transposed ConvNet decoder with Snake activation (512 dim → 24000 Hz)
+
+Architecture matches Rust inference in sonata-codec crate:
+- Encoder: 4 blocks with strides [8,5,4,3], kernel=stride*2, padding=stride//2
+- Snake activation: x + (1/alpha) * sin^2(alpha * x)
+- RVQ: project_in(512→128) → 8 codebooks(1024, 128) → project_out(128→512)
+- Decoder: 4 blocks with strides [3,4,5,8], kernel=stride*2, padding=stride//2
 
 Loss combines reconstruction (L1) + VQ commitment + codebook losses.
 
@@ -44,7 +50,10 @@ from pathlib import Path
 import time
 from tqdm import tqdm
 
-from data.codec_dataset import AudioCodecDataset, SyntheticAudioDataset
+try:
+    from data.codec_dataset import AudioCodecDataset, SyntheticAudioDataset
+except ImportError:
+    from train.data.codec_dataset import AudioCodecDataset, SyntheticAudioDataset
 
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
@@ -54,33 +63,56 @@ logger = logging.getLogger(__name__)
 # Model Components
 # ============================================================================
 
+class Snake(nn.Module):
+    """Snake activation: x + (1/alpha) * sin^2(alpha * x).
+
+    Learnable periodic activation function for audio, matching
+    sonata-codec/src/snake.rs. Alpha is per-channel.
+
+    Args:
+        channels: Number of channels (alpha has shape [channels])
+    """
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.ones(channels))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply Snake activation.
+
+        Args:
+            x: [B, channels, T]
+
+        Returns:
+            activated: [B, channels, T]
+        """
+        alpha = self.alpha.unsqueeze(0).unsqueeze(-1)  # [1, C, 1]
+        return x + (1.0 / alpha) * torch.sin(alpha * x).pow(2)
+
+
 class CodecEncoder(nn.Module):
     """1D ConvNet encoder: [B,1,24000] → [B,512,50].
 
-    Applies 4 strided convolutions (8×5×4×3 = 480× downsampling) followed
-    by projection to 512-dim latent space.
-
-    Architecture:
-        Conv1d(1, 64, 7, stride=1) → ReLU
-        Conv1d(64, 128, 4, stride=8) → ReLU
-        Conv1d(128, 256, 4, stride=5) → ReLU
-        Conv1d(256, 512, 4, stride=4) → ReLU
-        Conv1d(512, 512, 4, stride=3) → identity
+    Matches sonata-codec/src/encoder.rs:
+    4 EncoderBlocks with strides [8,5,4,3] (480× downsampling).
+    channels [1, 64, 128, 256, 512], kernel=stride*2, padding=stride//2.
+    Each block: Conv1d → Snake activation.
     """
 
-    def __init__(self, in_channels: int = 1, out_channels: int = 512):
+    STRIDES = [8, 5, 4, 3]
+    CHANNELS = [1, 64, 128, 256, 512]
+
+    def __init__(self):
         super().__init__()
-        self.layers = nn.Sequential(
-            nn.Conv1d(in_channels, 64, 7, stride=1, padding=3),
-            nn.ReLU(),
-            nn.Conv1d(64, 128, 4, stride=8, padding=0),
-            nn.ReLU(),
-            nn.Conv1d(128, 256, 4, stride=5, padding=0),
-            nn.ReLU(),
-            nn.Conv1d(256, 512, 4, stride=4, padding=0),
-            nn.ReLU(),
-            nn.Conv1d(512, out_channels, 4, stride=3, padding=0),
-        )
+        self.conv_layers = nn.ModuleList()
+        self.snake_layers = nn.ModuleList()
+        for i, stride in enumerate(self.STRIDES):
+            in_ch = self.CHANNELS[i]
+            out_ch = self.CHANNELS[i + 1]
+            kernel = stride * 2
+            padding = stride // 2
+            self.conv_layers.append(nn.Conv1d(in_ch, out_ch, kernel, stride=stride, padding=padding))
+            self.snake_layers.append(Snake(out_ch))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Encode audio to latent.
@@ -91,95 +123,103 @@ class CodecEncoder(nn.Module):
         Returns:
             z: [B, 512, 50]
         """
-        return self.layers(x)
-
-
-class VectorQuantizer(nn.Module):
-    """Single VQ codebook with commitment + codebook losses.
-
-    Quantizes continuous embeddings to nearest codebook entry using
-    straight-through estimator for gradient flow.
-
-    Args:
-        dim: Embedding dimension (default: 512)
-        codebook_size: Number of codes per codebook (default: 1024)
-        beta: Weight for commitment loss (default: 0.25)
-    """
-
-    def __init__(self, dim: int = 512, codebook_size: int = 1024, beta: float = 0.25):
-        super().__init__()
-        self.dim = dim
-        self.codebook_size = codebook_size
-        self.beta = beta
-
-        # Codebook: [codebook_size, dim]
-        self.codebook = nn.Embedding(codebook_size, dim)
-        self.codebook.weight.data.uniform_(-1.0 / codebook_size, 1.0 / codebook_size)
-
-    def forward(self, z: torch.Tensor) -> tuple:
-        """Quantize latent codes.
-
-        Args:
-            z: [B, dim, T]
-
-        Returns:
-            z_q_st: Quantized with straight-through estimator [B, dim, T]
-            indices: Codebook indices [B, T]
-            loss: Scalar VQ loss
-        """
-        # Flatten: [B, dim, T] → [B*T, dim]
-        z_flat = z.permute(0, 2, 1).reshape(-1, self.dim)
-
-        # Find nearest codebook entry: [B*T, codebook_size]
-        dist = torch.cdist(z_flat, self.codebook.weight)  # Euclidean distance
-        indices = dist.argmin(dim=-1)  # [B*T]
-
-        # Quantized: [B*T, dim]
-        z_q_flat = self.codebook(indices)
-
-        # Reshape back: [B, dim, T]
-        z_q = z_q_flat.reshape(z.shape[0], z.shape[2], self.dim).permute(0, 2, 1)
-
-        # Straight-through estimator: use quantized in backward
-        z_q_st = z + (z_q - z).detach()
-
-        # Losses
-        commitment_loss = F.mse_loss(z_q.detach(), z)
-        codebook_loss = F.mse_loss(z_q, z.detach())
-        loss = commitment_loss + self.beta * codebook_loss
-
-        return z_q_st, indices, loss
+        for conv, snake in zip(self.conv_layers, self.snake_layers):
+            x = snake(conv(x))
+        return x
 
 
 class ResidualVQ(nn.Module):
-    """Residual Vector Quantizer with K independent codebooks.
+    """Residual Vector Quantizer with shared project_in/out and K codebooks.
 
-    Applies successive quantization stages, where each stage quantizes
-    the residual from the previous stage. This improves reconstruction
-    by allowing different parts of the signal to be represented at
-    different precision levels.
+    Matches sonata-codec/src/quantizer.rs ResidualVQ:
+    - Shared project_in: Linear(input_dim→codebook_dim)
+    - Shared project_out: Linear(codebook_dim→input_dim)
+    - K codebooks as nn.ModuleList (each nn.Embedding)
+
+    State dict keys:
+        rvq.project_in.weight, rvq.project_out.weight
+        rvq.codebooks.{i}.embeddings  (renamed from .weight)
 
     Args:
-        dim: Embedding dimension (default: 512)
+        input_dim: Input embedding dimension (default: 512)
         num_books: Number of VQ stages (default: 8)
         codebook_size: Codes per codebook (default: 1024)
+        codebook_dim: Codebook vector dimension (default: 128)
+        beta: Commitment loss weight (default: 0.25)
     """
 
-    def __init__(self, dim: int = 512, num_books: int = 8, codebook_size: int = 1024):
+    def __init__(self, input_dim: int = 512, num_books: int = 8,
+                 codebook_size: int = 1024, codebook_dim: int = 128,
+                 beta: float = 0.25):
         super().__init__()
+        self.input_dim = input_dim
+        self.codebook_dim = codebook_dim
+        self.codebook_size = codebook_size
         self.num_books = num_books
-        self.quantizers = nn.ModuleList([
-            VectorQuantizer(dim, codebook_size) for _ in range(num_books)
+        self.beta = beta
+
+        # Shared projections (matches Rust: single project_in/out)
+        self.project_in = nn.Linear(input_dim, codebook_dim)
+        self.project_out = nn.Linear(codebook_dim, input_dim)
+
+        # Codebooks as ModuleList (keys: codebooks.{i}.embeddings)
+        self.codebooks = nn.ModuleList([
+            self._make_codebook(codebook_size, codebook_dim)
+            for _ in range(num_books)
         ])
+
+    @staticmethod
+    def _make_codebook(size, dim):
+        """Create a codebook module with 'embeddings' parameter name."""
+        codebook = nn.Module()
+        codebook.embeddings = nn.Parameter(
+            torch.empty(size, dim).uniform_(-1.0 / size, 1.0 / size)
+        )
+        return codebook
+
+    def _quantize_one(self, z_proj: torch.Tensor, codebook_idx: int):
+        """Quantize using one codebook (operates in codebook space).
+
+        Args:
+            z_proj: [B, T, codebook_dim] (already projected)
+            codebook_idx: Which codebook to use
+
+        Returns:
+            z_q: [B, input_dim, T] quantized back in input space
+            indices: [B, T] codebook indices
+            loss: scalar VQ loss
+        """
+        b, t, d = z_proj.shape
+        cb_weight = self.codebooks[codebook_idx].embeddings  # [codebook_size, codebook_dim]
+
+        z_flat = z_proj.reshape(-1, d)  # [B*T, codebook_dim]
+        dist = torch.cdist(z_flat, cb_weight)  # [B*T, codebook_size]
+        indices = dist.argmin(dim=-1)  # [B*T]
+
+        z_q_flat = cb_weight[indices]  # [B*T, codebook_dim]
+        z_q_proj = z_q_flat.reshape(b, t, d)
+
+        # Straight-through estimator in codebook space
+        z_q_st = z_proj + (z_q_proj - z_proj).detach()
+
+        # Losses in codebook space
+        commitment_loss = F.mse_loss(z_q_proj.detach(), z_proj)
+        codebook_loss = F.mse_loss(z_q_proj, z_proj.detach())
+        loss = codebook_loss + self.beta * commitment_loss
+
+        # Project back to input dimension
+        z_q_out = self.project_out(z_q_st).permute(0, 2, 1)  # [B, input_dim, T]
+
+        return z_q_out, indices.reshape(b, t), loss
 
     def forward(self, z: torch.Tensor) -> tuple:
         """Quantize with residual VQ.
 
         Args:
-            z: [B, dim, T]
+            z: [B, input_dim, T]
 
         Returns:
-            z_quantized: Reconstructed from all codebooks [B, dim, T]
+            z_quantized: Reconstructed from all codebooks [B, input_dim, T]
             codes: All codebook indices [B, num_books, T]
             loss: Total loss (sum of all stages)
         """
@@ -187,16 +227,18 @@ class ResidualVQ(nn.Module):
         all_indices = []
         total_loss = 0.0
 
-        for i, vq in enumerate(self.quantizers):
-            z_q, codes, loss = vq(residual)
-            residual = residual - z_q  # Subtract quantized from residual
+        for i in range(self.num_books):
+            # Project residual to codebook space
+            r_perm = residual.permute(0, 2, 1)  # [B, T, input_dim]
+            r_proj = self.project_in(r_perm)  # [B, T, codebook_dim]
+
+            z_q, codes, loss = self._quantize_one(r_proj, i)
+            residual = residual - z_q
             all_indices.append(codes)
             total_loss = total_loss + loss
 
-        # z_quantized = sum of all z_q across stages
         z_quantized = z - residual
-
-        codes_tensor = torch.stack(all_indices, dim=1)  # [B*T, num_books] → [B, T, num_books]
+        codes_tensor = torch.stack(all_indices, dim=1)  # [B, num_books, T]
 
         return z_quantized, codes_tensor, total_loss
 
@@ -204,31 +246,27 @@ class ResidualVQ(nn.Module):
 class CodecDecoder(nn.Module):
     """1D transposed ConvNet decoder: [B,512,50] → [B,1,24000].
 
-    Inverts the encoder with transposed convolutions and matching
-    strides/channels.
-
-    Architecture:
-        ConvTranspose1d(512, 512, 4, stride=3) → ReLU
-        ConvTranspose1d(512, 256, 4, stride=4) → ReLU
-        ConvTranspose1d(256, 128, 4, stride=5) → ReLU
-        ConvTranspose1d(128, 64, 4, stride=8) → ReLU
-        Conv1d(64, 1, 7, stride=1, padding=3) → Tanh
+    Matches sonata-codec/src/decoder.rs:
+    4 DecoderBlocks with strides [3,4,5,8] (480× upsampling).
+    channels [512, 256, 128, 64, 1], kernel=stride*2, padding=stride//2.
+    Each block: ConvTranspose1d → Snake activation (except final → Tanh).
     """
 
-    def __init__(self, in_channels: int = 512, out_channels: int = 1):
+    STRIDES = [3, 4, 5, 8]
+    CHANNELS = [512, 256, 128, 64, 1]
+
+    def __init__(self):
         super().__init__()
-        self.layers = nn.Sequential(
-            nn.ConvTranspose1d(in_channels, 512, 4, stride=3, padding=0),
-            nn.ReLU(),
-            nn.ConvTranspose1d(512, 256, 4, stride=4, padding=0),
-            nn.ReLU(),
-            nn.ConvTranspose1d(256, 128, 4, stride=5, padding=0),
-            nn.ReLU(),
-            nn.ConvTranspose1d(128, 64, 4, stride=8, padding=0),
-            nn.ReLU(),
-            nn.Conv1d(64, out_channels, 7, stride=1, padding=3),
-            nn.Tanh(),
-        )
+        self.conv_layers = nn.ModuleList()
+        self.snake_layers = nn.ModuleList()
+        for i, stride in enumerate(self.STRIDES):
+            in_ch = self.CHANNELS[i]
+            out_ch = self.CHANNELS[i + 1]
+            kernel = stride * 2
+            padding = stride // 2
+            self.conv_layers.append(nn.ConvTranspose1d(in_ch, out_ch, kernel, stride=stride, padding=padding))
+            if i < len(self.STRIDES) - 1:
+                self.snake_layers.append(Snake(out_ch))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Decode latent to audio.
@@ -237,33 +275,40 @@ class CodecDecoder(nn.Module):
             x: [B, 512, 50]
 
         Returns:
-            audio: [B, 1, 24000]
+            audio: [B, 1, ~24000]
         """
-        return self.layers(x)
+        for i, conv in enumerate(self.conv_layers):
+            x = conv(x)
+            if i < len(self.snake_layers):
+                x = self.snake_layers[i](x)
+            else:
+                x = torch.tanh(x)
+        return x
 
 
 class SonataCodec(nn.Module):
     """Full audio codec: encoder + RVQ + decoder.
 
-    End-to-end codec that learns to compress audio using quantized
-    embeddings and reconstruct from quantized codes.
+    Matches sonata-codec/src/lib.rs architecture.
 
     Args:
         sample_rate: Target sample rate (default: 24000 Hz)
         latent_dim: Latent embedding dimension (default: 512)
         num_books: Number of VQ codebooks (default: 8)
         codebook_size: Codes per codebook (default: 1024)
+        codebook_dim: Codebook vector dimension (default: 128)
     """
 
     def __init__(self, sample_rate: int = 24000, latent_dim: int = 512,
-                 num_books: int = 8, codebook_size: int = 1024):
+                 num_books: int = 8, codebook_size: int = 1024,
+                 codebook_dim: int = 128):
         super().__init__()
         self.sample_rate = sample_rate
         self.latent_dim = latent_dim
 
-        self.encoder = CodecEncoder(out_channels=latent_dim)
-        self.rvq = ResidualVQ(latent_dim, num_books, codebook_size)
-        self.decoder = CodecDecoder(in_channels=latent_dim)
+        self.encoder = CodecEncoder()
+        self.rvq = ResidualVQ(latent_dim, num_books, codebook_size, codebook_dim)
+        self.decoder = CodecDecoder()
 
     def forward(self, audio: torch.Tensor) -> tuple:
         """Encode, quantize, decode.
@@ -272,19 +317,13 @@ class SonataCodec(nn.Module):
             audio: [B, 1, 24000]
 
         Returns:
-            reconstructed: [B, 1, 24000]
-            codes: [B, T, num_books]
+            reconstructed: [B, 1, ~24000]
+            codes: [B, num_books, T]
             loss: Scalar VQ + reconstruction loss
         """
-        # Encode
-        z = self.encoder(audio)  # [B, 512, 50]
-
-        # Quantize
+        z = self.encoder(audio)
         z_q, codes, vq_loss = self.rvq(z)
-
-        # Decode
         reconstructed = self.decoder(z_q)
-
         return reconstructed, codes, vq_loss
 
     @torch.no_grad()
@@ -295,7 +334,7 @@ class SonataCodec(nn.Module):
             audio: [B, 1, samples]
 
         Returns:
-            codes: [B, T, num_books]
+            codes: [B, num_books, T]
         """
         z = self.encoder(audio)
         _, codes, _ = self.rvq(z)
@@ -306,17 +345,19 @@ class SonataCodec(nn.Module):
         """Decode from quantized codes (inference mode).
 
         Args:
-            codes: [B, T, num_books]
+            codes: [B, num_books, T]
 
         Returns:
             audio: [B, 1, samples]
         """
-        # Reconstruct from codes
-        z_q = torch.zeros(codes.shape[0], self.latent_dim, codes.shape[1],
-                         device=codes.device)
-        for i, vq in enumerate(self.rvq.quantizers):
-            z_q_i = vq.codebook(codes[:, :, i])  # [B, T, dim]
-            z_q = z_q + z_q_i.permute(0, 2, 1)  # Add to [B, dim, T]
+        b, num_books, t = codes.shape
+        z_q = torch.zeros(b, self.latent_dim, t, device=codes.device)
+        for i in range(num_books):
+            book_codes = codes[:, i, :]  # [B, T]
+            cb_weight = self.rvq.codebooks[i].embeddings  # [codebook_size, dim]
+            z_q_cb = cb_weight[book_codes]  # [B, T, codebook_dim]
+            z_q_out = self.rvq.project_out(z_q_cb)  # [B, T, latent_dim]
+            z_q = z_q + z_q_out.permute(0, 2, 1)
 
         audio = self.decoder(z_q)
         return audio
@@ -471,9 +512,9 @@ def main():
                            shuffle=False, num_workers=args.num_workers,
                            pin_memory=True)
 
-    # Model
+    # Model (no segment_length arg — matches SonataCodec constructor)
     logger.info("Creating model...")
-    model = SonataCodec(segment_length=args.segment_length).to(device)
+    model = SonataCodec().to(device)
     n_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model parameters: {n_params / 1e6:.2f}M")
 
