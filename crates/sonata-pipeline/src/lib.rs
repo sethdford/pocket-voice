@@ -38,12 +38,18 @@
 //! - `dual_stream`: Token interleaving for full-duplex conversation
 //! - `backchannel`: Engagement signal generation
 //! - `orchestrator`: Pipeline state and model management
+//! - `streaming_bridge`: LLM streaming → TTS sentence buffering
+//! - `ffi`: C-compatible FFI exports for SeaClaw integration
 
 pub mod backchannel;
 pub mod dual_stream;
+pub mod ffi;
 pub mod orchestrator;
+pub mod streaming_bridge;
 
 // Re-exports for convenience
 pub use backchannel::BackchannelGenerator;
 pub use dual_stream::{DualStreamInterleaver, StreamSource, StreamToken};
+pub use ffi::{SC_ERR_INTERNAL, SC_ERR_INVALID_ARGUMENT, SC_ERR_NOT_IMPLEMENTED, SC_ERR_NOT_INITIALIZED, SC_OK};
 pub use orchestrator::{ModelDims, PipelineConfig, PipelineOrchestrator, PipelineState};
+pub use streaming_bridge::StreamingBridge;

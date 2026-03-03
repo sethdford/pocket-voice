@@ -4,6 +4,9 @@ version = "0.2.0"
 edition = "2021"
 publish = false
 
+[lib]
+crate-type = ["rlib", "cdylib", "staticlib"]
+
 [dependencies]
 sonata-common = { path = "../sonata-common" }
 sonata-codec = { path = "../sonata-codec" }
