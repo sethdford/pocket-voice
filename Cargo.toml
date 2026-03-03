@@ -6,6 +6,7 @@ members = [
     "crates/sonata-cam",
     "crates/sonata-stt",
     "crates/sonata-tts",
+    "crates/sonata-cfm",
     # Legacy v1 crates:
     "src/stt",
     "src/sonata_lm",
