@@ -263,4 +263,84 @@ mod integration_tests {
         // Verify that SPEAKER_EMBED_DIM is imported correctly
         assert_eq!(SPEAKER_EMBED_DIM, 192);
     }
+
+    // --- Error path tests ---
+
+    #[test]
+    fn test_cfm_wrong_speaker_dim() {
+        // Speaker embedding with wrong dimension (128 instead of 192)
+        let dev = Device::Cpu;
+        let cfm = SonataCFM::new(&dev).unwrap();
+        let bad_speaker = Tensor::zeros(&[1, 128], DType::F32, &dev).unwrap();
+        let result = cfm.generate(&bad_speaker, 50, 4);
+        assert!(result.is_err(), "speaker dim 128 instead of 192 should fail");
+    }
+
+    #[test]
+    fn test_cfm_single_step() {
+        // Single ODE step — should still produce valid output
+        let dev = Device::Cpu;
+        let cfm = SonataCFM::new(&dev).unwrap();
+        let speaker = Tensor::zeros(&[1, 192], DType::F32, &dev).unwrap();
+        let mel = cfm.generate(&speaker, 50, 1).unwrap();
+        assert_eq!(mel.dims(), &[1, 80, 50]);
+    }
+
+    #[test]
+    fn test_cfm_single_frame() {
+        // Single mel frame (num_frames=1) — edge case for temporal processing
+        let dev = Device::Cpu;
+        let cfm = SonataCFM::new(&dev).unwrap();
+        let speaker = Tensor::zeros(&[1, 192], DType::F32, &dev).unwrap();
+        let mel = cfm.generate(&speaker, 1, 4).unwrap();
+        assert_eq!(mel.dims(), &[1, 80, 1]);
+    }
+
+    #[test]
+    fn test_cfm_2d_speaker_fails() {
+        // 1D speaker embedding (missing batch dimension) — should fail
+        let dev = Device::Cpu;
+        let cfm = SonataCFM::new(&dev).unwrap();
+        let bad_speaker = Tensor::zeros(&[192], DType::F32, &dev).unwrap();
+        let result = cfm.generate(&bad_speaker, 50, 4);
+        assert!(result.is_err(), "1D speaker embedding should fail");
+    }
+
+    #[test]
+    fn test_cfm_zero_frames() {
+        // num_frames=0 — degenerate case
+        let dev = Device::Cpu;
+        let cfm = SonataCFM::new(&dev).unwrap();
+        let speaker = Tensor::zeros(&[1, 192], DType::F32, &dev).unwrap();
+        let result = cfm.generate(&speaker, 0, 4);
+        // Zero frames should either produce empty output or error — not panic
+        if let Ok(mel) = result {
+            assert_eq!(mel.dim(0).unwrap(), 1);
+            assert_eq!(mel.dim(1).unwrap(), 80);
+            assert_eq!(mel.dim(2).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn test_cfm_zero_steps() {
+        // Zero ODE steps — should still produce output (just noise, no denoising)
+        let dev = Device::Cpu;
+        let cfm = SonataCFM::new(&dev).unwrap();
+        let speaker = Tensor::zeros(&[1, 192], DType::F32, &dev).unwrap();
+        let result = cfm.generate(&speaker, 50, 0);
+        // Zero steps means no ODE integration — output is initial noise
+        if let Ok(mel) = result {
+            assert_eq!(mel.dims(), &[1, 80, 50]);
+        }
+    }
+
+    #[test]
+    fn test_cfm_wrong_speaker_dtype() {
+        // F64 speaker embedding instead of F32
+        let dev = Device::Cpu;
+        let cfm = SonataCFM::new(&dev).unwrap();
+        let bad_speaker = Tensor::zeros(&[1, 192], DType::F64, &dev).unwrap();
+        let result = cfm.generate(&bad_speaker, 50, 4);
+        assert!(result.is_err(), "F64 speaker embedding should fail (model expects F32)");
+    }
 }

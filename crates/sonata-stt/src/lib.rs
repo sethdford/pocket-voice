@@ -243,4 +243,82 @@ mod tests {
             assert!(seq.iter().all(|&tok| tok < ctc::TEXT_VOCAB_SIZE as u32));
         }
     }
+
+    // --- Error path tests ---
+
+    #[test]
+    fn test_stt_wrong_input_dim() {
+        // Codec embeddings with wrong channel dim (256 instead of 512)
+        let dev = Device::Cpu;
+        let stt = SonataSTT::new(&dev).unwrap();
+        let bad_input = Tensor::zeros(&[1, 256, 20], DType::F32, &dev).unwrap();
+        let result = stt.forward(&bad_input);
+        assert!(result.is_err(), "input dim 256 instead of 512 should fail");
+    }
+
+    #[test]
+    fn test_stt_single_frame_input() {
+        // Single-frame input (T=1) — should still produce valid output
+        let dev = Device::Cpu;
+        let stt = SonataSTT::new(&dev).unwrap();
+        let input = Tensor::zeros(&[1, 512, 1], DType::F32, &dev).unwrap();
+        let logits = stt.forward(&input).unwrap();
+        assert_eq!(logits.dims()[0], 1);
+        assert_eq!(logits.dims()[1], 1);
+        assert_eq!(logits.dims()[2], ctc::TEXT_VOCAB_SIZE);
+    }
+
+    #[test]
+    fn test_stt_2d_input_fails() {
+        // 2D input (missing batch dimension) — shape error
+        let dev = Device::Cpu;
+        let stt = SonataSTT::new(&dev).unwrap();
+        let bad_input = Tensor::zeros(&[512, 20], DType::F32, &dev).unwrap();
+        let result = stt.forward(&bad_input);
+        assert!(result.is_err(), "2D input should fail (needs 3D)");
+    }
+
+    #[test]
+    fn test_stt_transcribe_single_frame() {
+        // Transcribe with single frame — CTC decode should handle gracefully
+        let dev = Device::Cpu;
+        let stt = SonataSTT::new(&dev).unwrap();
+        let input = Tensor::zeros(&[1, 512, 1], DType::F32, &dev).unwrap();
+        let tokens = stt.transcribe(&input).unwrap();
+        assert_eq!(tokens.len(), 1);
+    }
+
+    #[test]
+    fn test_stt_empty_codec_embeddings() {
+        // Zero-length time dimension — should handle gracefully
+        let dev = Device::Cpu;
+        let stt = SonataSTT::new(&dev).unwrap();
+        let empty = Tensor::zeros(&[1, 512, 0], DType::F32, &dev).unwrap();
+        let result = stt.transcribe(&empty);
+        // Zero frames should produce empty token sequences or error — not panic
+        if let Ok(tokens) = result {
+            assert_eq!(tokens.len(), 1);
+            assert!(tokens[0].is_empty());
+        }
+    }
+
+    #[test]
+    fn test_stt_wrong_dtype() {
+        // F64 input instead of F32 — should error on linear projection
+        let dev = Device::Cpu;
+        let stt = SonataSTT::new(&dev).unwrap();
+        let bad_input = Tensor::zeros(&[1, 512, 20], DType::F64, &dev).unwrap();
+        let result = stt.forward(&bad_input);
+        assert!(result.is_err(), "F64 input should fail (model expects F32)");
+    }
+
+    #[test]
+    fn test_stt_4d_input_fails() {
+        // 4D input — too many dimensions
+        let dev = Device::Cpu;
+        let stt = SonataSTT::new(&dev).unwrap();
+        let bad_input = Tensor::zeros(&[1, 1, 512, 20], DType::F32, &dev).unwrap();
+        let result = stt.forward(&bad_input);
+        assert!(result.is_err(), "4D input should fail (needs 3D)");
+    }
 }

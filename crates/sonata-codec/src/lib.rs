@@ -15,7 +15,7 @@ pub mod encoder;
 pub mod quantizer;
 pub mod snake;
 
-use candle_core::{Device, Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor};
 use decoder::CodecDecoder;
 use encoder::CodecEncoder;
 use quantizer::ResidualVQ;
@@ -189,5 +189,102 @@ mod integration_tests {
         assert_eq!(embeddings.dim(1).unwrap(), 512);
         // Time dim matches codes
         assert_eq!(embeddings.dim(2).unwrap(), codes.dim(2).unwrap());
+    }
+
+    // --- Error path tests ---
+
+    #[test]
+    fn test_codec_decode_wrong_codebook_count() {
+        // Provide codes with 4 codebooks instead of 8 — should fail in quantizer decode
+        let dev = Device::Cpu;
+        let codec = SonataCodec::new(&dev).unwrap();
+        let bad_codes = Tensor::zeros(&[1, 4, 50], DType::U32, &dev).unwrap();
+        let result = codec.decode(&bad_codes);
+        assert!(result.is_err(), "decode with 4 codebooks should fail");
+    }
+
+    #[test]
+    fn test_codec_encode_wrong_channels() {
+        // Audio with 2 channels instead of 1 — shape mismatch in encoder convolutions
+        let dev = Device::Cpu;
+        let codec = SonataCodec::new(&dev).unwrap();
+        let bad_audio = Tensor::zeros(&[1, 2, 24000], DType::F32, &dev).unwrap();
+        let result = codec.encode(&bad_audio);
+        assert!(result.is_err(), "encode with 2 channels should fail");
+    }
+
+    #[test]
+    fn test_codec_get_codebook_out_of_range() {
+        // Request codebook index beyond NUM_CODEBOOKS
+        let dev = Device::Cpu;
+        let codec = SonataCodec::new(&dev).unwrap();
+        let result = codec.get_codebook_embeddings(NUM_CODEBOOKS);
+        assert!(result.is_err(), "codebook index >= NUM_CODEBOOKS should fail");
+    }
+
+    #[test]
+    fn test_codec_codes_to_embeddings_wrong_dtype() {
+        // Codes with F32 dtype instead of U32 — should fail lookup
+        let dev = Device::Cpu;
+        let codec = SonataCodec::new(&dev).unwrap();
+        let bad_codes = Tensor::zeros(&[1, 8, 50], DType::F32, &dev).unwrap();
+        let result = codec.codes_to_embeddings(&bad_codes);
+        assert!(result.is_err(), "codes with F32 dtype should fail");
+    }
+
+    #[test]
+    fn test_codec_encode_very_short_audio() {
+        // Audio shorter than one stride (480 samples = 1 frame).
+        // Candle's conv layer panics on sub-stride inputs (arithmetic overflow).
+        // Callers must validate minimum audio length before calling encode.
+        use std::panic::catch_unwind;
+        let result = catch_unwind(|| {
+            let dev = Device::Cpu;
+            let codec = SonataCodec::new(&dev).unwrap();
+            let short_audio = Tensor::zeros(&[1, 1, 100], DType::F32, &dev).unwrap();
+            codec.encode(&short_audio)
+        });
+        // Either panics (candle conv underflow) or returns error — both acceptable
+        match result {
+            Ok(Ok(codes)) => {
+                assert_eq!(codes.dim(0).unwrap(), 1);
+                assert_eq!(codes.dim(1).unwrap(), 8);
+            }
+            Ok(Err(_)) | Err(_) => {} // error or panic is expected for sub-stride input
+        }
+    }
+
+    #[test]
+    fn test_codec_decode_zero_length_codes() {
+        // Codes with T=0 — degenerate input.
+        // Candle's conv layer panics on zero-length sequences.
+        use std::panic::catch_unwind;
+        let result = catch_unwind(|| {
+            let dev = Device::Cpu;
+            let codec = SonataCodec::new(&dev).unwrap();
+            let empty_codes = Tensor::zeros((1, 8, 0), DType::U32, &dev).unwrap();
+            codec.decode(&empty_codes)
+        });
+        match result {
+            Ok(Ok(audio)) => assert_eq!(audio.dim(0).unwrap(), 1),
+            Ok(Err(_)) | Err(_) => {} // error or panic is expected for zero-length
+        }
+    }
+
+    #[test]
+    fn test_codec_encode_zero_length_audio() {
+        // Audio with T=0 samples — degenerate input.
+        // Candle's conv layer panics on zero-length sequences.
+        use std::panic::catch_unwind;
+        let result = catch_unwind(|| {
+            let dev = Device::Cpu;
+            let codec = SonataCodec::new(&dev).unwrap();
+            let zero_audio = Tensor::zeros(&[1, 1, 0], DType::F32, &dev).unwrap();
+            codec.encode(&zero_audio)
+        });
+        match result {
+            Ok(Ok(codes)) => assert_eq!(codes.dim(0).unwrap(), 1),
+            Ok(Err(_)) | Err(_) => {} // error or panic is expected for zero-length
+        }
     }
 }

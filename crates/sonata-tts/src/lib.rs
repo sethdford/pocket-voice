@@ -136,4 +136,104 @@ mod integration_tests {
         assert_eq!(laugh.dims(), &[1, 512]);
         assert_eq!(sigh.dims(), &[1, 512]);
     }
+
+    // --- Error path tests ---
+
+    #[test]
+    fn test_tts_wrong_speaker_dim() {
+        // Speaker embedding with wrong dimension (128 instead of 192)
+        let dev = Device::Cpu;
+        let tts = SonataTTS::new(&dev).unwrap();
+        let text_tokens = Tensor::zeros(&[1, 10], DType::U32, &dev).unwrap();
+        let bad_speaker = Tensor::zeros(&[1, 128], DType::F32, &dev).unwrap();
+        let emotion = Tensor::zeros(&[1, 192], DType::F32, &dev).unwrap();
+        let result = tts.forward(&text_tokens, &bad_speaker, &emotion);
+        assert!(result.is_err(), "speaker dim 128 instead of 192 should fail");
+    }
+
+    #[test]
+    fn test_tts_wrong_emotion_dim() {
+        // Emotion embedding with wrong dimension (64 instead of 192)
+        let dev = Device::Cpu;
+        let tts = SonataTTS::new(&dev).unwrap();
+        let text_tokens = Tensor::zeros(&[1, 10], DType::U32, &dev).unwrap();
+        let speaker = Tensor::zeros(&[1, 192], DType::F32, &dev).unwrap();
+        let bad_emotion = Tensor::zeros(&[1, 64], DType::F32, &dev).unwrap();
+        let result = tts.forward(&text_tokens, &speaker, &bad_emotion);
+        assert!(result.is_err(), "emotion dim 64 instead of 192 should fail");
+    }
+
+    #[test]
+    fn test_tts_mismatched_batch_sizes() {
+        // Text batch=2 but speaker batch=1 — transformer may broadcast or error
+        let dev = Device::Cpu;
+        let tts = SonataTTS::new(&dev).unwrap();
+        let text_tokens = Tensor::zeros(&[2, 10], DType::U32, &dev).unwrap();
+        let speaker = Tensor::zeros(&[1, 192], DType::F32, &dev).unwrap();
+        let emotion = Tensor::zeros(&[1, 192], DType::F32, &dev).unwrap();
+        let result = tts.forward(&text_tokens, &speaker, &emotion);
+        // Some layers may broadcast speaker/emotion to match text batch.
+        // Either error or correct output shape is acceptable — no panic.
+        if let Ok(logits) = result {
+            assert_eq!(logits.dims()[1], 10);
+            assert_eq!(logits.dims()[2], 1024);
+        }
+    }
+
+    #[test]
+    fn test_tts_single_token() {
+        // Single text token — should produce valid output
+        let dev = Device::Cpu;
+        let tts = SonataTTS::new(&dev).unwrap();
+        let text_tokens = Tensor::zeros(&[1, 1], DType::U32, &dev).unwrap();
+        let speaker = Tensor::zeros(&[1, 192], DType::F32, &dev).unwrap();
+        let emotion = Tensor::zeros(&[1, 192], DType::F32, &dev).unwrap();
+        let logits = tts.forward(&text_tokens, &speaker, &emotion).unwrap();
+        assert_eq!(logits.dims(), &[1, 1, 1024]);
+    }
+
+    #[test]
+    fn test_tts_empty_text_tokens() {
+        // Zero-length text tokens (T=0)
+        let dev = Device::Cpu;
+        let tts = SonataTTS::new(&dev).unwrap();
+        let empty_tokens = Tensor::zeros(&[1, 0], DType::U32, &dev).unwrap();
+        let speaker = Tensor::zeros(&[1, 192], DType::F32, &dev).unwrap();
+        let emotion = Tensor::zeros(&[1, 192], DType::F32, &dev).unwrap();
+        let result = tts.forward(&empty_tokens, &speaker, &emotion);
+        // Should produce zero-length output or error — not panic
+        if let Ok(logits) = result {
+            assert_eq!(logits.dim(0).unwrap(), 1);
+            assert_eq!(logits.dim(1).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn test_tts_extreme_emotion_exaggeration() {
+        // Very high exaggeration values should not cause NaN/Inf
+        let dev = Device::Cpu;
+        let tts = SonataTTS::new(&dev).unwrap();
+        let tokens = Tensor::zeros(&[1, 10], DType::U32, &dev).unwrap();
+        let speaker = Tensor::zeros(&[1, 192], DType::F32, &dev).unwrap();
+        let extreme_emotion = tts.emotion_encoder.encode(3, 100.0, &dev).unwrap();
+        let result = tts.forward(&tokens, &speaker, &extreme_emotion);
+        // Should not crash; output may be garbage but shouldn't be NaN
+        if let Ok(logits) = result {
+            let has_nan = logits.to_vec3::<f32>().unwrap().iter()
+                .any(|batch| batch.iter().any(|frame| frame.iter().any(|v| v.is_nan())));
+            assert!(!has_nan, "extreme emotion should not produce NaN logits");
+        }
+    }
+
+    #[test]
+    fn test_tts_zero_speaker_embedding() {
+        // All-zero speaker embedding — should still produce valid output
+        let dev = Device::Cpu;
+        let tts = SonataTTS::new(&dev).unwrap();
+        let tokens = Tensor::zeros(&[1, 5], DType::U32, &dev).unwrap();
+        let zero_speaker = Tensor::zeros(&[1, 192], DType::F32, &dev).unwrap();
+        let emotion = Tensor::zeros(&[1, 192], DType::F32, &dev).unwrap();
+        let logits = tts.forward(&tokens, &zero_speaker, &emotion).unwrap();
+        assert_eq!(logits.dims(), &[1, 5, 1024]);
+    }
 }

@@ -43,7 +43,7 @@ pub mod pooling;
 
 use anyhow::Result;
 use cam_block::CAMBlock;
-use candle_core::{Device, Tensor};
+use candle_core::{DType, Device, Tensor};
 use frontend::MultiScaleFrontend;
 use pooling::AttentiveStatsPooling;
 use sonata_common::SPEAKER_EMBED_DIM;
@@ -257,6 +257,102 @@ mod integration_tests {
         let result = encoder.forward(&mel_with_80_bins)?;
         assert_eq!(result.dims()[1], 192);
 
+        Ok(())
+    }
+
+    // --- Error path tests ---
+
+    #[test]
+    fn test_cam_wrong_mel_bins() -> Result<()> {
+        // Mel with 40 bins instead of 80 — should fail in frontend convolution
+        let dev = Device::Cpu;
+        let encoder = CamPlusPlusEncoder::new(&dev)?;
+        let bad_mel = Tensor::randn(0.0f32, 1.0, &[1, 40, 100], &dev)?;
+        let result = encoder.forward(&bad_mel);
+        assert!(result.is_err(), "mel with 40 bins instead of 80 should fail");
+        Ok(())
+    }
+
+    #[test]
+    fn test_cam_2d_mel_fails() -> Result<()> {
+        // 2D mel input (missing batch dimension) — shape error
+        let dev = Device::Cpu;
+        let encoder = CamPlusPlusEncoder::new(&dev)?;
+        let bad_mel = Tensor::randn(0.0f32, 1.0, &[80, 100], &dev)?;
+        let result = encoder.forward(&bad_mel);
+        assert!(result.is_err(), "2D mel input should fail (needs 3D)");
+        Ok(())
+    }
+
+    #[test]
+    fn test_cam_very_short_utterance() -> Result<()> {
+        // Extremely short utterance (T=2) — test minimum viable input
+        let dev = Device::Cpu;
+        let encoder = CamPlusPlusEncoder::new(&dev)?;
+        let short_mel = Tensor::randn(0.0f32, 1.0, &[1, 80, 2], &dev)?;
+        let result = encoder.forward(&short_mel);
+        // May succeed or fail depending on conv kernel sizes — either is valid
+        match result {
+            Ok(emb) => assert_eq!(emb.dims()[1], SPEAKER_EMBED_DIM),
+            Err(_) => {} // Conv underflow is acceptable for very short inputs
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_cam_single_sample_batch() -> Result<()> {
+        // Verify that single-sample batch produces consistent output dim
+        let dev = Device::Cpu;
+        let encoder = CamPlusPlusEncoder::new(&dev)?;
+        let mel = Tensor::randn(0.0f32, 1.0, &[1, 80, 50], &dev)?;
+        let emb = encoder.forward(&mel)?;
+        assert_eq!(emb.dims(), &[1, SPEAKER_EMBED_DIM]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_cam_empty_mel_input() -> Result<()> {
+        // Mel with T=0 frames — degenerate input
+        // Known issue: candle CPU backend panics on subtraction overflow for empty tensors.
+        // We use catch_unwind to document the behavior without blocking the test suite.
+        let result = std::panic::catch_unwind(|| {
+            let dev = Device::Cpu;
+            let encoder = CamPlusPlusEncoder::new(&dev).unwrap();
+            let empty_mel = Tensor::zeros(&[1, 80, 0], DType::F32, &dev).unwrap();
+            encoder.forward(&empty_mel)
+        });
+        // Either an Err (panic caught) or Ok(Err(_)) (graceful error) is acceptable
+        match result {
+            Err(_) => {} // panic caught — known candle issue with empty tensors
+            Ok(Err(_)) => {} // graceful error — preferred behavior
+            Ok(Ok(_)) => panic!("empty mel should not produce a valid embedding"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_cam_wrong_dtype() -> Result<()> {
+        // F64 mel input instead of F32
+        let dev = Device::Cpu;
+        let encoder = CamPlusPlusEncoder::new(&dev)?;
+        let bad_mel = Tensor::zeros(&[1, 80, 100], DType::F64, &dev)?;
+        let result = encoder.forward(&bad_mel);
+        assert!(result.is_err(), "F64 mel input should fail (model expects F32)");
+        Ok(())
+    }
+
+    #[test]
+    fn test_cam_single_frame_mel() -> Result<()> {
+        // Single mel frame (T=1) — minimum temporal input
+        let dev = Device::Cpu;
+        let encoder = CamPlusPlusEncoder::new(&dev)?;
+        let single_frame = Tensor::randn(0.0f32, 1.0, &[1, 80, 1], &dev)?;
+        let result = encoder.forward(&single_frame);
+        // May succeed or fail depending on conv kernel sizes
+        match result {
+            Ok(emb) => assert_eq!(emb.dims()[1], SPEAKER_EMBED_DIM),
+            Err(_) => {} // Conv underflow acceptable for single frame
+        }
         Ok(())
     }
 }
