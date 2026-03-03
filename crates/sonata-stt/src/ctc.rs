@@ -26,9 +26,15 @@ pub fn greedy_decode(logits: &Tensor) -> Result<Vec<Vec<u32>>> {
     for b in 0..batch_size {
         let pred_b = predictions.get(b)?; // [T]
 
-        // Convert to i64, then cast to u32 (candle may use i64 for argmin)
-        let pred_vec: Vec<i64> = pred_b.to_vec1::<i64>()?;
-        let pred_u32: Vec<u32> = pred_vec.iter().map(|&x| x as u32).collect();
+        // Try to get as u32 first, fall back to i64
+        let pred_u32: Vec<u32> = match pred_b.to_vec1::<u32>() {
+            Ok(v) => v,
+            Err(_) => {
+                // Fallback: argmin may return i64
+                let vec_i64: Vec<i64> = pred_b.to_vec1::<i64>()?;
+                vec_i64.iter().map(|&x| x as u32).collect()
+            }
+        };
 
         let decoded = collapse_and_remove_blanks(&pred_u32);
         results.push(decoded);
