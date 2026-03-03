@@ -8,6 +8,7 @@ members = [
     "crates/sonata-tts",
     "crates/sonata-cfm",
     "crates/sonata-pipeline",
+    "crates/sonata-integration-tests",
     # Legacy v1 crates:
     "src/stt",
     "src/sonata_lm",

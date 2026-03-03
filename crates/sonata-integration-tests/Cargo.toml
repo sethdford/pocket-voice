@@ -1,0 +1,16 @@
+[package]
+name = "sonata-integration-tests"
+version = "0.2.0"
+edition = "2021"
+publish = false
+
+[dev-dependencies]
+sonata-common = { path = "../sonata-common" }
+sonata-codec = { path = "../sonata-codec" }
+sonata-cam = { path = "../sonata-cam" }
+sonata-stt = { path = "../sonata-stt" }
+sonata-tts = { path = "../sonata-tts" }
+sonata-cfm = { path = "../sonata-cfm" }
+sonata-pipeline = { path = "../sonata-pipeline" }
+candle-core = { workspace = true }
+anyhow = { workspace = true }

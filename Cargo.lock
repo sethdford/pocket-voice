@@ -2334,6 +2334,7 @@ dependencies = [
  "candle-nn",
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -2347,6 +2348,21 @@ dependencies = [
  "safetensors 0.4.5",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "sonata-integration-tests"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "sonata-cam",
+ "sonata-cfm",
+ "sonata-codec",
+ "sonata-common",
+ "sonata-pipeline",
+ "sonata-stt",
+ "sonata-tts",
 ]
 
 [[package]]
