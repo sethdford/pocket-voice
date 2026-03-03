@@ -205,8 +205,6 @@ train_speaker_encoder() {
         --patience 10 \
         --asnorm \
         --num-workers $NUM_WORKERS \
-        --pin-memory \
-        --mixed-precision \
         --output-dir $CHECKPOINT_DIR/cam"
 
     if [[ "$SYNTHETIC" == false ]]; then
@@ -234,8 +232,6 @@ train_speaker_encoder() {
             --sub-centers 2 \
             --asnorm \
             --num-workers $NUM_WORKERS \
-            --pin-memory \
-            --mixed-precision \
             --fine-tune \
             --fine-tune-margin 0.5 \
             --fine-tune-crop 6.0 \
@@ -269,11 +265,14 @@ train_codec() {
     save_state "codec" "training"
 
     local cmd="python3 $SCRIPT_DIR/train_codec.py \
+        --device $DEVICE \
         --batch_size 16 \
         --lr 3e-4 \
         --epochs 100 \
         --save_every 10 \
-        --val_split 0.1"
+        --val_split 0.1 \
+        --checkpoint_dir $CHECKPOINT_DIR/codec \
+        --num_workers $NUM_WORKERS"
 
     if [[ "$SYNTHETIC" == true ]]; then
         cmd="$cmd --data_dir /tmp/synthetic --synthetic"
@@ -308,9 +307,9 @@ train_stt() {
         return 0
     fi
 
-    # Check dependency: codec
+    # Check dependency: codec (skip in dry-run mode)
     local codec_state=$(check_state "codec")
-    if [[ "$codec_state" != "complete" && "$SYNTHETIC" == false ]]; then
+    if [[ "$codec_state" != "complete" && "$SYNTHETIC" == false && "$DRY_RUN" == false ]]; then
         fail "STT requires trained codec. Train codec first."
         return 1
     fi
@@ -318,21 +317,19 @@ train_stt() {
     save_state "stt" "training"
 
     local cmd="python3 $SCRIPT_DIR/train_stt.py \
+        --device $DEVICE \
         --batch_size 16 \
         --lr 5e-4 \
-        --epochs 100"
+        --epochs 100 \
+        --checkpoint_dir $CHECKPOINT_DIR/stt \
+        --num_workers $NUM_WORKERS"
 
     if [[ "$SYNTHETIC" == true ]]; then
         cmd="$cmd --data_dir /tmp/synthetic --text_dir /tmp/synthetic --synthetic --mel_mode"
     else
         cmd="$cmd --data_dir $AUDIO_DIR --text_dir $STT_TEXT_DIR"
-        # Use codec embeddings if codec checkpoint exists
-        if [[ -f "$CHECKPOINT_DIR/codec/codec_best.pt" ]]; then
-            cmd="$cmd --codec_checkpoint $CHECKPOINT_DIR/codec/codec_best.pt"
-        else
-            cmd="$cmd --mel_mode"
-            warn "No codec checkpoint — using mel mode for STT"
-        fi
+        # STT always uses mel mode (80-dim mel spectrograms as input)
+        cmd="$cmd --mel_mode"
     fi
 
     if [[ "$DRY_RUN" == true ]]; then
@@ -357,7 +354,7 @@ train_tts() {
     fi
 
     # Check dependencies: codec + speaker encoder
-    if [[ "$SYNTHETIC" == false ]]; then
+    if [[ "$SYNTHETIC" == false && "$DRY_RUN" == false ]]; then
         local codec_state=$(check_state "codec")
         local cam_state=$(check_state "cam")
         if [[ "$codec_state" != "complete" ]]; then
@@ -371,9 +368,12 @@ train_tts() {
     save_state "tts" "training"
 
     local cmd="python3 $SCRIPT_DIR/train_tts.py \
+        --device $DEVICE \
         --batch_size 16 \
         --lr 1e-4 \
-        --epochs 100"
+        --epochs 100 \
+        --checkpoint_dir $CHECKPOINT_DIR/tts \
+        --num_workers $NUM_WORKERS"
 
     if [[ "$SYNTHETIC" == true ]]; then
         cmd="$cmd --synthetic"
@@ -381,8 +381,6 @@ train_tts() {
         cmd="$cmd --data_dir $AUDIO_DIR --text_dir $STT_TEXT_DIR"
         [[ -f "$CHECKPOINT_DIR/codec/codec_best.pt" ]] && \
             cmd="$cmd --codec_checkpoint $CHECKPOINT_DIR/codec/codec_best.pt"
-        [[ -f "$CHECKPOINT_DIR/cam/speaker_encoder_best.pt" ]] && \
-            cmd="$cmd --speaker_checkpoint $CHECKPOINT_DIR/cam/speaker_encoder_best.pt"
     fi
 
     if [[ "$DRY_RUN" == true ]]; then
@@ -407,7 +405,7 @@ train_cfm() {
     fi
 
     # Check dependency: speaker encoder
-    if [[ "$SYNTHETIC" == false ]]; then
+    if [[ "$SYNTHETIC" == false && "$DRY_RUN" == false ]]; then
         local cam_state=$(check_state "cam")
         if [[ "$cam_state" != "complete" ]]; then
             fail "CFM requires trained speaker encoder. Train CAM++ first."; return 1
@@ -419,15 +417,12 @@ train_cfm() {
     local cmd="python3 $SCRIPT_DIR/train_cfm.py \
         --batch_size 16 \
         --lr 1e-4 \
-        --epochs 100"
+        --epochs 100 \
+        --checkpoint_dir $CHECKPOINT_DIR/cfm \
+        --data_dir $AUDIO_DIR"
 
-    if [[ "$SYNTHETIC" == true ]]; then
-        cmd="$cmd --synthetic"
-    else
-        cmd="$cmd --data_dir $AUDIO_DIR"
-        [[ -f "$CHECKPOINT_DIR/cam/speaker_encoder_best.pt" ]] && \
-            cmd="$cmd --speaker_checkpoint $CHECKPOINT_DIR/cam/speaker_encoder_best.pt"
-    fi
+    [[ -f "$CHECKPOINT_DIR/cam/speaker_encoder_best.pt" ]] && \
+        cmd="$cmd --speaker_checkpoint $CHECKPOINT_DIR/cam/speaker_encoder_best.pt"
 
     if [[ "$DRY_RUN" == true ]]; then
         log "DRY RUN: $cmd"
@@ -450,7 +445,7 @@ export_model() {
 
     if [[ ! -f "$checkpoint" ]]; then
         warn "No checkpoint for $model at $checkpoint, skipping export"
-        return 1
+        return 0
     fi
 
     log "Exporting $model to safetensors..."
