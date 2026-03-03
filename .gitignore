@@ -1,5 +1,6 @@
 # Build artifacts
 build/
+target/
 sonata
 pocket-voice
 *.o
