@@ -87,6 +87,7 @@ impl Default for PipelineConfig {
 ///
 /// Manages audio input/output and speech generation/recognition in a unified pipeline.
 pub struct PipelineOrchestrator {
+    device: Device,
     codec: SonataCodec,
     stt: SonataSTT,
     tts: SonataTTS,
@@ -130,6 +131,7 @@ impl PipelineOrchestrator {
         info!("PipelineOrchestrator initialization complete");
 
         Ok(Self {
+            device: dev.clone(),
             codec,
             stt,
             tts,
@@ -139,6 +141,11 @@ impl PipelineOrchestrator {
             state: PipelineState::Idle,
             config: PipelineConfig::default(),
         })
+    }
+
+    /// Get the device this pipeline was initialized on.
+    pub fn device(&self) -> &Device {
+        &self.device
     }
 
     /// Get the current pipeline state.
@@ -344,6 +351,115 @@ impl PipelineOrchestrator {
         debug!("Decoding {} codec frames to audio", seq_len);
         self.codec.decode(&codes)
             .map_err(|e| anyhow!("Codec decode failed: {}", e))
+    }
+
+    // --- Raw FFI helpers: work with slices instead of tensors ---
+
+    /// Process raw audio samples through codec + STT, returning token IDs as text.
+    ///
+    /// Convenience method for FFI: takes `&[f32]` samples and returns a
+    /// space-separated string of decoded token IDs.
+    ///
+    /// Returns an empty string for empty input (not an error).
+    pub fn process_audio_raw(&mut self, audio_samples: &[f32]) -> Result<String> {
+        if audio_samples.is_empty() {
+            return Ok(String::new());
+        }
+
+        // Wrap raw samples as tensor [1, 1, samples]
+        let audio_tensor = Tensor::new(audio_samples, &self.device)
+            .map_err(|e| anyhow!("Tensor creation failed: {}", e))?
+            .reshape((1, 1, audio_samples.len()))
+            .map_err(|e| anyhow!("Reshape failed: {}", e))?;
+
+        let token_seqs = self.process_audio(&audio_tensor)?;
+
+        // Convert first batch element's tokens to space-separated string
+        let tokens = token_seqs.into_iter().next().unwrap_or_default();
+        let text = tokens
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        Ok(text)
+    }
+
+    /// Generate speech audio from text, returning raw f32 samples.
+    ///
+    /// Uses simple byte-level tokenization (each UTF-8 byte → token ID).
+    /// The generated audio exercises the full TTS → codec pipeline but
+    /// requires real model weights for meaningful output.
+    ///
+    /// Returns an empty vec for empty input (not an error).
+    pub fn generate_speech_raw(&mut self, text: &str, emotion_exag: f32) -> Result<Vec<f32>> {
+        if text.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Simple byte-level tokenization (offset by 1 to avoid CTC blank token 0)
+        let token_ids: Vec<u32> = text.bytes().map(|b| (b as u32) + 1).collect();
+        let text_tokens = Tensor::new(token_ids.as_slice(), &self.device)
+            .map_err(|e| anyhow!("Tensor creation failed: {}", e))?
+            .unsqueeze(0)
+            .map_err(|e| anyhow!("Unsqueeze failed: {}", e))?; // [1, T]
+
+        // Default speaker embedding (zeros)
+        let speaker_emb = Tensor::zeros(
+            &[1, SPEAKER_EMBED_DIM],
+            DType::F32,
+            &self.device,
+        ).map_err(|e| anyhow!("Speaker embedding creation failed: {}", e))?;
+
+        // Set emotion
+        self.set_emotion(0, emotion_exag);
+
+        // TTS forward → logits [1, T, 1024]
+        let logits = self.generate_speech(&text_tokens, &speaker_emb)?;
+
+        // Decode logits to audio via codec
+        let audio = self.logits_to_audio(&logits)?;
+
+        // Extract audio samples: [1, 1, samples] → Vec<f32>
+        let audio_vec = audio
+            .squeeze(0)
+            .map_err(|e| anyhow!("Squeeze batch failed: {}", e))?
+            .squeeze(0)
+            .map_err(|e| anyhow!("Squeeze channel failed: {}", e))?
+            .to_vec1::<f32>()
+            .map_err(|e| anyhow!("to_vec1 failed: {}", e))?;
+
+        Ok(audio_vec)
+    }
+
+    /// Encode speaker embedding from raw audio samples.
+    ///
+    /// Computes mel spectrogram from audio, then extracts a 192-dim
+    /// speaker embedding via CAM++.
+    ///
+    /// Returns 192 zeros for empty input (not an error).
+    pub fn encode_speaker_raw(&self, audio_samples: &[f32]) -> Result<Vec<f32>> {
+        if audio_samples.is_empty() {
+            return Ok(vec![0.0f32; SPEAKER_EMBED_DIM]);
+        }
+
+        // Wrap as [1, samples] for mel computation
+        let audio_tensor = Tensor::new(audio_samples, &self.device)
+            .map_err(|e| anyhow!("Tensor creation failed: {}", e))?
+            .unsqueeze(0)
+            .map_err(|e| anyhow!("Unsqueeze failed: {}", e))?;
+
+        // Compute mel spectrogram [1, 80, T]
+        let mel = self.compute_mel(&audio_tensor)?;
+
+        // Encode speaker [1, 192]
+        let speaker_emb = self.encode_speaker(&mel)?;
+
+        // Extract as Vec<f32>
+        speaker_emb
+            .squeeze(0)
+            .map_err(|e| anyhow!("Squeeze failed: {}", e))?
+            .to_vec1::<f32>()
+            .map_err(|e| anyhow!("to_vec1 failed: {}", e))
     }
 
     /// Convert codec codes to continuous embeddings via RVQ codebook lookup.
