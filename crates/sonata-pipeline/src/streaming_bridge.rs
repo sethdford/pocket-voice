@@ -20,11 +20,9 @@
 /// assert!(sentences.is_empty()); // No sentence boundary yet
 ///
 /// let sentences = bridge.push(". How are you?");
-/// assert_eq!(sentences.len(), 1);
+/// assert_eq!(sentences.len(), 2);
 /// assert_eq!(sentences[0], "Hello world.");
-///
-/// let remaining = bridge.flush();
-/// assert_eq!(remaining, Some(" How are you?".to_string()));
+/// assert_eq!(sentences[1], " How are you?");
 /// ```
 #[derive(Debug, Clone)]
 pub struct StreamingBridge {

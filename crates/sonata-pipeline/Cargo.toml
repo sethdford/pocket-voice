@@ -19,6 +19,9 @@ candle-nn = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 
+[dev-dependencies]
+rand = { workspace = true }
+
 [features]
 default = []
 metal = [
