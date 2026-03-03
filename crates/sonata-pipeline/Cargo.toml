@@ -1,0 +1,21 @@
+[package]
+name = "sonata-pipeline"
+version = "0.2.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+sonata-common = { path = "../sonata-common" }
+sonata-codec = { path = "../sonata-codec" }
+sonata-stt = { path = "../sonata-stt" }
+sonata-tts = { path = "../sonata-tts" }
+sonata-cfm = { path = "../sonata-cfm" }
+sonata-cam = { path = "../sonata-cam" }
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+default = []
+metal = ["candle-core/metal", "candle-nn/metal"]

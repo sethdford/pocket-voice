@@ -2363,6 +2363,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "sonata-pipeline"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "candle-core",
+ "candle-nn",
+ "sonata-cam",
+ "sonata-cfm",
+ "sonata-codec",
+ "sonata-common",
+ "sonata-stt",
+ "sonata-tts",
+ "tracing",
+]
+
+[[package]]
 name = "sonata-speaker"
 version = "0.1.0"
 dependencies = [
