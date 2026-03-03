@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sonata-common",
+    # Legacy v1 crates:
+    "src/stt",
+    "src/sonata_lm",
+    "src/sonata_flow",
+    "src/sonata_speaker",
+    "src/sonata_storm",
+]
+
+[workspace.dependencies]
+candle-core = { version = "0.9", features = [] }
+candle-nn = { version = "0.9", features = [] }
+candle-transformers = { version = "0.9", features = [] }
+safetensors = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+hf-hub = "0.4"
+rand = "0.8"
+anyhow = "1.0"
+tracing = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+strip = true
