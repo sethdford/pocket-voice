@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod adain;
+pub mod mel;
 pub mod rope;
 pub mod swiglu;
 pub mod metal;
