@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 pub mod adain;
+pub mod rope;
+pub mod swiglu;
 
 // --- Audio constants ---
 
