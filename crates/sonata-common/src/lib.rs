@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod adain;
+
 // --- Audio constants ---
 
 pub const SAMPLE_RATE: u32 = 24000;
