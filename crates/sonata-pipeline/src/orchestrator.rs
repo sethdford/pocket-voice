@@ -33,11 +33,12 @@
 //! ```
 
 use anyhow::{anyhow, Result};
-use candle_core::{Device, Tensor};
+use candle_core::{DType, Device, Tensor};
 use sonata_cam::CamPlusPlusEncoder;
 use sonata_cfm::SonataCFM;
 use sonata_codec::SonataCodec;
-use sonata_common::{EmotionStyle, SPEAKER_EMBED_DIM};
+use sonata_common::mel::MelSpectrogram;
+use sonata_common::{EmotionStyle, NUM_CODEBOOKS, SPEAKER_EMBED_DIM};
 use sonata_stt::SonataSTT;
 use sonata_tts::SonataTTS;
 use tracing::{debug, info};
@@ -91,6 +92,7 @@ pub struct PipelineOrchestrator {
     tts: SonataTTS,
     cfm: SonataCFM,
     cam: CamPlusPlusEncoder,
+    mel: MelSpectrogram,
     state: PipelineState,
     config: PipelineConfig,
 }
@@ -121,6 +123,10 @@ impl PipelineOrchestrator {
         let cam = CamPlusPlusEncoder::new(dev)?;
         debug!("Initialized CamPlusPlusEncoder");
 
+        let mel = MelSpectrogram::new(dev)
+            .map_err(|e| anyhow!("Failed to initialize MelSpectrogram: {}", e))?;
+        debug!("Initialized MelSpectrogram");
+
         info!("PipelineOrchestrator initialization complete");
 
         Ok(Self {
@@ -129,6 +135,7 @@ impl PipelineOrchestrator {
             tts,
             cfm,
             cam,
+            mel,
             state: PipelineState::Idle,
             config: PipelineConfig::default(),
         })
@@ -277,6 +284,66 @@ impl PipelineOrchestrator {
             .map_err(|e| anyhow!("CFM mel generation failed: {}", e))?;
         debug!("CFM generated mel, shape: {:?}", mel.dims());
         Ok(mel)
+    }
+
+    /// Compute mel spectrogram from raw audio.
+    ///
+    /// # Arguments
+    /// * `audio` - Raw audio tensor [B, samples] or [B, 1, samples]
+    ///
+    /// # Returns
+    /// Mel spectrogram tensor [B, 80, T]
+    pub fn compute_mel(&self, audio: &Tensor) -> Result<Tensor> {
+        self.mel.forward(audio)
+            .map_err(|e| anyhow!("Mel spectrogram computation failed: {}", e))
+    }
+
+    /// Convert TTS logits to audio via codec decoding.
+    ///
+    /// Takes codec logits [B, T, 1024] from `generate_speech()`, argmaxes to get
+    /// first-codebook indices, pads remaining 7 codebooks with zeros, and decodes
+    /// via the codec to produce audio.
+    ///
+    /// # Arguments
+    /// * `logits` - Codec logits tensor [B, T, 1024] from TTS
+    ///
+    /// # Returns
+    /// Audio tensor [B, 1, audio_samples] at 24kHz
+    pub fn logits_to_audio(&self, logits: &Tensor) -> Result<Tensor> {
+        let dev = logits.device();
+        let dims = logits.dims();
+        let batch = dims[0];
+        let seq_len = dims[1];
+
+        // Argmax along vocab dimension → [B, T]
+        let codes_first = logits.argmax(candle_core::D::Minus1)
+            .map_err(|e| anyhow!("Argmax failed: {}", e))?;
+        // codes_first is [B, T] with dtype U32
+
+        // Build [B, 8, T]: first codebook = argmax, rest = zeros
+        let zeros = Tensor::zeros(&[batch, seq_len], DType::U32, dev)
+            .map_err(|e| anyhow!("Failed to create zero codes: {}", e))?;
+
+        let mut book_slices: Vec<Tensor> = Vec::with_capacity(NUM_CODEBOOKS);
+        for i in 0..NUM_CODEBOOKS {
+            let book = if i == 0 {
+                codes_first.unsqueeze(1)
+                    .map_err(|e| anyhow!("Unsqueeze failed: {}", e))?
+            } else {
+                zeros.unsqueeze(1)
+                    .map_err(|e| anyhow!("Unsqueeze failed: {}", e))?
+            };
+            book_slices.push(book);
+        }
+
+        let refs: Vec<&Tensor> = book_slices.iter().collect();
+        let codes = Tensor::cat(&refs, 1)
+            .map_err(|e| anyhow!("Cat codebooks failed: {}", e))?;
+        // codes: [B, 8, T]
+
+        debug!("Decoding {} codec frames to audio", seq_len);
+        self.codec.decode(&codes)
+            .map_err(|e| anyhow!("Codec decode failed: {}", e))
     }
 
     /// Convert codec codes to continuous embeddings via RVQ codebook lookup.

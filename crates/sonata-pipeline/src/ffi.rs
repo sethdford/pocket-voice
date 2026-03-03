@@ -30,7 +30,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Mutex;
 
 use crate::orchestrator::PipelineOrchestrator;
-use candle_core::Device;
+use candle_core::{DType, Device, Tensor};
+use sonata_common::SPEAKER_EMBED_DIM;
 
 /// Error code constants for FFI return values
 pub const SC_OK: i32 = 0;
@@ -165,11 +166,15 @@ unsafe fn parse_device_from_config(config_json: *const u8, config_len: usize) ->
 
 /// Run speech-to-text on raw audio.
 ///
+/// Converts raw 24kHz mono f32 audio into text token IDs. The output is a
+/// space-separated list of u32 token indices (CTC-decoded from a 32K vocab).
+/// A real tokenizer/detokenizer is needed to convert these IDs to human text.
+///
 /// # Arguments
 ///
 /// * `audio` - Pointer to f32 samples (24kHz mono)
-/// * `samples` - Number of samples
-/// * `text` - Output buffer for transcribed text (UTF-8)
+/// * `samples` - Number of samples (must be > 0)
+/// * `text` - Output buffer for token IDs as space-separated decimal UTF-8
 /// * `text_len` - In: buffer capacity, Out: bytes written
 ///
 /// # Returns
@@ -181,8 +186,6 @@ unsafe fn parse_device_from_config(config_json: *const u8, config_len: usize) ->
 /// - `audio` points to valid f32 samples of length `samples`
 /// - `text` points to a valid buffer of at least `*text_len` bytes
 /// - `text_len` pointer is valid and dereferenceable
-///
-/// Currently returns `SC_ERR_NOT_IMPLEMENTED`.
 #[no_mangle]
 pub unsafe extern "C" fn sonata_stt(
     audio: *const f32,
@@ -204,23 +207,68 @@ pub unsafe extern "C" fn sonata_stt(
             set_last_error("sonata_stt: text_len pointer is null");
             return SC_ERR_INVALID_ARGUMENT;
         }
+        if samples == 0 {
+            // Nothing to transcribe — write 0 bytes
+            *text_len = 0;
+            return SC_OK;
+        }
 
-        // Check pipeline is initialized
-        let guard = match PIPELINE.lock() {
+        // Lock pipeline
+        let mut guard = match PIPELINE.lock() {
             Ok(g) => g,
             Err(poisoned) => {
                 set_last_error("sonata_stt: pipeline mutex poisoned");
                 poisoned.into_inner()
             }
         };
-        if guard.is_none() {
-            set_last_error("sonata_stt: pipeline not initialized");
-            return SC_ERR_NOT_INITIALIZED;
-        }
+        let pipeline = match guard.as_mut() {
+            Some(p) => p,
+            None => {
+                set_last_error("sonata_stt: pipeline not initialized");
+                return SC_ERR_NOT_INITIALIZED;
+            }
+        };
 
-        // Stub: STT requires mel computation infrastructure not yet wired
-        set_last_error("sonata_stt: not implemented");
-        SC_ERR_NOT_IMPLEMENTED
+        // Create audio tensor [1, 1, samples] from raw f32 pointer
+        let audio_slice = std::slice::from_raw_parts(audio, samples);
+        let dev = Device::Cpu;
+        let audio_tensor = match Tensor::new(audio_slice, &dev)
+            .and_then(|t| t.reshape(&[1, 1, samples]))
+        {
+            Ok(t) => t,
+            Err(e) => {
+                set_last_error(format!("sonata_stt: failed to create audio tensor: {e}"));
+                return SC_ERR_INTERNAL;
+            }
+        };
+
+        // Run STT pipeline: audio → codec → embeddings → CTC decode → token IDs
+        let token_seqs = match pipeline.process_audio(&audio_tensor) {
+            Ok(t) => t,
+            Err(e) => {
+                set_last_error(format!("sonata_stt: process_audio failed: {e}"));
+                return SC_ERR_INTERNAL;
+            }
+        };
+
+        // Serialize first batch sequence as space-separated decimal token IDs
+        let tokens = if token_seqs.is_empty() { &[] as &[u32] } else { &token_seqs[0] };
+        let output_str: String = tokens
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let output_bytes = output_str.as_bytes();
+
+        // Copy to output buffer (truncate if too small)
+        let buf_cap = *text_len;
+        let copy_len = output_bytes.len().min(buf_cap);
+        if copy_len > 0 {
+            std::ptr::copy_nonoverlapping(output_bytes.as_ptr(), text, copy_len);
+        }
+        *text_len = copy_len;
+
+        SC_OK
     }));
     result.unwrap_or_else(|_| {
         set_last_error("panic during sonata_stt");
@@ -230,11 +278,15 @@ pub unsafe extern "C" fn sonata_stt(
 
 /// Run text-to-speech.
 ///
+/// Converts text into audio via the full TTS pipeline: text bytes are mapped
+/// to token IDs (each byte value as a u32 token), then run through the TTS
+/// model to produce codec logits, which are decoded to 24kHz audio.
+///
 /// # Arguments
 ///
 /// * `text` - Input text (UTF-8)
-/// * `text_len` - Length of text in bytes
-/// * `speaker_id` - Speaker identifier (nullable)
+/// * `text_len` - Length of text in bytes (must be > 0)
+/// * `speaker_id` - Speaker identifier (nullable, currently unused — zero embedding)
 /// * `emotion_exag` - Emotion exaggeration factor (0.0-2.0)
 /// * `audio` - Output buffer for f32 samples (24kHz mono)
 /// * `audio_len` - In: buffer capacity (samples), Out: samples written
@@ -249,14 +301,12 @@ pub unsafe extern "C" fn sonata_stt(
 /// - `speaker_id` is NULL or points to valid UTF-8
 /// - `audio` points to a valid f32 buffer of at least `*audio_len` samples
 /// - `audio_len` pointer is valid and dereferenceable
-///
-/// Currently returns `SC_ERR_NOT_IMPLEMENTED`.
 #[no_mangle]
 pub unsafe extern "C" fn sonata_tts(
     text: *const u8,
     text_len: usize,
     _speaker_id: *const u8,
-    _emotion_exag: f32,
+    emotion_exag: f32,
     audio: *mut f32,
     audio_len: *mut usize,
 ) -> i32 {
@@ -274,8 +324,13 @@ pub unsafe extern "C" fn sonata_tts(
             set_last_error("sonata_tts: audio_len pointer is null");
             return SC_ERR_INVALID_ARGUMENT;
         }
+        if text_len == 0 {
+            // Nothing to synthesize — write 0 samples
+            *audio_len = 0;
+            return SC_OK;
+        }
 
-        // Check pipeline is initialized
+        // Lock pipeline
         let guard = match PIPELINE.lock() {
             Ok(g) => g,
             Err(poisoned) => {
@@ -283,14 +338,86 @@ pub unsafe extern "C" fn sonata_tts(
                 poisoned.into_inner()
             }
         };
-        if guard.is_none() {
-            set_last_error("sonata_tts: pipeline not initialized");
-            return SC_ERR_NOT_INITIALIZED;
-        }
+        let pipeline = match guard.as_ref() {
+            Some(p) => p,
+            None => {
+                set_last_error("sonata_tts: pipeline not initialized");
+                return SC_ERR_NOT_INITIALIZED;
+            }
+        };
 
-        // Stub: TTS requires mel computation infrastructure not yet wired
-        set_last_error("sonata_tts: not implemented");
-        SC_ERR_NOT_IMPLEMENTED
+        let dev = Device::Cpu;
+
+        // Convert text bytes to token IDs (each byte value as a u32 token)
+        let text_slice = std::slice::from_raw_parts(text, text_len);
+        let token_ids: Vec<u32> = text_slice.iter().map(|&b| b as u32).collect();
+
+        let text_tokens = match Tensor::new(token_ids.as_slice(), &dev)
+            .and_then(|t| t.reshape(&[1, text_len]))
+        {
+            Ok(t) => t,
+            Err(e) => {
+                set_last_error(format!("sonata_tts: failed to create token tensor: {e}"));
+                return SC_ERR_INTERNAL;
+            }
+        };
+
+        // Create zero speaker embedding [1, 192] (speaker_id not yet supported)
+        let speaker_emb = match Tensor::zeros(&[1, SPEAKER_EMBED_DIM], DType::F32, &dev) {
+            Ok(t) => t,
+            Err(e) => {
+                set_last_error(format!("sonata_tts: failed to create speaker embedding: {e}"));
+                return SC_ERR_INTERNAL;
+            }
+        };
+
+        // Set emotion exaggeration (style_id=0 neutral, user controls exaggeration)
+        // Note: pipeline is behind a shared ref, emotion is set at init time via config.
+        // For per-call emotion, we'd need &mut — for now use default emotion.
+        let _ = emotion_exag; // Acknowledged but requires &mut pipeline
+
+        // Generate speech: text tokens + speaker → codec logits
+        let logits = match pipeline.generate_speech(&text_tokens, &speaker_emb) {
+            Ok(l) => l,
+            Err(e) => {
+                set_last_error(format!("sonata_tts: generate_speech failed: {e}"));
+                return SC_ERR_INTERNAL;
+            }
+        };
+
+        // Decode logits → audio via codec
+        let audio_tensor = match pipeline.logits_to_audio(&logits) {
+            Ok(a) => a,
+            Err(e) => {
+                set_last_error(format!("sonata_tts: logits_to_audio failed: {e}"));
+                return SC_ERR_INTERNAL;
+            }
+        };
+
+        // Flatten to [samples] and copy to output buffer
+        let flat = match audio_tensor.flatten_all() {
+            Ok(f) => f,
+            Err(e) => {
+                set_last_error(format!("sonata_tts: flatten failed: {e}"));
+                return SC_ERR_INTERNAL;
+            }
+        };
+        let audio_data: Vec<f32> = match flat.to_vec1() {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error(format!("sonata_tts: to_vec1 failed: {e}"));
+                return SC_ERR_INTERNAL;
+            }
+        };
+
+        let buf_cap = *audio_len;
+        let copy_len = audio_data.len().min(buf_cap);
+        if copy_len > 0 {
+            std::ptr::copy_nonoverlapping(audio_data.as_ptr(), audio, copy_len);
+        }
+        *audio_len = copy_len;
+
+        SC_OK
     }));
     result.unwrap_or_else(|_| {
         set_last_error("panic during sonata_tts");
@@ -300,10 +427,13 @@ pub unsafe extern "C" fn sonata_tts(
 
 /// Encode speaker embedding from audio.
 ///
+/// Converts raw audio to a mel spectrogram, then extracts a 192-dimensional
+/// speaker embedding via the CAM++ encoder.
+///
 /// # Arguments
 ///
-/// * `audio` - Pointer to f32 samples (16kHz mono)
-/// * `samples` - Number of samples
+/// * `audio` - Pointer to f32 samples (24kHz mono)
+/// * `samples` - Number of samples (must be > 0)
 /// * `embedding` - Output buffer for f32[192] speaker embedding
 ///
 /// # Returns
@@ -314,8 +444,6 @@ pub unsafe extern "C" fn sonata_tts(
 ///
 /// - `audio` points to valid f32 samples of length `samples`
 /// - `embedding` points to a buffer of at least 192 f32 values
-///
-/// Currently returns `SC_ERR_NOT_IMPLEMENTED`.
 #[no_mangle]
 pub unsafe extern "C" fn sonata_speaker_encode(
     audio: *const f32,
@@ -332,8 +460,12 @@ pub unsafe extern "C" fn sonata_speaker_encode(
             set_last_error("sonata_speaker_encode: embedding output buffer is null");
             return SC_ERR_INVALID_ARGUMENT;
         }
+        if samples == 0 {
+            set_last_error("sonata_speaker_encode: need audio samples for speaker encoding");
+            return SC_ERR_INVALID_ARGUMENT;
+        }
 
-        // Check pipeline is initialized
+        // Lock pipeline
         let guard = match PIPELINE.lock() {
             Ok(g) => g,
             Err(poisoned) => {
@@ -341,14 +473,71 @@ pub unsafe extern "C" fn sonata_speaker_encode(
                 poisoned.into_inner()
             }
         };
-        if guard.is_none() {
-            set_last_error("sonata_speaker_encode: pipeline not initialized");
-            return SC_ERR_NOT_INITIALIZED;
+        let pipeline = match guard.as_ref() {
+            Some(p) => p,
+            None => {
+                set_last_error("sonata_speaker_encode: pipeline not initialized");
+                return SC_ERR_NOT_INITIALIZED;
+            }
+        };
+
+        // Create audio tensor [1, samples] from raw f32 pointer
+        let dev = Device::Cpu;
+        let audio_slice = std::slice::from_raw_parts(audio, samples);
+        let audio_tensor = match Tensor::new(audio_slice, &dev)
+            .and_then(|t| t.reshape(&[1, samples]))
+        {
+            Ok(t) => t,
+            Err(e) => {
+                set_last_error(format!("sonata_speaker_encode: failed to create audio tensor: {e}"));
+                return SC_ERR_INTERNAL;
+            }
+        };
+
+        // Compute mel spectrogram: [1, samples] → [1, 80, T]
+        let mel = match pipeline.compute_mel(&audio_tensor) {
+            Ok(m) => m,
+            Err(e) => {
+                set_last_error(format!("sonata_speaker_encode: mel computation failed: {e}"));
+                return SC_ERR_INTERNAL;
+            }
+        };
+
+        // Encode speaker: mel [1, 80, T] → embedding [1, 192]
+        let emb_tensor = match pipeline.encode_speaker(&mel) {
+            Ok(e) => e,
+            Err(e) => {
+                set_last_error(format!("sonata_speaker_encode: encode_speaker failed: {e}"));
+                return SC_ERR_INTERNAL;
+            }
+        };
+
+        // Flatten and copy 192 floats to output buffer
+        let flat = match emb_tensor.flatten_all() {
+            Ok(f) => f,
+            Err(e) => {
+                set_last_error(format!("sonata_speaker_encode: flatten failed: {e}"));
+                return SC_ERR_INTERNAL;
+            }
+        };
+        let emb_data: Vec<f32> = match flat.to_vec1() {
+            Ok(v) => v,
+            Err(e) => {
+                set_last_error(format!("sonata_speaker_encode: to_vec1 failed: {e}"));
+                return SC_ERR_INTERNAL;
+            }
+        };
+
+        if emb_data.len() < SPEAKER_EMBED_DIM {
+            set_last_error(format!(
+                "sonata_speaker_encode: embedding has {} dims, expected {}",
+                emb_data.len(), SPEAKER_EMBED_DIM
+            ));
+            return SC_ERR_INTERNAL;
         }
 
-        // Stub: Speaker encoding requires mel computation infrastructure not yet wired
-        set_last_error("sonata_speaker_encode: not implemented");
-        SC_ERR_NOT_IMPLEMENTED
+        std::ptr::copy_nonoverlapping(emb_data.as_ptr(), embedding, SPEAKER_EMBED_DIM);
+        SC_OK
     }));
     result.unwrap_or_else(|_| {
         set_last_error("panic during sonata_speaker_encode");
@@ -529,9 +718,10 @@ mod tests {
     fn test_ffi_stt_not_initialized() {
         unsafe {
             sonata_pipeline_deinit(); // Ensure deinitialized
-            let mut buf = [0u8; 64];
-            let mut tl: usize = 64;
-            let ret = sonata_stt(std::ptr::null(), 0, buf.as_mut_ptr(), &mut tl);
+            let audio = [0.0f32; 100];
+            let mut buf = [0u8; 256];
+            let mut tl: usize = buf.len();
+            let ret = sonata_stt(audio.as_ptr(), audio.len(), buf.as_mut_ptr(), &mut tl);
             assert_eq!(ret, SC_ERR_NOT_INITIALIZED);
         }
     }
@@ -619,8 +809,9 @@ mod tests {
     fn test_ffi_speaker_encode_not_initialized() {
         unsafe {
             sonata_pipeline_deinit();
+            let audio = [0.0f32; 100];
             let mut emb = [0f32; 192];
-            let ret = sonata_speaker_encode(std::ptr::null(), 0, emb.as_mut_ptr());
+            let ret = sonata_speaker_encode(audio.as_ptr(), audio.len(), emb.as_mut_ptr());
             assert_eq!(ret, SC_ERR_NOT_INITIALIZED);
         }
     }
@@ -642,19 +833,149 @@ mod tests {
     }
 
     #[test]
+    fn test_ffi_stt_zero_samples() {
+        unsafe {
+            let ret = sonata_pipeline_init(std::ptr::null(), 0);
+            assert_eq!(ret, SC_OK);
+
+            // STT with zero samples → SC_OK, text_len set to 0
+            let mut buf = [0u8; 64];
+            let mut tl: usize = 64;
+            let ret = sonata_stt(std::ptr::null(), 0, buf.as_mut_ptr(), &mut tl);
+            assert_eq!(ret, SC_OK);
+            assert_eq!(tl, 0);
+
+            sonata_pipeline_deinit();
+        }
+    }
+
+    #[test]
+    fn test_ffi_tts_zero_text() {
+        unsafe {
+            let ret = sonata_pipeline_init(std::ptr::null(), 0);
+            assert_eq!(ret, SC_OK);
+
+            // TTS with zero-length text → SC_OK, audio_len set to 0
+            let mut audio = [0f32; 100];
+            let mut al: usize = 100;
+            let ret = sonata_tts(
+                std::ptr::null(), 0,
+                std::ptr::null(), 1.0,
+                audio.as_mut_ptr(), &mut al,
+            );
+            assert_eq!(ret, SC_OK);
+            assert_eq!(al, 0);
+
+            sonata_pipeline_deinit();
+        }
+    }
+
+    #[test]
+    fn test_ffi_speaker_encode_zero_samples() {
+        unsafe {
+            let ret = sonata_pipeline_init(std::ptr::null(), 0);
+            assert_eq!(ret, SC_OK);
+
+            // Speaker encode with zero samples → invalid argument (need audio)
+            let mut emb = [0f32; 192];
+            let ret = sonata_speaker_encode(std::ptr::null(), 0, emb.as_mut_ptr());
+            assert_eq!(ret, SC_ERR_INVALID_ARGUMENT);
+
+            sonata_pipeline_deinit();
+        }
+    }
+
+    #[test]
+    fn test_ffi_stt_end_to_end() {
+        unsafe {
+            // Note: tests share the global PIPELINE, so another test's deinit can
+            // race with us. Re-init to ensure we have a live pipeline.
+            let ret = sonata_pipeline_init(std::ptr::null(), 0);
+            assert_eq!(ret, SC_OK);
+
+            // Create 1 second of silence at 24kHz
+            let audio = vec![0.0f32; 24000];
+            let mut text_buf = vec![0u8; 4096];
+            let mut text_len: usize = text_buf.len();
+
+            let ret = sonata_stt(audio.as_ptr(), audio.len(), text_buf.as_mut_ptr(), &mut text_len);
+            // If another test raced and cleared the pipeline, we get NOT_INITIALIZED.
+            // Accept both SC_OK and SC_ERR_NOT_INITIALIZED due to test parallelism.
+            if ret == SC_ERR_NOT_INITIALIZED {
+                // Retry: re-init and try again
+                let ret_init = sonata_pipeline_init(std::ptr::null(), 0);
+                assert_eq!(ret_init, SC_OK);
+                text_len = text_buf.len();
+                let ret2 = sonata_stt(audio.as_ptr(), audio.len(), text_buf.as_mut_ptr(), &mut text_len);
+                assert_eq!(ret2, SC_OK);
+            } else {
+                assert_eq!(ret, SC_OK);
+            }
+            // text_len should be set (token IDs serialized as space-separated text)
+            assert!(text_len <= text_buf.len());
+
+            sonata_pipeline_deinit();
+        }
+    }
+
+    #[test]
+    fn test_ffi_tts_end_to_end() {
+        unsafe {
+            let ret = sonata_pipeline_init(std::ptr::null(), 0);
+            assert_eq!(ret, SC_OK);
+
+            let text = b"hello";
+            let mut audio_buf = vec![0.0f32; 120_000]; // ~5s at 24kHz
+            let mut audio_len: usize = audio_buf.len();
+
+            let ret = sonata_tts(
+                text.as_ptr(), text.len(),
+                std::ptr::null(), 1.0,
+                audio_buf.as_mut_ptr(), &mut audio_len,
+            );
+            assert_eq!(ret, SC_OK);
+            // Should have produced some audio samples
+            assert!(audio_len > 0);
+            assert!(audio_len <= audio_buf.len());
+
+            sonata_pipeline_deinit();
+        }
+    }
+
+    #[test]
+    fn test_ffi_speaker_encode_end_to_end() {
+        unsafe {
+            let ret = sonata_pipeline_init(std::ptr::null(), 0);
+            assert_eq!(ret, SC_OK);
+
+            // 1 second of audio at 24kHz
+            let audio = vec![0.0f32; 24000];
+            let mut emb = [0.0f32; 192];
+
+            let ret = sonata_speaker_encode(audio.as_ptr(), audio.len(), emb.as_mut_ptr());
+            assert_eq!(ret, SC_OK);
+            // Embedding should have been written (all values populated)
+            // With zero-initialized weights, values are deterministic
+
+            sonata_pipeline_deinit();
+        }
+    }
+
+    #[test]
     fn test_ffi_null_pointer_safety() {
         unsafe {
             // Init with null config is fine
             let ret1 = sonata_pipeline_init(std::ptr::null(), 0);
             assert_eq!(ret1, SC_OK);
 
-            // STT with null audio + zero samples → still returns not-implemented (init'd)
+            // STT with null audio + zero samples → SC_OK (nothing to transcribe)
             let mut buf = [0u8; 64];
             let mut tl: usize = 64;
             let ret2 = sonata_stt(std::ptr::null(), 0, buf.as_mut_ptr(), &mut tl);
-            assert_eq!(ret2, SC_ERR_NOT_IMPLEMENTED);
+            assert_eq!(ret2, SC_OK);
+            assert_eq!(tl, 0);
 
-            // TTS with null text + zero len → still returns not-implemented (init'd)
+            // TTS with null text + zero len → SC_OK (nothing to synthesize)
             let mut audio = [0f32; 100];
             let mut al: usize = 100;
             let ret3 = sonata_tts(
@@ -662,12 +983,13 @@ mod tests {
                 std::ptr::null(), 1.0,
                 audio.as_mut_ptr(), &mut al,
             );
-            assert_eq!(ret3, SC_ERR_NOT_IMPLEMENTED);
+            assert_eq!(ret3, SC_OK);
+            assert_eq!(al, 0);
 
-            // Speaker encode with null audio + zero samples → invalid (embedding null)
+            // Speaker encode with null audio + zero samples → invalid (need audio)
             let mut emb = [0f32; 192];
             let ret4 = sonata_speaker_encode(std::ptr::null(), 0, emb.as_mut_ptr());
-            assert_eq!(ret4, SC_ERR_NOT_IMPLEMENTED);
+            assert_eq!(ret4, SC_ERR_INVALID_ARGUMENT);
 
             sonata_pipeline_deinit();
         }
@@ -713,12 +1035,21 @@ mod tests {
             assert_eq!(ret, SC_OK);
             sonata_pipeline_deinit();
 
-            // All ops should return NOT_INITIALIZED
+            // STT with zero samples after deinit → zero samples returns OK early
+            // (checked before pipeline lock)
             let mut buf = [0u8; 64];
             let mut tl: usize = 64;
             let ret = sonata_stt(std::ptr::null(), 0, buf.as_mut_ptr(), &mut tl);
+            assert_eq!(ret, SC_OK); // zero samples → early return
+            assert_eq!(tl, 0);
+
+            // STT with non-zero samples after deinit → NOT_INITIALIZED
+            let audio_data = [0.0f32; 100];
+            tl = 64;
+            let ret = sonata_stt(audio_data.as_ptr(), 100, buf.as_mut_ptr(), &mut tl);
             assert_eq!(ret, SC_ERR_NOT_INITIALIZED);
 
+            // TTS with text after deinit → NOT_INITIALIZED
             let mut audio = [0f32; 100];
             let mut al: usize = 100;
             let ret = sonata_tts(
@@ -728,8 +1059,9 @@ mod tests {
             );
             assert_eq!(ret, SC_ERR_NOT_INITIALIZED);
 
+            // Speaker encode after deinit → NOT_INITIALIZED
             let mut emb = [0f32; 192];
-            let ret = sonata_speaker_encode(std::ptr::null(), 0, emb.as_mut_ptr());
+            let ret = sonata_speaker_encode(audio_data.as_ptr(), 100, emb.as_mut_ptr());
             assert_eq!(ret, SC_ERR_NOT_INITIALIZED);
         }
     }
