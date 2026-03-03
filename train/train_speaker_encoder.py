@@ -1255,10 +1255,10 @@ def main():
                 f"lr={args.lr}, bs={args.batch_size}, crop={args.crop_duration}s")
     if args.sub_centers > 1:
         logger.info(f"Sub-center ArcFace: K={args.sub_centers}")
-    if musan_dir:
-        logger.info(f"MUSAN augmentation: {musan_dir}")
-    if rir_dir:
-        logger.info(f"RIR augmentation: {rir_dir}")
+    if args.musan_dir:
+        logger.info(f"MUSAN augmentation: {args.musan_dir}")
+    if args.rir_dir:
+        logger.info(f"RIR augmentation: {args.rir_dir}")
     if args.asnorm:
         logger.info(f"AS-Norm validation: cohort_size={args.asnorm_cohort_size}")
 
