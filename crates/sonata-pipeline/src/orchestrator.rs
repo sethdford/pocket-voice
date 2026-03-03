@@ -689,4 +689,38 @@ mod tests {
             assert_eq!(dims[2], 10);
         }
     }
+
+    // --- Error path tests ---
+
+    #[test]
+    fn test_orchestrator_process_audio_empty() {
+        // Empty audio slice should return empty string
+        let dev = Device::Cpu;
+        let mut orch = PipelineOrchestrator::new(&dev).unwrap();
+        let result = orch.process_audio_raw(&[]);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_orchestrator_generate_speech_empty() {
+        // Empty text should return empty audio vec
+        let dev = Device::Cpu;
+        let mut orch = PipelineOrchestrator::new(&dev).unwrap();
+        let result = orch.generate_speech_raw("", 1.0);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_orchestrator_encode_speaker_empty() {
+        // Empty audio should return zero-filled embedding
+        let dev = Device::Cpu;
+        let orch = PipelineOrchestrator::new(&dev).unwrap();
+        let result = orch.encode_speaker_raw(&[]);
+        assert!(result.is_ok());
+        let emb = result.unwrap();
+        assert_eq!(emb.len(), SPEAKER_EMBED_DIM);
+        assert!(emb.iter().all(|&v| v == 0.0));
+    }
 }
