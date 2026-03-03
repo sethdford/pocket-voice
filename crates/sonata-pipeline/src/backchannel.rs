@@ -32,6 +32,7 @@ pub struct BackchannelGenerator {
     last_backchannel_ms: u64,
     min_interval_ms: u64,
     next_tag_index: usize,
+    has_generated: bool,
 }
 
 impl BackchannelGenerator {
@@ -54,6 +55,7 @@ impl BackchannelGenerator {
             last_backchannel_ms: 0,
             min_interval_ms: 2000,
             next_tag_index: 0,
+            has_generated: false,
         }
     }
 
@@ -63,6 +65,7 @@ impl BackchannelGenerator {
             last_backchannel_ms: 0,
             min_interval_ms,
             next_tag_index: 0,
+            has_generated: false,
         }
     }
 
@@ -78,6 +81,9 @@ impl BackchannelGenerator {
     pub fn should_backchannel(&self, current_ms: u64, user_speaking: bool) -> bool {
         if user_speaking {
             return false; // Don't backchannel while user speaks
+        }
+        if !self.has_generated {
+            return true; // First backchannel is always allowed
         }
         current_ms.saturating_sub(self.last_backchannel_ms) >= self.min_interval_ms
     }
@@ -100,8 +106,7 @@ impl BackchannelGenerator {
         }
 
         // Check timing constraint (enough time since last backchannel)
-        // On first call, last_backchannel_ms is 0, so allow immediately
-        if self.last_backchannel_ms > 0 {
+        if self.has_generated {
             let elapsed = current_ms.saturating_sub(self.last_backchannel_ms);
             if elapsed < self.min_interval_ms {
                 return None;
@@ -114,6 +119,7 @@ impl BackchannelGenerator {
             (self.next_tag_index + 1) % Self::BACKCHANNEL_TAGS.len();
 
         self.last_backchannel_ms = current_ms;
+        self.has_generated = true;
         Some(tag)
     }
 
@@ -123,12 +129,16 @@ impl BackchannelGenerator {
     pub fn reset(&mut self) {
         self.last_backchannel_ms = 0;
         self.next_tag_index = 0;
+        self.has_generated = false;
     }
 
     /// Get the time until the next backchannel can be generated (in ms).
     ///
     /// Returns 0 if a backchannel can be generated immediately.
     pub fn time_until_next(&self, current_ms: u64) -> u64 {
+        if !self.has_generated {
+            return 0;
+        }
         let elapsed = current_ms.saturating_sub(self.last_backchannel_ms);
         self.min_interval_ms.saturating_sub(elapsed)
     }
@@ -165,6 +175,7 @@ mod tests {
         assert_eq!(gen.last_backchannel(), 0);
         assert_eq!(gen.min_interval(), 2000);
         assert_eq!(gen.next_tag_index, 0);
+        assert!(!gen.has_generated);
     }
 
     #[test]
@@ -232,6 +243,7 @@ mod tests {
 
         gen.reset();
         assert_eq!(gen.last_backchannel(), 0);
+        assert!(!gen.has_generated);
 
         // Can generate immediately after reset
         let tag = gen.generate(1000, 1000);
@@ -284,10 +296,9 @@ mod tests {
     fn test_backchannel_time_until_next() {
         let mut gen = BackchannelGenerator::new();
 
-        // Initially at time 0, so time_until_next(0) should be 2000
-        assert_eq!(gen.time_until_next(0), 2000);
-        // At time 1000, still need 1000 more ms to wait
-        assert_eq!(gen.time_until_next(1000), 1000);
+        // Initially, can generate immediately (never generated before)
+        assert_eq!(gen.time_until_next(0), 0);
+        assert_eq!(gen.time_until_next(1000), 0);
 
         gen.generate(1000, 1000).unwrap();
         // After generation at 1000, need to wait until 3000
@@ -301,5 +312,40 @@ mod tests {
         let gen = BackchannelGenerator::default();
         assert_eq!(gen.min_interval(), 2000);
         assert_eq!(gen.last_backchannel(), 0);
+    }
+
+    #[test]
+    fn test_backchannel_first_call_at_time_zero() {
+        let mut gen = BackchannelGenerator::new();
+
+        // First call at t=0 should succeed (never generated before)
+        let tag1 = gen.generate(0, 1000);
+        assert!(tag1.is_some());
+        assert_eq!(gen.last_backchannel(), 0);
+        assert!(gen.has_generated);
+
+        // Second call at t=0 should fail (interval not met: 0 - 0 = 0 < 2000)
+        let tag2 = gen.generate(0, 1000);
+        assert!(tag2.is_none());
+
+        // Call within interval should fail
+        let tag3 = gen.generate(500, 1000);
+        assert!(tag3.is_none());
+
+        // After interval should succeed
+        let tag4 = gen.generate(2000, 1000);
+        assert!(tag4.is_some());
+    }
+
+    #[test]
+    fn test_backchannel_should_backchannel_before_first_generation() {
+        let gen = BackchannelGenerator::new();
+
+        // Before any generation, should_backchannel returns true (not speaking)
+        assert!(gen.should_backchannel(0, false));
+        assert!(gen.should_backchannel(100, false));
+
+        // Still false while user speaking
+        assert!(!gen.should_backchannel(0, true));
     }
 }

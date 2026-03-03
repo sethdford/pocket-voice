@@ -1,13 +1,14 @@
 //! Streaming STT: process audio in chunks with state caching.
 
 use candle_core::Tensor;
+use std::collections::VecDeque;
 
 /// Streaming state for chunk-based STT processing.
 ///
 /// Manages buffering and chunking for real-time transcription without
 /// waiting for the entire audio to be available.
 pub struct StreamingState {
-    pub buffer: Vec<Tensor>,
+    pub buffer: VecDeque<Tensor>,
     pub chunk_size: usize,
     pub overlap: usize,
 }
@@ -20,7 +21,7 @@ impl StreamingState {
     /// * `overlap` - Number of frames to overlap between chunks for continuity
     pub fn new(chunk_size: usize, overlap: usize) -> Self {
         Self {
-            buffer: Vec::new(),
+            buffer: VecDeque::new(),
             chunk_size,
             overlap,
         }
@@ -28,7 +29,7 @@ impl StreamingState {
 
     /// Add a new audio chunk to the buffer.
     pub fn add_chunk(&mut self, chunk: Tensor) {
-        self.buffer.push(chunk);
+        self.buffer.push_back(chunk);
     }
 
     /// Check if we have enough data to process.
@@ -41,18 +42,14 @@ impl StreamingState {
         self.buffer.len()
     }
 
-    /// Take the next chunk from the buffer for processing.
+    /// Take the next chunk from the buffer for processing. O(1) via VecDeque.
     pub fn take_chunk(&mut self) -> Option<Tensor> {
-        if self.buffer.is_empty() {
-            None
-        } else {
-            Some(self.buffer.remove(0))
-        }
+        self.buffer.pop_front()
     }
 
     /// Peek at the next chunk without removing it.
     pub fn peek_chunk(&self) -> Option<&Tensor> {
-        self.buffer.first()
+        self.buffer.front()
     }
 
     /// Clear all buffered chunks.
@@ -193,5 +190,25 @@ mod tests {
     fn test_streaming_state_peek_empty() {
         let state = StreamingState::new(100, 20);
         assert!(state.peek_chunk().is_none());
+    }
+
+    #[test]
+    fn test_streaming_fifo_order() {
+        let dev = Device::Cpu;
+        let mut state = StreamingState::new(100, 20);
+
+        // Add chunks with distinct shapes to verify FIFO order
+        for i in 1..=3 {
+            let chunk = Tensor::zeros(&[i * 10, 512], DType::F32, &dev).unwrap();
+            state.add_chunk(chunk);
+        }
+
+        // Should come out in FIFO order
+        let c1 = state.take_chunk().unwrap();
+        assert_eq!(c1.dims()[0], 10);
+        let c2 = state.take_chunk().unwrap();
+        assert_eq!(c2.dims()[0], 20);
+        let c3 = state.take_chunk().unwrap();
+        assert_eq!(c3.dims()[0], 30);
     }
 }

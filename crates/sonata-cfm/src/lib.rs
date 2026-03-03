@@ -37,21 +37,45 @@ use sonata_common::{CFM_DIM, CFM_LAYERS, MEL_BINS, SPEAKER_EMBED_DIM};
 const TIME_DIM: usize = 256;
 const CFM_FFN_DIM: usize = 2048;
 
-/// Time embedding: sinusoidal positional encoding for diffusion timestep.
+/// Time embedding: sinusoidal encoding + MLP for diffusion timestep.
+///
+/// Standard diffusion model time embedding:
+/// 1. Encode scalar timestep t into sinusoidal features (sin/cos at log-spaced frequencies)
+/// 2. Pass through a 2-layer MLP with ReLU activation
 struct TimeEmbedding {
-    proj: Linear,
+    mlp1: Linear,
+    mlp2: Linear,
+    dim: usize,
 }
 
 impl TimeEmbedding {
     fn new(dim: usize, dev: &Device) -> Result<Self> {
         let vb = VarBuilder::zeros(DType::F32, dev);
-        let proj = candle_nn::linear(1, dim, vb.pp("time"))?;
-        Ok(Self { proj })
+        let mlp1 = candle_nn::linear(dim, dim, vb.pp("time_mlp1"))?;
+        let mlp2 = candle_nn::linear(dim, dim, vb.pp("time_mlp2"))?;
+        Ok(Self { mlp1, mlp2, dim })
+    }
+
+    /// Create sinusoidal embedding for a scalar timestep.
+    ///
+    /// Uses log-spaced frequencies: freq_i = exp(-i/half_dim * ln(10000))
+    /// Output: [1, dim] with first half sin, second half cos.
+    fn sinusoidal_embedding(t: f32, dim: usize, dev: &Device) -> Result<Tensor> {
+        let half_dim = dim / 2;
+        let mut emb = vec![0.0f32; dim];
+        for i in 0..half_dim {
+            let freq = (-(i as f64 / half_dim as f64) * (10000.0_f64).ln()).exp();
+            let angle = t as f64 * freq;
+            emb[i] = angle.sin() as f32;
+            emb[i + half_dim] = angle.cos() as f32;
+        }
+        Tensor::from_vec(emb, (1, dim), dev)
     }
 
     fn forward(&self, t: f32, dev: &Device) -> Result<Tensor> {
-        let t_tensor = Tensor::new(&[[t]], dev)?;
-        self.proj.forward(&t_tensor)
+        let emb = Self::sinusoidal_embedding(t, self.dim, dev)?;
+        let h = self.mlp1.forward(&emb)?.relu()?;
+        self.mlp2.forward(&h)
     }
 }
 

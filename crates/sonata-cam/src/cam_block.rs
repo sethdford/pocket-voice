@@ -24,7 +24,11 @@ impl CAMBlock {
     ///
     /// # Arguments
     /// * `dim` - Feature dimension (typically 256)
-    /// * `_num_heads` - Number of attention heads (typically 8, reserved for future use)
+    /// * `_num_heads` - Accepted for API compatibility but unused. CAM++ uses global
+    ///   attention-based masking rather than multi-head self-attention: a single
+    ///   attention projection computes mask weights over the full feature dimension,
+    ///   which are applied element-wise. This differs from standard multi-head
+    ///   attention where features are split across heads.
     /// * `dev` - Candle device
     pub fn new(dim: usize, _num_heads: usize, dev: &Device) -> Result<Self> {
         let vb = VarBuilder::zeros(DType::F32, dev);

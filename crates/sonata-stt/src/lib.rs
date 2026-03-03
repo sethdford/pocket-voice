@@ -22,9 +22,11 @@ use candle_core::{Device, DType, Result, Tensor};
 use candle_nn::{Linear, Module, VarBuilder};
 use conformer::ConformerBlock;
 
+// STT model architecture constants
 const STT_DIM: usize = 512;
 const STT_LAYERS: usize = 12;
 const STT_FFN_DIM: usize = 2048;
+const STT_HEADS: usize = 8;
 
 /// Full STT model: Conformer encoder + CTC decoder.
 pub struct SonataSTT {
@@ -49,6 +51,7 @@ impl SonataSTT {
             blocks.push(ConformerBlock::new(
                 STT_DIM,
                 STT_FFN_DIM,
+                STT_HEADS,
                 dev,
             )?);
         }

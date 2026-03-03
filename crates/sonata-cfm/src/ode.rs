@@ -12,12 +12,12 @@ pub fn euler_solve<F>(v_fn: F, x0: &Tensor, steps: usize) -> Result<Tensor>
 where
     F: Fn(&Tensor, f32) -> Result<Tensor>,
 {
-    let dt = 1.0 / steps as f32;
+    let dt = 1.0_f64 / steps as f64;
     let mut x = x0.clone();
     for step in 0..steps {
-        let t = step as f32 * dt;
+        let t = (step as f64 * dt) as f32;
         let v = v_fn(&x, t)?;
-        x = (&x + &(v * dt as f64)?)?;
+        x = (&x + &v.affine(dt, 0.0)?)?;
     }
     Ok(x)
 }
