@@ -3,17 +3,38 @@
 train_speaker_encoder.py — Train ECAPA-TDNN speaker encoder with AAM-Softmax loss.
 
 Architecture: SE-Res2Net blocks + attentive statistics pooling (24.6M params)
-Loss: Additive Angular Margin Softmax (ArcFace) — prevents training collapse
-Data: LibriTTS-R with SpecAugment + speed perturbation + noise injection
-Validation: Equal Error Rate (EER) on test-clean
+Loss: Additive Angular Margin Softmax (ArcFace) with optional sub-center support
+Data: LibriTTS-R with MUSAN/RIR augmentation + SpecAugment + speed perturbation
+Advanced: Sub-center ArcFace, Large Margin Fine-tuning, AS-Norm validation, Multi-length Training
+Validation: Equal Error Rate (EER) on test-clean with optional AS-Norm normalization
 
 Usage:
+    # Standard training
     python3 train_speaker_encoder.py \
       --data-dir /path/to/LibriTTS_R \
       --output-dir ./checkpoints/speaker_encoder_v2 \
       --batch-size 64 --n-epochs 40 --lr 0.001 \
       --scale 30.0 --margin 0.2 \
       --warmup-epochs 2 --val-every 2 --patience 10
+
+    # With MUSAN/RIR augmentation
+    python3 train_speaker_encoder.py \
+      --data-dir /path/to/LibriTTS_R \
+      --musan-dir /path/to/MUSAN \
+      --rir-dir /path/to/RIRS_NOISES \
+      --crop-duration 4.0
+
+    # Fine-tuning with large margin
+    python3 train_speaker_encoder.py \
+      --data-dir /path/to/LibriTTS_R \
+      --fine-tune --resume ./checkpoints/best.pt \
+      --fine-tune-margin 0.5 --fine-tune-epochs 5 \
+      --fine-tune-crop 6.0 --sub-centers 2
+
+    # Validation with AS-Norm
+    python3 train_speaker_encoder.py \
+      --data-dir /path/to/LibriTTS_R \
+      --asnorm --asnorm-cohort-size 300
 
 Exports to safetensors + ONNX for Rust/C inference.
 """
@@ -115,6 +136,253 @@ class SpecAugment(nn.Module):
         for _ in range(self.n_time_masks):
             mel = self.time_mask(mel)
         return mel
+
+
+class MUSANAugmenter(nn.Module):
+    """MUSAN dataset augmentation (noise, music, speech babble)."""
+
+    def __init__(self, musan_dir: Optional[str] = None, sample_rate: int = 16000):
+        super().__init__()
+        self.sample_rate = sample_rate
+        self.cache = {}
+        self.musan_files = {'noise': [], 'music': [], 'speech': []}
+
+        if musan_dir:
+            self._load_musan_index(musan_dir)
+
+    def _load_musan_index(self, musan_dir: str) -> None:
+        """Index all MUSAN .wav files by category."""
+        musan_path = Path(musan_dir)
+        for category in ['noise', 'music', 'speech']:
+            cat_dir = musan_path / category
+            if cat_dir.exists():
+                files = sorted(cat_dir.rglob('*.wav'))
+                self.musan_files[category] = files
+                logger.info(f"Indexed {len(files)} MUSAN {category} files")
+
+    def forward(self, waveform: torch.Tensor, category: str = None) -> torch.Tensor:
+        """Add MUSAN augmentation at random SNR.
+
+        Args:
+            waveform: [samples]
+            category: 'noise', 'music', 'speech' or random if None
+
+        Returns:
+            augmented: [samples]
+        """
+        if not self.musan_files['noise']:
+            return waveform
+
+        if category is None:
+            category = np.random.choice(['noise', 'music', 'speech'])
+
+        if category == 'noise':
+            return self._add_noise(waveform, snr_range=(5, 20))
+        elif category == 'music':
+            return self._add_music(waveform, snr_range=(5, 15))
+        elif category == 'speech':
+            return self._add_babble(waveform, num_speakers=(3, 7), snr_range=(13, 20))
+        else:
+            return waveform
+
+    def _add_noise(self, waveform: torch.Tensor, snr_range: Tuple[float, float]) -> torch.Tensor:
+        """Add single noise clip at random SNR."""
+        if not self.musan_files['noise']:
+            return waveform
+
+        noise_file = np.random.choice(self.musan_files['noise'])
+        noise, sr = self._load_audio(noise_file)
+
+        # Match length
+        if noise.shape[0] < waveform.shape[0]:
+            noise = torch.tile(noise, (waveform.shape[0] // noise.shape[0] + 1,))
+        noise = noise[:waveform.shape[0]]
+
+        snr_db = np.random.uniform(*snr_range)
+        return self._mix_at_snr(waveform, noise, snr_db)
+
+    def _add_music(self, waveform: torch.Tensor, snr_range: Tuple[float, float]) -> torch.Tensor:
+        """Add single music clip at random SNR."""
+        if not self.musan_files['music']:
+            return waveform
+
+        music_file = np.random.choice(self.musan_files['music'])
+        music, sr = self._load_audio(music_file)
+
+        # Random segment
+        if music.shape[0] > waveform.shape[0]:
+            start = np.random.randint(0, music.shape[0] - waveform.shape[0])
+            music = music[start:start + waveform.shape[0]]
+        else:
+            music = torch.tile(music, (waveform.shape[0] // music.shape[0] + 1,))
+            music = music[:waveform.shape[0]]
+
+        snr_db = np.random.uniform(*snr_range)
+        return self._mix_at_snr(waveform, music, snr_db)
+
+    def _add_babble(self, waveform: torch.Tensor, num_speakers: Tuple[int, int],
+                    snr_range: Tuple[float, float]) -> torch.Tensor:
+        """Add multiple speech clips as babble at random SNR."""
+        if not self.musan_files['speech']:
+            return waveform
+
+        n_speakers = np.random.randint(*num_speakers)
+        babble = torch.zeros_like(waveform)
+
+        for _ in range(n_speakers):
+            speech_file = np.random.choice(self.musan_files['speech'])
+            speech, sr = self._load_audio(speech_file)
+
+            # Random segment
+            if speech.shape[0] > waveform.shape[0]:
+                start = np.random.randint(0, speech.shape[0] - waveform.shape[0])
+                speech = speech[start:start + waveform.shape[0]]
+            else:
+                speech = torch.tile(speech, (waveform.shape[0] // speech.shape[0] + 1,))
+                speech = speech[:waveform.shape[0]]
+
+            babble = babble + speech
+
+        # Normalize babble
+        babble = babble / (n_speakers + 1e-9)
+
+        snr_db = np.random.uniform(*snr_range)
+        return self._mix_at_snr(waveform, babble, snr_db)
+
+    def _load_audio(self, filepath: Path) -> Tuple[torch.Tensor, int]:
+        """Load audio with caching."""
+        filepath_str = str(filepath)
+        if filepath_str in self.cache:
+            return self.cache[filepath_str]
+
+        try:
+            waveform, sr = torchaudio.load(filepath_str)
+            if sr != self.sample_rate:
+                resampler = T.Resample(sr, self.sample_rate)
+                waveform = resampler(waveform)
+            waveform = waveform.squeeze(0)
+            self.cache[filepath_str] = (waveform, self.sample_rate)
+            return waveform, self.sample_rate
+        except Exception as e:
+            logger.warning(f"Failed to load {filepath}: {e}")
+            return torch.zeros(self.sample_rate), self.sample_rate
+
+    def _mix_at_snr(self, signal: torch.Tensor, noise: torch.Tensor,
+                    snr_db: float) -> torch.Tensor:
+        """Mix signal and noise at target SNR."""
+        signal_power = signal.pow(2).mean()
+        noise_power = noise.pow(2).mean()
+
+        if noise_power < 1e-9:
+            return signal
+
+        snr_linear = 10 ** (snr_db / 10)
+        noise_scale = (signal_power / (snr_linear * noise_power)).sqrt()
+        return signal + noise * noise_scale
+
+
+class RIRAugmenter(nn.Module):
+    """Room Impulse Response reverb augmentation."""
+
+    def __init__(self, rir_dir: Optional[str] = None, sample_rate: int = 16000):
+        super().__init__()
+        self.sample_rate = sample_rate
+        self.rir_files = []
+
+        if rir_dir:
+            self._load_rir_index(rir_dir)
+
+    def _load_rir_index(self, rir_dir: str) -> None:
+        """Index all RIR .wav files."""
+        rir_path = Path(rir_dir)
+        self.rir_files = sorted(rir_path.rglob('*.wav'))
+        logger.info(f"Indexed {len(self.rir_files)} RIR files")
+
+    def forward(self, waveform: torch.Tensor) -> torch.Tensor:
+        """Apply RIR convolution (reverb).
+
+        Args:
+            waveform: [samples]
+
+        Returns:
+            convolved: [samples + rir_len - 1]
+        """
+        if not self.rir_files:
+            return waveform
+
+        rir_file = np.random.choice(self.rir_files)
+        try:
+            rir, sr = torchaudio.load(str(rir_file))
+            if sr != self.sample_rate:
+                resampler = T.Resample(sr, self.sample_rate)
+                rir = resampler(rir)
+            rir = rir.squeeze(0)
+
+            # Normalize RIR
+            rir = rir / (rir.abs().max() + 1e-9)
+
+            # FFT convolution
+            waveform_np = waveform.numpy()
+            rir_np = rir.numpy()
+            convolved = np.convolve(waveform_np, rir_np, mode='full')
+            convolved = torch.from_numpy(convolved).float()
+
+            # Trim to original length + small margin
+            if convolved.shape[0] > waveform.shape[0]:
+                convolved = convolved[:waveform.shape[0]]
+
+            return convolved
+        except Exception as e:
+            logger.warning(f"RIR convolution failed: {e}")
+            return waveform
+
+
+class AugmentationPipeline(nn.Module):
+    """Chain augmentations with configurable probabilities."""
+
+    def __init__(self, musan_dir: Optional[str] = None,
+                 rir_dir: Optional[str] = None,
+                 sample_rate: int = 16000):
+        super().__init__()
+        self.speed_perturb_prob = 0.5
+        self.rir_prob = 0.3
+        self.musan_prob = 0.5
+
+        self.musan = MUSANAugmenter(musan_dir, sample_rate) if musan_dir else None
+        self.rir = RIRAugmenter(rir_dir, sample_rate) if rir_dir else None
+
+    def forward(self, waveform: torch.Tensor) -> torch.Tensor:
+        """Apply augmentation pipeline.
+
+        Args:
+            waveform: [samples]
+
+        Returns:
+            augmented: [samples]
+        """
+        # Speed perturbation (50% chance: 0.9x, 1.0x, 1.1x)
+        if np.random.random() < self.speed_perturb_prob:
+            speed = np.random.choice([0.9, 1.0, 1.1])
+            if speed != 1.0:
+                try:
+                    effects = [['speed', str(speed)], ['rate', str(16000)]]
+                    waveform_unsq = waveform.unsqueeze(0) if waveform.dim() == 1 else waveform
+                    waveform_aug, _ = torchaudio.sox_effects.apply_effects_tensor(
+                        waveform_unsq, 16000, effects
+                    )
+                    waveform = waveform_aug.squeeze(0)
+                except Exception:
+                    pass
+
+        # RIR reverb (30% chance)
+        if self.rir and np.random.random() < self.rir_prob:
+            waveform = self.rir(waveform)
+
+        # MUSAN augmentation (50% chance)
+        if self.musan and np.random.random() < self.musan_prob:
+            waveform = self.musan(waveform)
+
+        return waveform
 
 
 # ============================================================================
@@ -380,18 +648,25 @@ class EcapaTdnn(nn.Module):
 class AAMSoftmax(nn.Module):
     """Additive Angular Margin Softmax (ArcFace) for speaker verification.
 
+    Supports optional sub-centers per speaker class (K > 1) for richer decision boundaries.
+
     Unlike GE2E, this loss:
     - Has no learnable scale/bias that can drift to zero
     - Doesn't need speaker-balanced batches
     - Angular margin prevents embedding collapse
+    - Sub-center variant improves convergence (K=2 recommended)
     """
 
     def __init__(self, embedding_dim: int, num_speakers: int,
-                 scale: float = 30.0, margin: float = 0.2):
+                 scale: float = 30.0, margin: float = 0.2, sub_centers: int = 1):
         super().__init__()
         self.scale = scale
         self.margin = margin
-        self.weight = nn.Parameter(torch.FloatTensor(num_speakers, embedding_dim))
+        self.sub_centers = sub_centers
+        self.num_speakers = num_speakers
+
+        # Weight matrix: [num_speakers * sub_centers, embedding_dim]
+        self.weight = nn.Parameter(torch.FloatTensor(num_speakers * sub_centers, embedding_dim))
         nn.init.xavier_uniform_(self.weight)
 
         # Pre-compute trigonometric values
@@ -402,7 +677,7 @@ class AAMSoftmax(nn.Module):
         self.mm = math.sin(math.pi - margin) * margin
 
     def forward(self, embeddings: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        """Compute AAM-Softmax loss.
+        """Compute AAM-Softmax loss with optional sub-centers.
 
         Args:
             embeddings: [batch, embedding_dim]
@@ -415,7 +690,7 @@ class AAMSoftmax(nn.Module):
         embeddings = F.normalize(embeddings, p=2, dim=1)
         weight = F.normalize(self.weight, p=2, dim=1)
 
-        # Cosine similarity: [batch, num_speakers]
+        # Cosine similarity: [batch, num_speakers * sub_centers]
         cosine = F.linear(embeddings, weight)
         cosine = cosine.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
 
@@ -426,8 +701,21 @@ class AAMSoftmax(nn.Module):
         # When cos(theta) < cos(pi - m), use cosine - mm as fallback
         phi = torch.where(cosine > self.th, phi, cosine - self.mm)
 
+        # If using sub-centers, take max cosine over all centers per speaker
+        if self.sub_centers > 1:
+            # Reshape: [batch, num_speakers, sub_centers]
+            cosine_reshaped = cosine.reshape(-1, self.num_speakers, self.sub_centers)
+            phi_reshaped = phi.reshape(-1, self.num_speakers, self.sub_centers)
+
+            # Max over sub-centers: [batch, num_speakers]
+            cosine_max, max_indices = cosine_reshaped.max(dim=2)
+            phi_max = phi_reshaped.gather(2, max_indices.unsqueeze(2)).squeeze(2)
+
+            cosine = cosine_max
+            phi = phi_max
+
         # Only apply margin to target class
-        one_hot = F.one_hot(labels, num_classes=self.weight.size(0)).float()
+        one_hot = F.one_hot(labels, num_classes=self.num_speakers).float()
         logits = one_hot * phi + (1.0 - one_hot) * cosine
         logits = self.scale * logits
 
@@ -448,7 +736,8 @@ class LibriTTSRDataset(torch.utils.data.Dataset):
 
     def __init__(self, data_dir: str, sample_rate: int = 16000,
                  segment_duration: float = 3.0, mode: str = 'train',
-                 augment: bool = False):
+                 augment: bool = False, musan_dir: Optional[str] = None,
+                 rir_dir: Optional[str] = None):
         self.data_dir = Path(data_dir)
         self.sample_rate = sample_rate
         self.segment_samples = int(segment_duration * sample_rate)
@@ -456,6 +745,17 @@ class LibriTTSRDataset(torch.utils.data.Dataset):
         self.augment = augment
         self.files = []
         self.speaker_ids = {}
+
+        # Initialize augmentation pipeline
+        if augment:
+            self.aug_pipeline = AugmentationPipeline(
+                musan_dir=musan_dir,
+                rir_dir=rir_dir,
+                sample_rate=sample_rate
+            )
+        else:
+            self.aug_pipeline = None
+
         self._build_index()
 
     def _build_index(self):
@@ -544,10 +844,15 @@ class LibriTTSRDataset(torch.utils.data.Dataset):
                 waveform = waveform.mean(dim=0, keepdim=True)
             waveform = waveform.squeeze(0)
 
-            # Apply augmentation (training only)
+            # Apply augmentation pipeline (training only)
             if self.augment:
-                waveform = self._speed_perturb(waveform)
-                waveform = self._add_noise(waveform)
+                if self.aug_pipeline is not None:
+                    # Use new augmentation pipeline if available
+                    waveform = self.aug_pipeline(waveform)
+                else:
+                    # Fallback to old methods if pipeline not initialized
+                    waveform = self._speed_perturb(waveform)
+                    waveform = self._add_noise(waveform)
 
             # Extract fixed-length segment
             if waveform.shape[0] > self.segment_samples:
@@ -624,6 +929,90 @@ def compute_eer(embeddings: np.ndarray, labels: np.ndarray,
     return eer
 
 
+def compute_asnorm_eer(embeddings: np.ndarray, labels: np.ndarray,
+                       cohort_size: int = 300, n_pairs: int = 50000) -> float:
+    """Compute EER with Adaptive Score Normalization (AS-Norm).
+
+    AS-Norm normalizes scores using a cohort of similar speakers:
+    s_norm = (s - mean_cohort) / std_cohort
+
+    Args:
+        embeddings: [num_utterances, embedding_dim]
+        labels: [num_utterances]
+        cohort_size: number of cohort speakers
+        n_pairs: number of pairs to sample
+
+    Returns:
+        eer: Equal Error Rate with AS-Norm in [0, 1]
+    """
+    unique_labels = np.unique(labels)
+    label_to_indices = {l: np.where(labels == l)[0] for l in unique_labels}
+
+    # Filter speakers with at least 2 utterances
+    valid_speakers = [l for l in unique_labels if len(label_to_indices[l]) >= 2]
+
+    if len(valid_speakers) < 2:
+        logger.warning("Not enough speakers for AS-Norm EER computation")
+        return 1.0
+
+    # Build cohort from random sample of training speakers
+    cohort_sample_size = min(cohort_size, len(embeddings) // 3)
+    cohort_indices = np.random.choice(len(embeddings), cohort_sample_size, replace=False)
+    cohort_embeddings = embeddings[cohort_indices]
+
+    scores, targets = [], []
+
+    for _ in range(n_pairs):
+        # Positive pair (same speaker)
+        spk = np.random.choice(valid_speakers)
+        i, j = np.random.choice(label_to_indices[spk], 2, replace=False)
+        score_ij = float(np.dot(embeddings[i], embeddings[j]))
+
+        # Symmetric AS-Norm: normalize by both cohorts
+        cohort_i = np.dot(embeddings[i], cohort_embeddings.T)
+        cohort_j = np.dot(embeddings[j], cohort_embeddings.T)
+        mean_cohort = (cohort_i.mean() + cohort_j.mean()) / 2
+        std_cohort = (cohort_i.std() + cohort_j.std()) / 2 + 1e-9
+        score_norm = (score_ij - mean_cohort) / std_cohort
+
+        scores.append(float(score_norm))
+        targets.append(1)
+
+        # Negative pair (different speakers)
+        spk1, spk2 = np.random.choice(unique_labels, 2, replace=False)
+        i = np.random.choice(label_to_indices[spk1])
+        j = np.random.choice(label_to_indices[spk2])
+        score_ij = float(np.dot(embeddings[i], embeddings[j]))
+
+        # Symmetric AS-Norm
+        cohort_i = np.dot(embeddings[i], cohort_embeddings.T)
+        cohort_j = np.dot(embeddings[j], cohort_embeddings.T)
+        mean_cohort = (cohort_i.mean() + cohort_j.mean()) / 2
+        std_cohort = (cohort_i.std() + cohort_j.std()) / 2 + 1e-9
+        score_norm = (score_ij - mean_cohort) / std_cohort
+
+        scores.append(float(score_norm))
+        targets.append(0)
+
+    scores = np.array(scores)
+    targets = np.array(targets)
+
+    # Sweep thresholds to find EER
+    thresholds = np.linspace(scores.min(), scores.max(), 1000)
+    min_diff = float('inf')
+    eer = 1.0
+
+    for t in thresholds:
+        far = np.mean(scores[targets == 0] >= t)
+        frr = np.mean(scores[targets == 1] < t)
+        diff = abs(far - frr)
+        if diff < min_diff:
+            min_diff = diff
+            eer = (far + frr) / 2.0
+
+    return eer
+
+
 # ============================================================================
 # Training Functions
 # ============================================================================
@@ -689,17 +1078,20 @@ def train_epoch(model, mel_extractor, spec_augment, loader, criterion,
 
 
 @torch.no_grad()
-def validate_eer(model, mel_extractor, loader, device) -> float:
-    """Compute EER on validation set.
+def validate_eer(model, mel_extractor, loader, device, use_asnorm: bool = False,
+                 asnorm_cohort_size: int = 300) -> Tuple[float, Optional[float]]:
+    """Compute EER on validation set with optional AS-Norm.
 
     Args:
         model: ECAPA-TDNN encoder
         mel_extractor: mel spectrogram extractor
         loader: test data loader
         device: torch device
+        use_asnorm: whether to compute AS-Norm EER as well
+        asnorm_cohort_size: cohort size for AS-Norm
 
     Returns:
-        eer: Equal Error Rate
+        (eer, asnorm_eer): standard EER and optional AS-Norm EER
     """
     model.eval()
     mel_extractor.eval()
@@ -717,7 +1109,12 @@ def validate_eer(model, mel_extractor, loader, device) -> float:
     labels = np.concatenate(all_labels, axis=0)
 
     eer = compute_eer(embeddings, labels)
-    return eer
+    asnorm_eer = None
+
+    if use_asnorm:
+        asnorm_eer = compute_asnorm_eer(embeddings, labels, cohort_size=asnorm_cohort_size)
+
+    return eer, asnorm_eer
 
 
 # ============================================================================
@@ -814,6 +1211,35 @@ def main():
                         help='Checkpoint path to resume from')
     parser.add_argument('--num-workers', type=int, default=4,
                         help='DataLoader workers')
+
+    # New augmentation args
+    parser.add_argument('--musan-dir', type=str, default='',
+                        help='Path to MUSAN dataset (enables MUSAN augmentation)')
+    parser.add_argument('--rir-dir', type=str, default='',
+                        help='Path to RIR dataset (enables reverb augmentation)')
+    parser.add_argument('--crop-duration', type=float, default=3.0,
+                        help='Audio crop length in seconds')
+
+    # New sub-center ArcFace arg
+    parser.add_argument('--sub-centers', type=int, default=1,
+                        help='Sub-center count for ArcFace (default 1 = standard AAM-Softmax)')
+
+    # New fine-tuning args
+    parser.add_argument('--fine-tune', action='store_true',
+                        help='Enable large-margin fine-tuning mode')
+    parser.add_argument('--fine-tune-margin', type=float, default=0.5,
+                        help='Margin for fine-tuning')
+    parser.add_argument('--fine-tune-epochs', type=int, default=5,
+                        help='Epochs for fine-tuning')
+    parser.add_argument('--fine-tune-crop', type=float, default=6.0,
+                        help='Crop duration for fine-tuning in seconds')
+
+    # New AS-Norm arg
+    parser.add_argument('--asnorm', action='store_true',
+                        help='Enable AS-Norm for validation EER')
+    parser.add_argument('--asnorm-cohort-size', type=int, default=300,
+                        help='Cohort size for AS-Norm')
+
     args = parser.parse_args()
 
     # Set seeds for reproducibility
@@ -826,18 +1252,50 @@ def main():
 
     logger.info(f"Device: {device}")
     logger.info(f"Config: scale={args.scale}, margin={args.margin}, "
-                f"lr={args.lr}, bs={args.batch_size}")
+                f"lr={args.lr}, bs={args.batch_size}, crop={args.crop_duration}s")
+    if args.sub_centers > 1:
+        logger.info(f"Sub-center ArcFace: K={args.sub_centers}")
+    if musan_dir:
+        logger.info(f"MUSAN augmentation: {musan_dir}")
+    if rir_dir:
+        logger.info(f"RIR augmentation: {rir_dir}")
+    if args.asnorm:
+        logger.info(f"AS-Norm validation: cohort_size={args.asnorm_cohort_size}")
+
+    # ========================================================================
+    # Handle Fine-tuning Mode
+    # ========================================================================
+    if args.fine_tune:
+        if not args.resume:
+            logger.error("--fine-tune requires --resume checkpoint!")
+            sys.exit(1)
+        args.n_epochs = args.fine_tune_epochs
+        args.margin = args.fine_tune_margin
+        args.lr = args.lr * 0.1  # Reduce learning rate for fine-tuning
+        args.crop_duration = args.fine_tune_crop
+        logger.info(f"Fine-tuning mode: margin={args.margin}, lr={args.lr}, "
+                   f"crop={args.crop_duration}s, epochs={args.n_epochs}")
 
     # ========================================================================
     # Load Data
     # ========================================================================
     logger.info("Loading LibriTTS-R dataset...")
-    train_dataset = LibriTTSRDataset(args.data_dir, mode='train', augment=True)
+    musan_dir = args.musan_dir if args.musan_dir else None
+    rir_dir = args.rir_dir if args.rir_dir else None
+
+    train_dataset = LibriTTSRDataset(
+        args.data_dir, mode='train', augment=True,
+        segment_duration=args.crop_duration,
+        musan_dir=musan_dir, rir_dir=rir_dir
+    )
     if len(train_dataset) == 0:
         logger.error("No training data found!")
         sys.exit(1)
 
-    test_dataset = LibriTTSRDataset(args.data_dir, mode='test', augment=False)
+    test_dataset = LibriTTSRDataset(
+        args.data_dir, mode='test', augment=False,
+        segment_duration=args.crop_duration
+    )
     has_validation = len(test_dataset) > 0
     if not has_validation:
         logger.warning("No test data found — training without EER validation!")
@@ -894,7 +1352,8 @@ def main():
         model_config['embedding_dim'],
         num_speakers,
         scale=args.scale,
-        margin=args.margin
+        margin=args.margin,
+        sub_centers=args.sub_centers
     ).to(device)
 
     # ========================================================================
@@ -961,12 +1420,25 @@ def main():
         # Validation
         # ====================================================================
         if has_validation and (epoch + 1) % args.val_every == 0:
-            eer = validate_eer(model, mel_extractor, test_loader, device)
-            logger.info(f"Validation EER: {eer:.4f} ({eer*100:.2f}%) | "
-                       f"Best: {best_eer:.4f}")
+            eer, asnorm_eer = validate_eer(
+                model, mel_extractor, test_loader, device,
+                use_asnorm=args.asnorm,
+                asnorm_cohort_size=args.asnorm_cohort_size
+            )
 
-            if eer < best_eer:
-                best_eer = eer
+            if args.asnorm and asnorm_eer is not None:
+                logger.info(f"Validation EER: {eer:.4f} ({eer*100:.2f}%) | "
+                           f"AS-Norm EER: {asnorm_eer:.4f} ({asnorm_eer*100:.2f}%) | "
+                           f"Best: {best_eer:.4f}")
+                # Use AS-Norm EER for early stopping
+                eval_eer = asnorm_eer
+            else:
+                logger.info(f"Validation EER: {eer:.4f} ({eer*100:.2f}%) | "
+                           f"Best: {best_eer:.4f}")
+                eval_eer = eer
+
+            if eval_eer < best_eer:
+                best_eer = eval_eer
                 patience_counter = 0
 
                 checkpoint_path = output_dir / "speaker_encoder_best.pt"
