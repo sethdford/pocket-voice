@@ -138,24 +138,23 @@ int main(void) {
     {
         float audio[16000] = {0};
         float emb[256] = {0};
-        CHECK(speaker_encoder_extract(NULL, audio, 16000, emb) == -1,
+        CHECK(speaker_encoder_encode_audio(NULL, audio, 16000, 16000, emb) == -1,
               "extract with NULL encoder returns -1");
     }
 
-    /* Test 4: extract_from_wav with NULL encoder returns -1 */
+    /* Test 4: encode_mel with NULL encoder returns -1 */
     {
+        float mel[80 * 100] = {0};
         float emb[256] = {0};
-        CHECK(speaker_encoder_extract_from_wav(NULL, "/tmp/any.wav", emb) == -1,
-              "extract_from_wav with NULL encoder returns -1");
+        CHECK(speaker_encoder_encode_mel(NULL, mel, 100, emb) == -1,
+              "encode_mel with NULL encoder returns -1");
     }
 
-    /* Test 5: extract_from_wav with NULL path returns -1 */
+    /* Test 5: encode_mel with NULL mel returns -1 */
     {
         float emb[256] = {0};
-        /* Use dummy pointer; API checks !wav_path before dereferencing enc */
-        SpeakerEncoder *dummy = (SpeakerEncoder *)1;
-        CHECK(speaker_encoder_extract_from_wav(dummy, NULL, emb) == -1,
-              "extract_from_wav with NULL path returns -1");
+        CHECK(speaker_encoder_encode_mel(NULL, NULL, 100, emb) == -1,
+              "encode_mel with NULL encoder and NULL mel returns -1");
     }
 
     /* Test 6: destroy NULL is safe */
@@ -285,14 +284,14 @@ int main(void) {
     /* Test 7: extract with NULL audio returns -1 */
     {
         float emb[256] = {0};
-        CHECK(speaker_encoder_extract(NULL, NULL, 16000, emb) == -1,
+        CHECK(speaker_encoder_encode_audio(NULL, NULL, 16000, 16000, emb) == -1,
               "extract with NULL encoder and NULL audio returns -1");
     }
 
     /* Test 8: extract with NULL embedding_out returns -1 */
     {
         float audio[16000] = {0};
-        CHECK(speaker_encoder_extract(NULL, audio, 16000, NULL) == -1,
+        CHECK(speaker_encoder_encode_audio(NULL, audio, 16000, 16000, NULL) == -1,
               "extract with NULL encoder and NULL output returns -1");
     }
 
@@ -300,7 +299,7 @@ int main(void) {
     {
         float audio[1] = {0};
         float emb[256] = {0};
-        CHECK(speaker_encoder_extract(NULL, audio, 0, emb) == -1,
+        CHECK(speaker_encoder_encode_audio(NULL, audio, 0, 16000, emb) == -1,
               "extract with NULL encoder and 0 samples returns -1");
     }
 
@@ -311,13 +310,14 @@ int main(void) {
               "embedding_dim with NULL returns -1 or 0");
     }
 
-    /* Test 11: extract_from_wav with nonexistent WAV returns -1 */
+    /* Test 11: encode_audio with dummy encoder returns -1 */
     {
         float emb[256] = {0};
+        float audio[16000] = {0};
         SpeakerEncoder *dummy = (SpeakerEncoder *)1;
-        int rc = speaker_encoder_extract_from_wav(dummy, "/nonexistent/file.wav", emb);
-        /* Should return -1 (dummy is invalid but path check or load should fail) */
-        CHECK(rc == -1, "extract_from_wav with nonexistent WAV returns -1");
+        int rc = speaker_encoder_encode_audio(dummy, audio, 16000, 16000, emb);
+        /* Should return -1 (dummy is invalid, native encoder call should fail) */
+        CHECK(rc == -1, "encode_audio with dummy encoder returns -1");
     }
 
     /* Test 12: create with empty string path returns NULL */

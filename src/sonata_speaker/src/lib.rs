@@ -17,7 +17,7 @@ use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{linear, Conv1d, Conv1dConfig, Linear, Module, VarBuilder};
 use serde::Deserialize;
 use std::ffi::{c_char, c_float, c_int, c_void, CStr};
-use std::path::Path;
+
 
 fn panic_message(e: Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = e.downcast_ref::<&str>() {
@@ -103,7 +103,7 @@ struct SEBlock {
 
 impl SEBlock {
     fn load(channels: usize, se_channels: usize, vb: VarBuilder) -> Result<Self> {
-        let cfg = Conv1dConfig { padding: 0, stride: 1, dilation: 1, groups: 1 };
+        let cfg = Conv1dConfig { padding: 0, stride: 1, dilation: 1, groups: 1, cudnn_fwd_algo: None };
         let conv1 = candle_nn::conv1d(channels, se_channels, 1, cfg, vb.pp("conv1"))?;
         let conv2 = candle_nn::conv1d(se_channels, channels, 1, cfg, vb.pp("conv2"))?;
         Ok(Self { conv1, conv2 })
@@ -135,7 +135,7 @@ impl Res2NetBlock {
         let mut convs = Vec::new();
         let mut bns = Vec::new();
         let padding = (kernel_size - 1) * dilation / 2;
-        let cfg = Conv1dConfig { padding, stride: 1, dilation, groups: 1 };
+        let cfg = Conv1dConfig { padding, stride: 1, dilation, groups: 1, cudnn_fwd_algo: None };
         // scale-2 convolutions (first chunk is identity, last chunk is identity)
         for i in 0..(scale - 1) {
             let c = candle_nn::conv1d(width, width, kernel_size, cfg, vb.pp(format!("convs.{}", i)))?;
@@ -191,7 +191,7 @@ impl SERes2NetBlock {
     fn load(in_channels: usize, out_channels: usize, kernel_size: usize,
             dilation: usize, scale: usize, se_channels: usize,
             vb: VarBuilder) -> Result<Self> {
-        let cfg1 = Conv1dConfig { padding: 0, stride: 1, dilation: 1, groups: 1 };
+        let cfg1 = Conv1dConfig { padding: 0, stride: 1, dilation: 1, groups: 1, cudnn_fwd_algo: None };
         let conv1 = candle_nn::conv1d(in_channels, out_channels, 1, cfg1, vb.pp("conv1"))?;
         let bn1 = BatchNorm1d::load(out_channels, vb.pp("bn1"))?;
 
@@ -242,7 +242,7 @@ struct AttentiveStatisticsPooling {
 
 impl AttentiveStatisticsPooling {
     fn load(channels: usize, attention_channels: usize, vb: VarBuilder) -> Result<Self> {
-        let cfg = Conv1dConfig { padding: 0, stride: 1, dilation: 1, groups: 1 };
+        let cfg = Conv1dConfig { padding: 0, stride: 1, dilation: 1, groups: 1, cudnn_fwd_algo: None };
         let attention = candle_nn::conv1d(channels, attention_channels, 1, cfg,
                                            vb.pp("attention"))?;
         let bn = BatchNorm1d::load(attention_channels, vb.pp("bn"))?;
@@ -292,6 +292,7 @@ impl EcapaTdnn {
         let cfg = Conv1dConfig {
             padding, stride: 1,
             dilation: config.dilations[0], groups: 1,
+            cudnn_fwd_algo: None,
         };
         let input_conv = candle_nn::conv1d(config.n_mels, first_channels,
                                             config.kernel_sizes[0], cfg,
@@ -316,7 +317,7 @@ impl EcapaTdnn {
         // Multi-layer feature aggregation: cat all block outputs → project
         let last_ch = *config.channels.last().unwrap_or(&1536);
         let total_cat = config.channels.iter().sum::<usize>(); // input + all block outputs
-        let mfa_cfg = Conv1dConfig { padding: 0, stride: 1, dilation: 1, groups: 1 };
+        let mfa_cfg = Conv1dConfig { padding: 0, stride: 1, dilation: 1, groups: 1, cudnn_fwd_algo: None };
         let mfa_conv = candle_nn::conv1d(total_cat, last_ch, 1, mfa_cfg,
                                           vb.pp("mfa_conv"))?;
         let mfa_bn = BatchNorm1d::load(last_ch, vb.pp("mfa_bn"))?;
