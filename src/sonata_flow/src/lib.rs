@@ -17,6 +17,7 @@ use candle_nn::{embedding, linear, Embedding, Linear, Module, VarBuilder};
 use serde::Deserialize;
 use std::ffi::{c_char, c_float, c_int, c_void, CStr};
 use std::path::Path;
+use safetensors::SafeTensors;
 
 // ─── Quality Mode Constants ──────────────────────────────────────────────────
 const FLOW_QUALITY_FAST: i32 = 0;      // 4 steps, Euler only
@@ -1168,6 +1169,8 @@ struct SonataFlowEngine {
     n_steps: usize,
     use_heun: bool,
     quality_mode: i32,
+    first_chunk_steps: Option<usize>,
+    is_first_chunk: bool,
     last_phase: Vec<f32>,
     speaker_embedding_override: Option<Tensor>,
     emotion_id: Option<u32>,
@@ -1316,6 +1319,8 @@ pub extern "C" fn sonata_flow_create(
             n_steps,
             use_heun: false,
             quality_mode: FLOW_QUALITY_BALANCED,
+            first_chunk_steps: None,
+            is_first_chunk: true,
             last_phase: Vec::new(),
             speaker_embedding_override: None,
             emotion_id: None,
@@ -1384,6 +1389,28 @@ pub extern "C" fn sonata_flow_set_n_steps(engine: *mut c_void, n_steps: c_int) -
     0
 }
 
+/// Set step count for first chunk only (TTFA optimization). Use 3 for ~25% faster first chunk.
+/// Pass 0 to disable. Resets with sonata_flow_reset_phase (between utterances).
+#[no_mangle]
+pub extern "C" fn sonata_flow_set_first_chunk_steps(engine: *mut c_void, steps: c_int) {
+    if engine.is_null() { return; }
+    let eng = unsafe { &mut *(engine as *mut SonataFlowEngine) };
+    eng.first_chunk_steps = if steps > 0 && steps <= 64 {
+        Some(steps as usize)
+    } else {
+        None
+    };
+}
+
+/// Reset first-chunk flag so next generate() uses first_chunk_steps.
+/// Also called automatically by sonata_flow_reset_phase.
+#[no_mangle]
+pub extern "C" fn sonata_flow_reset_first_chunk(engine: *mut c_void) {
+    if engine.is_null() { return; }
+    let eng = unsafe { &mut *(engine as *mut SonataFlowEngine) };
+    eng.is_first_chunk = true;
+}
+
 /// Set quality mode (FAST=0, BALANCED=1, HIGH=2).
 /// Automatically configures n_steps and use_heun based on mode.
 /// Manual set_n_steps() calls override the quality mode.
@@ -1419,6 +1446,7 @@ pub extern "C" fn sonata_flow_reset_phase(engine: *mut c_void) {
     if engine.is_null() { return; }
     let eng = unsafe { &mut *(engine as *mut SonataFlowEngine) };
     eng.last_phase.clear();
+    eng.is_first_chunk = true;
 }
 
 /// Enable or disable causal (left-to-right) attention for streaming TTS.
@@ -1439,6 +1467,7 @@ pub extern "C" fn sonata_flow_reset_streaming(engine: *mut c_void) {
         *c = None;
     }
     eng.streaming_prefix_x_at_step.clear();
+    eng.is_first_chunk = true;
 }
 
 /// Generate one streaming chunk with causal attention. semantic_tokens must have length
@@ -1467,14 +1496,32 @@ pub extern "C" fn sonata_flow_generate_streaming_chunk(
                 .collect();
             let sem = Tensor::from_vec(tokens.clone(), (1, total_len), &eng.device)?;
 
-            let steps = eng.flow.config.n_steps_inference;
+            let steps = if offset == 0 && eng.is_first_chunk {
+                eng.is_first_chunk = false;
+                eng.first_chunk_steps.unwrap_or(eng.n_steps)
+            } else {
+                eng.n_steps
+            };
             let n_layers = eng.flow.blocks.len();
 
-            let prefix = if offset > 0 && eng.streaming_prefix_x_at_step.len() == steps {
+            // Extend prefix if first chunk used fewer steps (pad with last element)
+            if offset > 0 && !eng.streaming_prefix_x_at_step.is_empty()
+                && eng.streaming_prefix_x_at_step.len() < steps
+            {
+                let last = eng.streaming_prefix_x_at_step.last().cloned();
+                if let Some(expand) = last {
+                    while eng.streaming_prefix_x_at_step.len() < steps {
+                        eng.streaming_prefix_x_at_step.push(expand.clone());
+                    }
+                }
+            }
+
+            let prefix = if offset > 0 && eng.streaming_prefix_x_at_step.len() >= steps {
                 eng.streaming_prefix_x_at_step.as_mut_slice()
             } else {
                 &mut []
             };
+            let prefix = if prefix.len() > steps { &mut prefix[..steps] } else { prefix };
 
             let mut chunk_x: Vec<Tensor> = (0..steps)
                 .map(|_| Tensor::zeros((1, n_f, eng.flow.config.acoustic_dim), DType::F32, &eng.device))
@@ -1484,7 +1531,7 @@ pub extern "C" fn sonata_flow_generate_streaming_chunk(
             kv.resize(n_layers, None);
 
             let acoustic = eng.flow.sample_streaming_chunk(
-                &sem, offset, n_f, eng.n_steps, eng.use_heun, eng.cfg_scale, eng.dtype,
+                &sem, offset, n_f, steps, eng.use_heun, eng.cfg_scale, eng.dtype,
                 eng.speaker_id, eng.speaker_embedding_override.as_ref(),
                 eng.prosody_embedding_override.as_ref(),
                 eng.emotion_id, eng.prosody_features.as_ref(),
@@ -1592,8 +1639,14 @@ pub extern "C" fn sonata_flow_generate(
 
         let sem = Tensor::from_vec(tokens.clone(), (1, n_frames as usize), &eng.device)?;
         let spk_override = eng.speaker_embedding_override.as_ref();
+        let steps = if eng.is_first_chunk {
+            eng.is_first_chunk = false;
+            eng.first_chunk_steps.unwrap_or(eng.n_steps)
+        } else {
+            eng.n_steps
+        };
         let acoustic = eng.flow.sample(
-            &sem, eng.speaker_id, eng.cfg_scale, eng.n_steps,
+            &sem, eng.speaker_id, eng.cfg_scale, steps,
             eng.use_heun, eng.dtype, spk_override,
             eng.prosody_embedding_override.as_ref(),
             eng.emotion_id,
@@ -1765,8 +1818,14 @@ pub extern "C" fn sonata_flow_generate_audio(
 
         let sem = Tensor::from_vec(tokens.clone(), (1, n_frames as usize), &eng.device)?;
         let spk_override = eng.speaker_embedding_override.as_ref();
+        let steps = if eng.is_first_chunk {
+            eng.is_first_chunk = false;
+            eng.first_chunk_steps.unwrap_or(eng.n_steps)
+        } else {
+            eng.n_steps
+        };
         let acoustic = eng.flow.sample(
-            &sem, eng.speaker_id, eng.cfg_scale, eng.n_steps,
+            &sem, eng.speaker_id, eng.cfg_scale, steps,
             eng.use_heun, eng.dtype, spk_override,
             eng.prosody_embedding_override.as_ref(),
             eng.emotion_id,
@@ -3618,6 +3677,72 @@ struct FlowV3StreamingState {
     prev_overlap: Option<Tensor>,
 }
 
+/// Check if a safetensors checkpoint is a distilled model by examining metadata.
+/// Distilled checkpoints have a 'distilled: true' flag in the header.
+fn is_distilled_checkpoint(weights_path: &str) -> bool {
+    // Only read the header (first 8 bytes for size + header JSON), not the entire file
+    let file = match std::fs::File::open(weights_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("[sonata_flow_v3] Warning: could not open weights for distilled check: {}", e);
+            return false;
+        }
+    };
+    let file_size = match file.metadata() {
+        Ok(m) => m.len(),
+        Err(_) => return false,
+    };
+    // Safetensors header is typically <100KB. Cap read at 1MB to prevent OOM.
+    const MAX_HEADER_READ: u64 = 1_048_576;
+    if file_size > MAX_HEADER_READ {
+        // For very large files, read just enough for the header
+        use std::io::Read;
+        let mut reader = std::io::BufReader::new(file);
+        let mut header_size_buf = [0u8; 8];
+        if std::io::Read::read_exact(&mut reader, &mut header_size_buf).is_err() {
+            return false;
+        }
+        let header_size = u64::from_le_bytes(header_size_buf);
+        if header_size > MAX_HEADER_READ {
+            return false; // Header too large, skip
+        }
+        let mut header_buf = vec![0u8; header_size as usize];
+        if std::io::Read::read_exact(&mut reader, &mut header_buf).is_err() {
+            return false;
+        }
+        // Parse header JSON for "distilled" key
+        let header_str = match std::str::from_utf8(&header_buf) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        return header_str.contains("\"distilled\":true") ||
+               header_str.contains("\"distilled\": true") ||
+               header_str.contains("\"distilled\":\"true\"") ||
+               header_str.contains("\"distilled\": \"true\"");
+    }
+    // Small file: safe to read entirely, but enforce absolute size limit
+    const MAX_FILE_SIZE: u64 = 1_000_000_000;  // 1GB limit
+    if file_size > MAX_FILE_SIZE {
+        eprintln!("[is_distilled] File too large: {} bytes", file_size);
+        return false;
+    }
+    let data = match std::fs::read(weights_path) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    match SafeTensors::read_metadata(&data) {
+        Ok((_header_size, metadata)) => {
+            if let Some(meta_map) = metadata.metadata() {
+                if let Some(val) = meta_map.get("distilled") {
+                    return val.to_lowercase() == "true";
+                }
+            }
+            false
+        }
+        Err(_) => false,
+    }
+}
+
 struct SonataFlowV3Engine {
     model: SonataFlowV3Model,
     device: Device,
@@ -3634,6 +3759,8 @@ struct SonataFlowV3Engine {
     /// Per-phoneme/char durations from last generate() call, in mel frames.
     /// Frame duration = hop_length/sample_rate (typically 20ms at 24kHz).
     last_durations: Vec<f32>,
+    /// True if this is a distilled checkpoint (trained for 1-step generation)
+    is_distilled: bool,
 }
 
 #[no_mangle]
@@ -3661,6 +3788,9 @@ pub extern "C" fn sonata_flow_v3_create(
             let config: FlowV3Config = serde_json::from_str(&config_content)
                 .map_err(|e| candle_core::Error::Msg(format!("Config parse: {}", e)))?;
 
+            // Check if this is a distilled checkpoint
+            let is_distilled = is_distilled_checkpoint(weights_str);
+
             let vb = unsafe {
                 VarBuilder::from_mmaped_safetensors(&[weights_str], dtype, &device)?
             };
@@ -3673,16 +3803,24 @@ pub extern "C" fn sonata_flow_v3_create(
                 eprintln!("[sonata_flow_v3] Metal warmup: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
             }
 
-            eprintln!("[sonata_flow_v3] Loaded ({}L, mel_dim={}, steps={})",
-                      config.n_layers, config.mel_dim, config.n_steps_inference);
+            // Auto-configure n_steps and solver for distilled models
+            let (n_steps, use_heun) = if is_distilled {
+                eprintln!("[sonata_flow_v3] Distilled model detected: forcing n_steps=1, solver=Euler");
+                (1, false)
+            } else {
+                (config.n_steps_inference, false)
+            };
+
+            eprintln!("[sonata_flow_v3] Loaded ({}L, mel_dim={}, steps={}, distilled={})",
+                      config.n_layers, config.mel_dim, n_steps, is_distilled);
 
             Ok(SonataFlowV3Engine {
                 model,
                 device,
                 dtype,
-                n_steps: config.n_steps_inference,
+                n_steps,
                 cfg_scale: 2.0f32,
-                use_heun: false,
+                use_heun,
                 quality_mode: FLOW_QUALITY_BALANCED,
                 speaker_id: None,
                 ref_mel: None,
@@ -3690,6 +3828,7 @@ pub extern "C" fn sonata_flow_v3_create(
                 streaming_mode: 0,
                 streaming: None,
                 last_durations: Vec::new(),
+                is_distilled,
             })
         })()
     }));
@@ -3732,6 +3871,10 @@ pub extern "C" fn sonata_flow_v3_set_n_steps(engine: *mut c_void, steps: c_int) 
         return -1;
     }
     let eng = unsafe { &mut *(engine as *mut SonataFlowV3Engine) };
+    if eng.is_distilled {
+        eprintln!("[sonata_flow_v3] Warning: ignoring set_n_steps on distilled model (locked to 1)");
+        return 0;
+    }
     eng.n_steps = steps as usize;
     0
 }
@@ -3741,6 +3884,10 @@ pub extern "C" fn sonata_flow_v3_set_n_steps(engine: *mut c_void, steps: c_int) 
 pub extern "C" fn sonata_flow_v3_set_quality_mode(engine: *mut c_void, mode: c_int) -> c_int {
     if engine.is_null() { return -1; }
     let eng = unsafe { &mut *(engine as *mut SonataFlowV3Engine) };
+    if eng.is_distilled {
+        eprintln!("[sonata_flow_v3] Warning: ignoring set_quality_mode on distilled model (locked to 1-step Euler)");
+        return 0;
+    }
     match mode {
         0 => { // FAST
             eng.quality_mode = FLOW_QUALITY_FAST;
@@ -3778,6 +3925,15 @@ pub extern "C" fn sonata_flow_v3_set_solver(engine: *mut c_void, use_heun: c_int
     let eng = unsafe { &mut *(engine as *mut SonataFlowV3Engine) };
     eng.use_heun = use_heun != 0;
     0
+}
+
+/// Query if the loaded model is a distilled checkpoint (trained for 1-step generation).
+/// Returns 1 if distilled, 0 if not distilled, -1 on error.
+#[no_mangle]
+pub extern "C" fn sonata_flow_v3_is_distilled(engine: *mut c_void) -> c_int {
+    if engine.is_null() { return -1; }
+    let eng = unsafe { &*(engine as *mut SonataFlowV3Engine) };
+    if eng.is_distilled { 1 } else { 0 }
 }
 
 #[no_mangle]
@@ -4438,5 +4594,71 @@ pub extern "C" fn sonata_vocoder_generate(
             eprintln!("[sonata_vocoder] Generate error: {}", e);
             -1
         }
+    }
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    /// Test detection of distilled checkpoint flag in safetensors metadata.
+    /// Creates a minimal safetensors file with the 'distilled: true' metadata flag.
+    #[test]
+    fn test_distilled_checkpoint_detection() {
+        // Create a minimal safetensors file with distilled metadata
+        // Format: 8-byte header (size), followed by JSON metadata, then tensors
+        // The JSON header can optionally contain file-level metadata.
+        let header_with_meta = r#"{"__metadata__":{"distilled":"true"}}"#;
+        let size = header_with_meta.len() as u64;
+
+        let mut file = NamedTempFile::new().expect("Failed to create temp file");
+
+        // Write header (little-endian u64)
+        file.write_all(&size.to_le_bytes())
+            .expect("Failed to write size");
+        file.write_all(header_with_meta.as_bytes())
+            .expect("Failed to write header");
+        file.flush().expect("Failed to flush file");
+
+        let path = file.path().to_str().unwrap();
+        let is_distilled = is_distilled_checkpoint(path);
+
+        assert!(is_distilled, "Expected to detect distilled=true in metadata");
+    }
+
+    /// Test that non-distilled checkpoints return false.
+    #[test]
+    fn test_non_distilled_checkpoint() {
+        // Create a minimal safetensors file WITHOUT distilled metadata
+        let metadata_json = r#"{"some_other_field": "value"}"#;
+        let header_size = metadata_json.len() as u64;
+
+        let mut file = NamedTempFile::new().expect("Failed to create temp file");
+
+        // Write header (little-endian u64)
+        file.write_all(&header_size.to_le_bytes())
+            .expect("Failed to write header");
+
+        // Write metadata JSON
+        file.write_all(metadata_json.as_bytes())
+            .expect("Failed to write metadata");
+
+        file.flush().expect("Failed to flush file");
+
+        let path = file.path().to_str().unwrap();
+        let is_distilled = is_distilled_checkpoint(path);
+
+        assert!(!is_distilled, "Expected to NOT detect distilled flag");
+    }
+
+    /// Test graceful handling of invalid/missing files.
+    #[test]
+    fn test_distilled_detection_missing_file() {
+        let is_distilled = is_distilled_checkpoint("/nonexistent/path/to/weights.safetensors");
+        assert!(!is_distilled, "Expected false for missing file (graceful fallback)");
     }
 }
