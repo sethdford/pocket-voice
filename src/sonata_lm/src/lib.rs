@@ -21,6 +21,9 @@ use std::ffi::{CStr, c_char, c_float, c_int, c_void};
 use std::path::Path;
 use std::ptr;
 
+mod drafter;
+use drafter::GruDrafter;
+
 // ─── Config ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -239,7 +242,7 @@ impl GQAttention {
 
         // Fused SDPA Metal kernel — handles GQA natively (no repeat_kv needed)
         let scale = (self.head_dim as f32).powf(-0.5);
-        let out = candle_nn::ops::sdpa(&q, &k_full, &v_full, scale, 1.0)?;
+        let out = candle_nn::ops::sdpa(&q, &k_full, &v_full, None, false, scale, 1.0)?;
         let out = out.transpose(1, 2)?.contiguous()?.reshape((b, 1, ()))?;
         self.wo.forward(&out)
     }
@@ -388,7 +391,7 @@ impl CrossAttention {
 
         // Fused SDPA Metal kernel — handles GQA natively (no repeat_kv needed)
         let scale = (self.head_dim as f32).powf(-0.5);
-        let out = candle_nn::ops::sdpa(&q, &k, &v, scale, 1.0)?;
+        let out = candle_nn::ops::sdpa(&q, &k, &v, None, false, scale, 1.0)?;
         let out = out.transpose(1, 2)?.contiguous()?.reshape((b, t_a, ()))?;
         self.wo.forward(&out)
     }
@@ -467,7 +470,7 @@ impl TextEncoderBlock {
         let v = self.attn_v.forward(&h)?.reshape((b, t, self.n_heads, self.head_dim))?.transpose(1, 2)?;
         // Fused SDPA Metal kernel — bidirectional (no mask needed for text encoder)
         let scale = (self.head_dim as f32).powf(-0.5);
-        let out = candle_nn::ops::sdpa(&q, &k, &v, scale, 1.0)?;
+        let out = candle_nn::ops::sdpa(&q, &k, &v, None, false, scale, 1.0)?;
         let out = out.transpose(1, 2)?.contiguous()?.reshape((b, t, ()))?;
         let out = self.attn_o.forward(&out)?;
         let x = (x + out)?;
@@ -888,13 +891,16 @@ impl GruCell {
 
     /// x: (1, input_dim), h: (1, hidden_dim) -> h_new: (1, hidden_dim)
     fn forward(&self, x: &Tensor, h: &Tensor) -> Result<Tensor> {
-        let z = (self.w_z.forward(x)? + self.u_z.forward(h)?)?.sigmoid()?;
-        let r = (self.w_r.forward(x)? + self.u_r.forward(h)?)?.sigmoid()?;
+        let z = (self.w_z.forward(x)? + self.u_z.forward(h)?)?;
+        let z = candle_nn::Activation::Sigmoid.forward(&z)?;
+        let r = (self.w_r.forward(x)? + self.u_r.forward(h)?)?;
+        let r = candle_nn::Activation::Sigmoid.forward(&r)?;
         let rh = (&r * h)?;
-        let h_cand = (self.w_h.forward(x)? + self.u_h.forward(&rh)?)?.tanh()?;
+        let h_cand = (self.w_h.forward(x)? + self.u_h.forward(&rh)?)?;
+        let h_cand = h_cand.tanh()?;
         let ones = Tensor::ones_like(&z)?;
-        let one_minus_z = (ones - &z)?;
-        let h_new = (one_minus_z * h)? + (&z * &h_cand)?;
+        let one_minus_z = (&ones - &z)?;
+        let h_new = (((&one_minus_z * h)? + (&z * &h_cand)?))?;
         Ok(h_new)
     }
 
@@ -1021,7 +1027,7 @@ impl RnnDrafter {
 
         let output_head = linear_no_bias(cfg.gru_hidden, cfg.vocab_size, vb.pp("output_head"))?;
 
-        Ok(Self { hidden_proj, token_emb, gru_layers, output_head, cfg })
+        Ok(Self { hidden_proj, token_emb, gru_layers, output_head, cfg: cfg.clone() })
     }
 
     /// Generate tree of candidate tokens from the main model's hidden state.
@@ -1133,6 +1139,7 @@ struct LmEngine {
     consecutive_pad: usize,
     draft: Option<DraftModel>,
     rnn_drafter: Option<RnnDrafter>,
+    gru_drafter: Option<GruDrafter>,
     last_hidden: Option<Tensor>,
     speculate_k: usize,
     mask_cache: CausalMaskCache,
@@ -1264,6 +1271,7 @@ impl LmEngine {
             consecutive_pad: 0,
             draft: None,
             rnn_drafter: None,
+            gru_drafter: None,
             last_hidden: None,
             speculate_k: 5,
             mask_cache: CausalMaskCache::new(),
@@ -1606,6 +1614,165 @@ impl LmEngine {
         Ok(())
     }
 
+    fn load_gru_drafter(&mut self, weights_path: &str, config_path: Option<&str>)
+        -> std::result::Result<(), Box<dyn std::error::Error>>
+    {
+        let cfg: drafter::DrafterConfig = if let Some(cp) = config_path {
+            let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(cp)?)?;
+            drafter::DrafterConfig {
+                gru_hidden: raw.get("gru_hidden").and_then(|v| v.as_u64()).unwrap_or(512) as usize,
+                gru_layers: raw.get("gru_layers").and_then(|v| v.as_u64()).unwrap_or(2) as usize,
+                emb_dim: raw.get("emb_dim").and_then(|v| v.as_u64()).unwrap_or(256) as usize,
+                d_model: self.model.cfg.d_model,
+                vocab_size: self.model.cfg.semantic_vocab_size,
+            }
+        } else {
+            drafter::DrafterConfig {
+                gru_hidden: 512,
+                gru_layers: 2,
+                emb_dim: 256,
+                d_model: self.model.cfg.d_model,
+                vocab_size: self.model.cfg.semantic_vocab_size,
+            }
+        };
+
+        eprintln!("[sonata_lm] Loading GRU drafter (h={}, L={}, emb={})...",
+                  cfg.gru_hidden, cfg.gru_layers, cfg.emb_dim);
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&[weights_path], self.dtype, &self.device)?
+        };
+        let drafter = GruDrafter::load(&cfg, vb, &self.device, self.dtype)?;
+        let params: usize = cfg.d_model * cfg.gru_hidden  // hidden_proj
+            + cfg.vocab_size * cfg.emb_dim                  // token_emb
+            + cfg.gru_layers * (cfg.emb_dim * cfg.gru_hidden * 3 + cfg.gru_hidden * cfg.gru_hidden * 3) // rough GRU
+            + cfg.gru_hidden * cfg.vocab_size;              // output_head
+        eprintln!("[sonata_lm] GRU drafter loaded (~{:.1}M params)", params as f64 / 1e6);
+        self.gru_drafter = Some(drafter);
+        Ok(())
+    }
+
+    /// K-step linear speculative decoding using the GRU drafter.
+    /// 1. Run main model to get hidden state + first token
+    /// 2. GRU drafter generates K candidates from hidden state
+    /// 3. Verify candidates in one batch forward pass through main model
+    /// 4. Accept longest matching prefix + 1 token
+    fn gru_speculative_step(&mut self) -> std::result::Result<Vec<u32>, Box<dyn std::error::Error>> {
+        if self.done || self.step_count >= self.max_tokens {
+            self.done = true;
+            return Ok(Vec::new());
+        }
+
+        let drafter = match self.gru_drafter {
+            Some(ref d) if !self.model.use_cross_attention => d,
+            _ => {
+                let tok = self.step()?;
+                return Ok(tok.into_iter().collect());
+            }
+        };
+
+        let sem_tok = *self.semantic_tokens.last().unwrap_or(&1);
+        let pos = self.text_pos + self.step_count;
+
+        // Step 1: Run main model to get hidden state + logits for first token
+        let (logits, hidden) = self.model.forward_hidden(
+            sem_tok, pos, &mut self.kv_caches, None, self.text_encoding.as_ref(),
+        )?;
+        let logits = logits.squeeze(0)?.squeeze(0)?;
+        let mut logits_vec: Vec<f32> = logits.to_dtype(DType::F32)?.to_vec1()?;
+        Self::apply_repetition_penalty(&mut logits_vec, &self.recent_tokens, self.repetition_penalty);
+        let temp = if self.temperature > 1e-8 { self.temperature } else { 1e-8 };
+        let inv_temp = 1.0 / temp;
+        for v in logits_vec.iter_mut() { *v *= inv_temp; }
+        let first_token = Self::sample_top_k_top_p(&logits_vec, self.top_k, self.top_p,
+                                                    &mut self.sampling_buf);
+
+        if first_token == 2 {
+            self.done = true;
+            return Ok(Vec::new());
+        }
+
+        // Accept first token (always verified by main model)
+        self.semantic_tokens.push(first_token);
+        self.step_count += 1;
+        self.recent_tokens.push_back(first_token);
+        if self.recent_tokens.len() > 64 { self.recent_tokens.pop_front(); }
+        if first_token == 0 {
+            self.consecutive_pad += 1;
+            if self.consecutive_pad > 100 { self.done = true; return Ok(vec![first_token]); }
+        } else {
+            self.consecutive_pad = 0;
+        }
+
+        // Step 2: Generate K draft candidates using GRU drafter
+        let k = self.speculate_k;
+        let draft_tokens = drafter.draft(&hidden, first_token, k)?;
+
+        if draft_tokens.is_empty() {
+            self.last_hidden = Some(hidden);
+            return Ok(vec![first_token]);
+        }
+
+        // Step 3: Verify draft tokens in batch with main model
+        let base_pos = pos + 1;
+        let mut verify_toks = Vec::with_capacity(draft_tokens.len() + 1);
+        verify_toks.push(first_token);
+        verify_toks.extend_from_slice(&draft_tokens);
+
+        let tree_logits = self.model.forward_seq(
+            &verify_toks, base_pos - 1, &mut self.kv_caches,
+            &mut self.mask_cache,
+        )?;
+        let tree_logits = tree_logits.squeeze(0)?; // (seq_len, vocab)
+
+        // Step 4: Walk and accept the longest matching prefix
+        let mut accepted = vec![first_token];
+
+        for i in 0..draft_tokens.len() {
+            let pos_logits = tree_logits.i(i + 1)?;
+            let mut lv: Vec<f32> = pos_logits.to_dtype(DType::F32)?.to_vec1()?;
+            Self::apply_repetition_penalty(&mut lv, &self.recent_tokens, self.repetition_penalty);
+            for v in lv.iter_mut() { *v *= inv_temp; }
+            let verified = Self::sample_top_k_top_p(&lv, self.top_k, self.top_p,
+                                                     &mut self.sampling_buf);
+
+            let accepted_match = if self.coarse_grained {
+                Self::tokens_similar_static(self.similarity_groups.as_ref(), verified, draft_tokens[i])
+            } else {
+                verified == draft_tokens[i]
+            };
+
+            let accept_tok = if accepted_match && self.coarse_grained && verified != draft_tokens[i] {
+                draft_tokens[i]  // keep draft token for acoustic consistency
+            } else {
+                verified
+            };
+
+            accepted.push(accept_tok);
+
+            if accept_tok != draft_tokens[i] {
+                // Mismatch: accept longest prefix and stop
+                break;
+            }
+        }
+
+        // Update engine state with accepted tokens
+        for &tok in &accepted[1..] {
+            self.semantic_tokens.push(tok);
+            self.step_count += 1;
+            self.recent_tokens.push_back(tok);
+            if self.recent_tokens.len() > 64 { self.recent_tokens.pop_front(); }
+            if tok == 0 {
+                self.consecutive_pad += 1;
+                if self.consecutive_pad > 100 { self.done = true; break; }
+            } else {
+                self.consecutive_pad = 0;
+            }
+        }
+
+        self.last_hidden = Some(hidden);
+        Ok(accepted)
+    }
+
     /// Tree-based speculative decoding using the RNN drafter (ReDrafter approach).
     /// 1. Run main model to get hidden state + first token
     /// 2. RNN generates tree of candidates from hidden state
@@ -1789,9 +1956,12 @@ impl LmEngine {
             return Ok(Vec::new());
         }
 
-        // Prefer RNN drafter (tree-based) over transformer draft model (linear)
+        // Prefer RNN drafter (tree-based) over GRU drafter (linear) over transformer draft model
         if self.rnn_drafter.is_some() && !self.model.use_cross_attention {
             return self.tree_speculative_step();
+        }
+        if self.gru_drafter.is_some() && !self.model.use_cross_attention {
+            return self.gru_speculative_step();
         }
 
         let k = self.speculate_k;
@@ -2385,6 +2555,35 @@ pub extern "C" fn sonata_lm_load_rnn_drafter(
         Ok(v) => v,
         Err(e) => {
             eprintln!("[sonata_lm] panic in load_rnn_drafter: {}", panic_message(e));
+            -1
+        }
+    }
+}
+
+/// Load a GRU-based draft model for K-step linear speculative decoding.
+/// When loaded, speculative_step automatically uses GRU-based drafting.
+/// weights_path: path to safetensors file with GRU weights.
+/// config_path: optional JSON config (gru_hidden, gru_layers, emb_dim).
+/// Returns: 0 on success, -1 on error.
+#[no_mangle]
+pub extern "C" fn sonata_lm_load_gru_drafter(
+    engine: *mut c_void, weights_path: *const c_char, config_path: *const c_char,
+) -> c_int {
+    if engine.is_null() || weights_path.is_null() { return -1; }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let eng = unsafe { &mut *(engine as *mut LmEngine) };
+        let wp = unsafe { CStr::from_ptr(weights_path) }.to_str().unwrap_or("");
+        let cp = if config_path.is_null() { None }
+                 else { unsafe { CStr::from_ptr(config_path) }.to_str().ok() };
+        match eng.load_gru_drafter(wp, cp) {
+            Ok(()) => 0,
+            Err(e) => { eprintln!("[sonata_lm] gru_drafter: {}", e); -1 }
+        }
+    }));
+    match result {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[sonata_lm] panic in load_gru_drafter: {}", panic_message(e));
             -1
         }
     }
