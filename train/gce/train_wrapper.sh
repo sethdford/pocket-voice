@@ -248,8 +248,71 @@ while [ $RETRY -lt $MAX_RETRIES ]; do
             TRAIN_PID=$!
             ;;
 
+        drafter)
+            # Extract semantic token data for ReDrafter if not already done
+            DATA_TOKENS_DIR="$DATA_DIR/drafter_tokens"
+            if [ ! -d "$DATA_TOKENS_DIR" ] || [ -z "$(ls -A "$DATA_TOKENS_DIR" 2>/dev/null)" ]; then
+                echo "  Data tokens not found, extracting from LM..."
+
+                # Find LM checkpoint (required)
+                LM_CKPT=$(find_latest_checkpoint "$CKPT_DIR/lm_v4" "sonata_lm_best.pt")
+                if [ -z "$LM_CKPT" ]; then
+                    LM_CKPT=$(find_latest_checkpoint "$CKPT_DIR/lm_v4" "sonata_lm_step_*.pt")
+                fi
+                if [ -z "$LM_CKPT" ]; then
+                    echo "ERROR: No LM checkpoint found in $CKPT_DIR/lm_v4"
+                    exit 1
+                fi
+                echo "  Using LM checkpoint: $LM_CKPT"
+
+                # Run extraction with resume support
+                python3 -u extract_drafter_data.py \
+                    --lm-ckpt "$LM_CKPT" \
+                    --manifest "$DATA_DIR/libritts_r_full_manifest.jsonl" \
+                    --output "$DATA_TOKENS_DIR" \
+                    --device "$DEVICE" \
+                    --shard-size 5000 \
+                    --max-text-len 512 \
+                    --max-semantic-len 512 \
+                    --resume || true
+                echo "  Token extraction complete"
+            else
+                echo "  Reusing cached semantic tokens from $DATA_TOKENS_DIR"
+            fi
+
+            # Train ReDrafter
+            JOB_CKPT_DIR="$CKPT_DIR/drafter"
+            GCS_CKPT_DIR="$BUCKET/checkpoints/drafter"
+            mkdir -p "$JOB_CKPT_DIR"
+
+            # Find LM checkpoint for freezing
+            LM_CKPT=$(find_latest_checkpoint "$CKPT_DIR/lm_v4" "sonata_lm_best.pt")
+            if [ -z "$LM_CKPT" ]; then
+                echo "ERROR: No LM checkpoint found (needed to freeze base model)"
+                exit 1
+            fi
+
+            python3 -u train_drafter.py \
+                --base_model "$LM_CKPT" \
+                --data "$DATA_TOKENS_DIR" \
+                --output "$JOB_CKPT_DIR/rnn_drafter.safetensors" \
+                --gru_hidden 512 \
+                --gru_layers 2 \
+                --emb_dim 256 \
+                --tree_width 4 \
+                --tree_depth 3 \
+                --batch_size 8 \
+                --lr 1e-3 \
+                --weight_decay 0.01 \
+                --epochs 20 \
+                --max_len 512 \
+                --kd_weight 0.7 \
+                --kd_temperature 2.0 &
+            TRAIN_PID=$!
+            ;;
+
         *)
-            echo "ERROR: Unknown job '$JOB'. Use: flow_v3, vocoder, speaker_encoder, codec_12hz, distill_v3, semantic_eou"
+            echo "ERROR: Unknown job '$JOB'. Use: flow_v3, vocoder, speaker_encoder, codec_12hz, distill_v3, semantic_eou, drafter"
             exit 1
             ;;
     esac
