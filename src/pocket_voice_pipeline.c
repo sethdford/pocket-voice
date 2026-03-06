@@ -55,6 +55,15 @@
 #include "http_api.h"
 #include "backchannel.h"
 #include "audio_emotion.h"
+#include "vap_model.h"
+#include "mel_spectrogram.h"
+#include "audio_mixer.h"
+#include "intent_router.h"
+#include "streaming_llm.h"
+#include "neural_backchannel.h"
+#include "speculative_gen.h"
+#include "response_cache.h"
+#include "streaming_tts.h"
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * FFI declarations for the three native libraries
@@ -171,13 +180,16 @@ extern void pronunciation_dict_destroy(PronunciationDict *dict);
 extern int pronunciation_dict_apply(const PronunciationDict *dict, const char *text,
                                      char *out, int out_cap);
 
-/* --- Speaker encoder (ONNX) --- */
+/* --- Speaker encoder (ECAPA-TDNN for zero-shot voice cloning) --- */
 typedef struct SpeakerEncoder SpeakerEncoder;
-extern SpeakerEncoder *speaker_encoder_create(const char *model_path);
+extern SpeakerEncoder *speaker_encoder_create(const char *weights_path);
 extern void speaker_encoder_destroy(SpeakerEncoder *enc);
-extern int speaker_encoder_extract(SpeakerEncoder *enc, const float *audio, int n_samples, float *embedding_out);
+extern int speaker_encoder_encode_audio(SpeakerEncoder *enc, const float *pcm,
+                                        int n_samples, int sample_rate, float *out_emb);
+extern int speaker_encoder_encode_mel(SpeakerEncoder *enc, const float *mel,
+                                      int n_frames, float *out_emb);
 extern int speaker_encoder_embedding_dim(const SpeakerEncoder *enc);
-extern int speaker_encoder_extract_from_wav(SpeakerEncoder *enc, const char *wav_path, float *embedding_out);
+extern int speaker_encoder_sample_rate(const SpeakerEncoder *enc);
 
 /* --- Speaker encoder (native Rust/ECAPA-TDNN) --- */
 typedef void* SpeakerEncoderNative;
@@ -1181,6 +1193,7 @@ extern int   sonata_flow_samples_per_frame(void *engine);
 extern int   sonata_flow_set_speaker(void *engine, int speaker_id);
 extern int   sonata_flow_set_cfg_scale(void *engine, float scale);
 extern int   sonata_flow_set_n_steps(void *engine, int n_steps);
+extern void  sonata_flow_set_first_chunk_steps(void *engine, int steps);
 extern void  sonata_flow_reset_phase(void *engine);
 extern int   sonata_flow_set_causal(void *engine, int enable);
 extern void  sonata_flow_reset_streaming(void *engine);
@@ -1226,28 +1239,34 @@ extern int   sonata_flow_interpolate_speakers(void *engine, const float *emb_a,
 #define SONATA_HOP 480
 #define SONATA_N_BINS (SONATA_N_FFT / 2 + 1)
 #define SONATA_MAX_FRAMES 2000
-#define SONATA_FIRST_CHUNK 12
+#define SONATA_FIRST_CHUNK_DEFAULT 8  /* configurable via --sonata-first-chunk */
 #define SONATA_CHUNK_SIZE 50
 #define SONATA_CROSSFADE 480  /* 20ms at 24kHz — smooth spectral transition */
 
 /* ─── Flow Worker: GPU-threaded flow generation for pipeline parallelism ─── */
+/* Double-buffered: two slots allow LM to submit next chunk while Flow processes previous. */
 
 typedef struct {
+    struct {
+        int             tokens[SONATA_MAX_FRAMES];
+        int             n_tokens;
+        float          *result_audio;
+        int             result_len;
+        int             request_pending;  /* 1 = submitted, waiting for worker */
+        int             result_ready;     /* 1 = worker done, ready for collect */
+    } slots[2];
+    int             submit_slot;   /* next slot to submit to (0 or 1) */
+    int             collect_slot;  /* next slot to collect from (0 or 1) */
+    int             process_slot;  /* slot worker is processing / will process next */
+
     pthread_t       thread;
     pthread_mutex_t mutex;
     pthread_cond_t  request_cond;
     pthread_cond_t  done_cond;
+    pthread_cond_t  slot_free_cond;  /* signaled when a slot becomes free for submit */
 
     void           *flow_engine;
     SonataISTFT    *istft;
-
-    int             req_tokens[SONATA_MAX_FRAMES];
-    int             req_n_tokens;
-    int             req_pending;
-
-    float          *result_audio;
-    int             result_len;
-    int             result_ready;
 
     float           crossfade_tail[SONATA_CROSSFADE];
     int             has_crossfade;
@@ -1267,7 +1286,7 @@ static void *flow_worker_thread(void *arg) {
 
     while (!atomic_load(&fw->shutdown)) {
         pthread_mutex_lock(&fw->mutex);
-        while (!fw->req_pending && !atomic_load(&fw->shutdown)) {
+        while (!fw->slots[fw->process_slot].request_pending && !atomic_load(&fw->shutdown)) {
             pthread_cond_wait(&fw->request_cond, &fw->mutex);
         }
         if (atomic_load(&fw->shutdown)) {
@@ -1275,10 +1294,13 @@ static void *flow_worker_thread(void *arg) {
             break;
         }
 
-        int n = fw->req_n_tokens;
+        int slot = fw->process_slot;
+        int n = fw->slots[slot].n_tokens;
         int tokens[SONATA_MAX_FRAMES];
-        memcpy(tokens, fw->req_tokens, n * sizeof(int));
-        fw->req_pending = 0;
+        memcpy(tokens, fw->slots[slot].tokens, n * sizeof(int));
+        /* Do NOT clear request_pending here — keeps slot busy until collect clears it.
+           Otherwise main thread could submit to this slot while worker is still computing. */
+        float *result_audio = fw->slots[slot].result_audio;
         pthread_mutex_unlock(&fw->mutex);
 
         int total_audio = 0;
@@ -1287,20 +1309,20 @@ static void *flow_worker_thread(void *arg) {
             int max_samples = n * SONATA_HOP + 4096;
             if (max_samples > SONATA_BUF_CAPACITY) max_samples = SONATA_BUF_CAPACITY;
             total_audio = sonata_flow_generate_audio(fw->flow_engine, tokens, n,
-                                                      fw->result_audio, max_samples);
+                                                      result_audio, max_samples);
             if (total_audio > 0 && fw->has_crossfade) {
                 int cf = SONATA_CROSSFADE;
                 if (total_audio < cf) cf = total_audio;
                 for (int i = 0; i < cf; i++) {
                     float alpha = (float)i / (float)cf;
-                    fw->result_audio[i] =
+                    result_audio[i] =
                         fw->crossfade_tail[i] * (1.0f - alpha) +
-                        fw->result_audio[i] * alpha;
+                        result_audio[i] * alpha;
                 }
             }
             if (total_audio >= SONATA_CROSSFADE) {
                 memcpy(fw->crossfade_tail,
-                       &fw->result_audio[total_audio - SONATA_CROSSFADE],
+                       &result_audio[total_audio - SONATA_CROSSFADE],
                        SONATA_CROSSFADE * sizeof(float));
                 fw->has_crossfade = 1;
             }
@@ -1313,7 +1335,7 @@ static void *flow_worker_thread(void *arg) {
                     int ns = sonata_istft_decode_frame(fw->istft,
                         &mag_batch[t * bins], &phase_batch[t * bins], frame_audio);
                     if (ns > 0 && total_audio + ns < SONATA_BUF_CAPACITY) {
-                        memcpy(&fw->result_audio[total_audio], frame_audio, ns * sizeof(float));
+                        memcpy(&result_audio[total_audio], frame_audio, ns * sizeof(float));
                         total_audio += ns;
                     }
                 }
@@ -1322,14 +1344,14 @@ static void *flow_worker_thread(void *arg) {
                     if (total_audio < cf) cf = total_audio;
                     for (int i = 0; i < cf; i++) {
                         float alpha = (float)i / (float)cf;
-                        fw->result_audio[i] =
+                        result_audio[i] =
                             fw->crossfade_tail[i] * (1.0f - alpha) +
-                            fw->result_audio[i] * alpha;
+                            result_audio[i] * alpha;
                     }
                 }
                 if (total_audio >= SONATA_CROSSFADE) {
                     memcpy(fw->crossfade_tail,
-                           &fw->result_audio[total_audio - SONATA_CROSSFADE],
+                           &result_audio[total_audio - SONATA_CROSSFADE],
                            SONATA_CROSSFADE * sizeof(float));
                     fw->has_crossfade = 1;
                 }
@@ -1337,9 +1359,11 @@ static void *flow_worker_thread(void *arg) {
         }
 
         pthread_mutex_lock(&fw->mutex);
-        fw->result_len = total_audio;
-        fw->result_ready = 1;
+        fw->slots[slot].result_len = total_audio;
+        fw->slots[slot].result_ready = 1;
+        fw->process_slot = 1 - fw->process_slot;
         pthread_cond_signal(&fw->done_cond);
+        pthread_cond_signal(&fw->slot_free_cond);
         pthread_mutex_unlock(&fw->mutex);
     }
 
@@ -1354,22 +1378,30 @@ static FlowWorker *flow_worker_create(void *flow_engine, SonataISTFT *istft) {
 
     fw->flow_engine = flow_engine;
     fw->istft = istft;
-    fw->result_audio = (float *)calloc(SONATA_BUF_CAPACITY, sizeof(float));
-    if (!fw->result_audio) {
-        free(fw);
-        return NULL;
+    for (int i = 0; i < 2; i++) {
+        fw->slots[i].result_audio = (float *)calloc(SONATA_BUF_CAPACITY, sizeof(float));
+        if (!fw->slots[i].result_audio) {
+            for (int j = 0; j < i; j++) free(fw->slots[j].result_audio);
+            free(fw);
+            return NULL;
+        }
     }
     atomic_store(&fw->shutdown, 0);
     pthread_mutex_init(&fw->mutex, NULL);
     pthread_cond_init(&fw->request_cond, NULL);
     pthread_cond_init(&fw->done_cond, NULL);
+    pthread_cond_init(&fw->slot_free_cond, NULL);
 
     if (pthread_create(&fw->thread, NULL, flow_worker_thread, fw) != 0) {
-        free(fw->result_audio);
+        for (int i = 0; i < 2; i++) free(fw->slots[i].result_audio);
+        pthread_cond_destroy(&fw->slot_free_cond);
+        pthread_cond_destroy(&fw->done_cond);
+        pthread_cond_destroy(&fw->request_cond);
+        pthread_mutex_destroy(&fw->mutex);
         free(fw);
         return NULL;
     }
-    fprintf(stderr, "[sonata] Flow worker thread started for pipeline parallelism\n");
+    fprintf(stderr, "[sonata] Flow worker thread started for pipeline parallelism (double-buffered)\n");
     return fw;
 }
 
@@ -1381,24 +1413,37 @@ static void flow_worker_destroy(FlowWorker *fw) {
     pthread_mutex_destroy(&fw->mutex);
     pthread_cond_destroy(&fw->request_cond);
     pthread_cond_destroy(&fw->done_cond);
-    free(fw->result_audio);
+    pthread_cond_destroy(&fw->slot_free_cond);
+    for (int i = 0; i < 2; i++) free(fw->slots[i].result_audio);
     free(fw);
 }
 
-static void flow_worker_submit(FlowWorker *fw, const int *tokens, int n) {
+static int flow_worker_submit(FlowWorker *fw, const int *tokens, int n) {
     pthread_mutex_lock(&fw->mutex);
-    memcpy(fw->req_tokens, tokens, n * sizeof(int));
-    fw->req_n_tokens = n;
-    fw->req_pending = 1;
-    fw->result_ready = 0;
+    /* If target slot busy, caller must collect first. Return -1 so they can collect and retry. */
+    if (fw->slots[fw->submit_slot].request_pending || fw->slots[fw->submit_slot].result_ready) {
+        pthread_mutex_unlock(&fw->mutex);
+        return -1;
+    }
+    if (atomic_load(&fw->shutdown)) {
+        pthread_mutex_unlock(&fw->mutex);
+        return -1;
+    }
+    int slot = fw->submit_slot;
+    memcpy(fw->slots[slot].tokens, tokens, n * sizeof(int));
+    fw->slots[slot].n_tokens = n;
+    fw->slots[slot].request_pending = 1;
+    fw->slots[slot].result_ready = 0;
+    fw->submit_slot = 1 - fw->submit_slot;
     pthread_cond_signal(&fw->request_cond);
     pthread_mutex_unlock(&fw->mutex);
+    return 0;
 }
 
 static int flow_worker_collect(FlowWorker *fw, float *out_audio) {
     pthread_mutex_lock(&fw->mutex);
     int iterations = 0;
-    while (!fw->result_ready) {
+    while (!fw->slots[fw->collect_slot].result_ready) {
         if (atomic_load(&fw->shutdown)) {
             pthread_mutex_unlock(&fw->mutex);
             return 0;
@@ -1417,26 +1462,42 @@ static int flow_worker_collect(FlowWorker *fw, float *out_audio) {
         }
         pthread_cond_timedwait(&fw->done_cond, &fw->mutex, &ts);
     }
-    int len = fw->result_len;
+    int slot = fw->collect_slot;
+    int len = fw->slots[slot].result_len;
     if (len > SONATA_BUF_CAPACITY) len = SONATA_BUF_CAPACITY;
-    if (len > 0) memcpy(out_audio, fw->result_audio, len * sizeof(float));
-    fw->result_ready = 0;
+    if (len > 0) memcpy(out_audio, fw->slots[slot].result_audio, len * sizeof(float));
+    fw->slots[slot].result_ready = 0;
+    fw->slots[slot].request_pending = 0;  /* slot now idle for submit */
+    fw->collect_slot = 1 - fw->collect_slot;
+    pthread_cond_signal(&fw->slot_free_cond);
     pthread_mutex_unlock(&fw->mutex);
     return len;
 }
 
 static int flow_worker_try_collect(FlowWorker *fw, float *out_audio) {
     pthread_mutex_lock(&fw->mutex);
-    if (!fw->result_ready) {
+    if (!fw->slots[fw->collect_slot].result_ready) {
         pthread_mutex_unlock(&fw->mutex);
         return -1;
     }
-    int len = fw->result_len;
+    int slot = fw->collect_slot;
+    int len = fw->slots[slot].result_len;
     if (len > SONATA_BUF_CAPACITY) len = SONATA_BUF_CAPACITY;
-    if (len > 0) memcpy(out_audio, fw->result_audio, len * sizeof(float));
-    fw->result_ready = 0;
+    if (len > 0) memcpy(out_audio, fw->slots[slot].result_audio, len * sizeof(float));
+    fw->slots[slot].result_ready = 0;
+    fw->slots[slot].request_pending = 0;  /* slot now idle for submit */
+    fw->collect_slot = 1 - fw->collect_slot;
+    pthread_cond_signal(&fw->slot_free_cond);
     pthread_mutex_unlock(&fw->mutex);
     return len;
+}
+
+static int flow_worker_has_pending(FlowWorker *fw) {
+    pthread_mutex_lock(&fw->mutex);
+    int pending = fw->slots[0].request_pending || fw->slots[0].result_ready ||
+                  fw->slots[1].request_pending || fw->slots[1].result_ready;
+    pthread_mutex_unlock(&fw->mutex);
+    return pending;
 }
 
 typedef struct {
@@ -1463,17 +1524,23 @@ typedef struct {
     int             use_storm;       /* 1 = use SoundStorm instead of AR LM */
     int             tts_quality_mode;   /* 0=FAST, 1=BALANCED, 2=HIGH */
     int             tts_first_chunk_fast; /* 1 = FAST for first chunk, then revert */
+    int             first_chunk_size;   /* tokens for first TTS chunk (default 8) */
     float          *collect_buf;
     float          *mag_scratch;
     float          *phase_scratch;
     float           phase_accum[SONATA_N_BINS]; /* per-instance phase state for placeholder synth */
     pthread_mutex_t crossfade_mutex;            /* protects crossfade_tail access */
+    /* Voice cloning via speaker encoder */
+    SpeakerEncoder *speaker_encoder;            /* ECAPA-TDNN encoder for zero-shot voice cloning */
+    float          *cached_speaker_embedding;   /* Cached 256D embedding from reference audio */
+    int             has_speaker_embedding;      /* 1 if cached_speaker_embedding is valid */
 } SonataEngine;
 
 static SonataEngine *sonata_engine_create(
     const char *lm_weights, const char *lm_config, const char *tokenizer_path,
     const char *flow_weights, const char *flow_config,
-    const char *dec_weights, const char *dec_config
+    const char *dec_weights, const char *dec_config,
+    int first_chunk_size
 ) {
     SonataEngine *e = (SonataEngine *)calloc(1, sizeof(SonataEngine));
     if (!e) return NULL;
@@ -1543,10 +1610,28 @@ static SonataEngine *sonata_engine_create(
     e->done = 0;
     e->n_semantic_tokens = 0;
     e->is_first_chunk = 1;
+    e->first_chunk_size = (first_chunk_size > 0) ? first_chunk_size : SONATA_FIRST_CHUNK_DEFAULT;
     e->has_crossfade = 0;
     e->parallel_pending = 0;
     memset(e->phase_accum, 0, sizeof(e->phase_accum));
     pthread_mutex_init(&e->crossfade_mutex, NULL);
+
+    /* Allocate space for cached speaker embedding (256 dims, ECAPA-TDNN) */
+    e->cached_speaker_embedding = (float *)calloc(256, sizeof(float));
+    if (!e->cached_speaker_embedding) {
+        fprintf(stderr, "[sonata] Speaker embedding cache alloc failed\n");
+        free(e->audio_buf); free(e->collect_buf);
+        free(e->mag_scratch); free(e->phase_scratch);
+        if (e->flow_engine) sonata_flow_destroy(e->flow_engine);
+        if (e->lm_engine) sonata_lm_destroy(e->lm_engine);
+        if (e->istft) sonata_istft_destroy(e->istft);
+        if (e->tokenizer) spm_destroy(e->tokenizer);
+        pthread_mutex_destroy(&e->crossfade_mutex);
+        free(e);
+        return NULL;
+    }
+    e->speaker_encoder = NULL;  /* Lazy-loaded when first reference audio is set */
+    e->has_speaker_embedding = 0;
 
     if (e->flow_engine) {
         e->flow_worker = flow_worker_create(e->flow_engine, e->istft);
@@ -1707,12 +1792,17 @@ static int sonata_set_text_done(void *engine) {
 
 static void sonata_collect_parallel(SonataEngine *e) {
     if (!e->parallel_pending || !e->flow_worker) return;
-    int len = flow_worker_collect(e->flow_worker, e->collect_buf);
-    if (len > 0 && e->buf_write + len < SONATA_BUF_CAPACITY) {
-        memcpy(&e->audio_buf[e->buf_write], e->collect_buf, len * sizeof(float));
-        e->buf_write += len;
+    /* Drain all pending chunks (blocking) — final collect when TTS is done */
+    int len;
+    while (flow_worker_has_pending(e->flow_worker)) {
+        len = flow_worker_collect(e->flow_worker, e->collect_buf);
+        if (len <= 0) break;
+        if (e->buf_write + len < SONATA_BUF_CAPACITY) {
+            memcpy(&e->audio_buf[e->buf_write], e->collect_buf, len * sizeof(float));
+            e->buf_write += len;
+        }
     }
-    e->parallel_pending = 0;
+    e->parallel_pending = flow_worker_has_pending(e->flow_worker);
 }
 
 static void sonata_try_collect_parallel(SonataEngine *e) {
@@ -1723,7 +1813,7 @@ static void sonata_try_collect_parallel(SonataEngine *e) {
         memcpy(&e->audio_buf[e->buf_write], e->collect_buf, len * sizeof(float));
         e->buf_write += len;
     }
-    e->parallel_pending = 0;
+    e->parallel_pending = flow_worker_has_pending(e->flow_worker);
 }
 
 static void sonata_flush_chunk(SonataEngine *e) {
@@ -1736,8 +1826,24 @@ static void sonata_flush_chunk(SonataEngine *e) {
     }
 
     if (e->flow_worker) {
-        sonata_collect_parallel(e);
-        flow_worker_submit(e->flow_worker, e->semantic_tokens, n);
+        /* Drain any ready results (non-blocking) to free slots for double-buffering */
+        {
+            int len;
+            while ((len = flow_worker_try_collect(e->flow_worker, e->collect_buf)) >= 0) {
+                if (len > 0 && e->buf_write + len < SONATA_BUF_CAPACITY) {
+                    memcpy(&e->audio_buf[e->buf_write], e->collect_buf, len * sizeof(float));
+                    e->buf_write += len;
+                }
+            }
+        }
+        /* If submit fails (both slots busy), block on collect then retry */
+        while (flow_worker_submit(e->flow_worker, e->semantic_tokens, n) < 0) {
+            int len = flow_worker_collect(e->flow_worker, e->collect_buf);
+            if (len > 0 && e->buf_write + len < SONATA_BUF_CAPACITY) {
+                memcpy(&e->audio_buf[e->buf_write], e->collect_buf, len * sizeof(float));
+                e->buf_write += len;
+            }
+        }
         e->parallel_pending = 1;
     } else if (e->flow_engine && sonata_flow_decoder_type(e->flow_engine) == 1) {
         int chunk_start = e->buf_write;
@@ -1905,8 +2011,9 @@ static int sonata_step(void *engine) {
     int n = e->n_semantic_tokens;
     int last_tok = (n > 0) ? e->semantic_tokens[n - 1] : -1;
     int should_flush = 0;
-    int hard_max = e->is_first_chunk ? SONATA_FIRST_CHUNK : 80;
-    int soft_min = e->is_first_chunk ? SONATA_FIRST_CHUNK : 20;
+    int first = e->first_chunk_size;
+    int hard_max = e->is_first_chunk ? first : 80;
+    int soft_min = e->is_first_chunk ? first : 20;
 
     if (n >= hard_max) {
         should_flush = 1;
@@ -1926,11 +2033,11 @@ static int sonata_step(void *engine) {
             int prev = e->semantic_tokens[n-2];
             int curr = e->semantic_tokens[n-1];
             int delta = abs(curr - prev);
-            if (delta > 500 && n >= SONATA_FIRST_CHUNK + 5) {
+            if (delta > 500 && n >= first + 5) {
                 should_flush = 1;
             }
         }
-    } else if (e->is_first_chunk && n >= SONATA_FIRST_CHUNK) {
+    } else if (e->is_first_chunk && n >= first) {
         should_flush = 1;
     }
 
@@ -1997,6 +2104,82 @@ static int sonata_reset_engine(void *engine) {
     return 0;
 }
 
+/**
+ * sonata_set_reference_audio — Extract speaker embedding from reference audio
+ * and set it on the Flow model for zero-shot voice cloning.
+ *
+ * @param engine         SonataEngine pointer (void*)
+ * @param encoder_path   Path to speaker_encoder.safetensors weights
+ * @param pcm            Input audio samples (float32, mono)
+ * @param n_samples      Number of audio samples
+ * @param sample_rate    Sample rate of input audio (e.g., 16000, 24000)
+ * @return               0 on success, -1 on error
+ *
+ * This function:
+ * 1. Lazily creates speaker encoder if not already created
+ * 2. Extracts 256D embedding from the provided audio clip
+ * 3. Caches the embedding for reuse across multiple generations
+ * 4. Sets the embedding on the Flow model via sonata_flow_set_speaker_embedding
+ *
+ * Recommended: 3-10 seconds of clear speech for best voice characterization.
+ */
+static int sonata_set_reference_audio(void *engine, const char *encoder_path,
+                                       const float *pcm, int n_samples, int sample_rate) {
+    SonataEngine *e = (SonataEngine *)engine;
+    if (!e || !encoder_path || !pcm || n_samples <= 0) return -1;
+    if (!e->flow_engine) {
+        fprintf(stderr, "[sonata] Flow engine not available for voice cloning\n");
+        return -1;
+    }
+
+    /* Lazily create speaker encoder on first use */
+    if (!e->speaker_encoder) {
+        e->speaker_encoder = speaker_encoder_create(encoder_path);
+        if (!e->speaker_encoder) {
+            fprintf(stderr, "[sonata] Failed to create speaker encoder from %s\n", encoder_path);
+            return -1;
+        }
+        fprintf(stderr, "[sonata] Speaker encoder loaded (256D ECAPA-TDNN)\n");
+    }
+
+    /* Extract embedding from audio */
+    if (speaker_encoder_encode_audio(e->speaker_encoder, pcm, n_samples, sample_rate,
+                                      e->cached_speaker_embedding) != 0) {
+        fprintf(stderr, "[sonata] Failed to extract speaker embedding from audio\n");
+        return -1;
+    }
+    e->has_speaker_embedding = 1;
+
+    /* Set embedding on Flow model for voice-conditioned generation */
+    if (sonata_flow_set_speaker_embedding(e->flow_engine, e->cached_speaker_embedding, 256) != 0) {
+        fprintf(stderr, "[sonata] Failed to set speaker embedding on Flow model\n");
+        e->has_speaker_embedding = 0;
+        return -1;
+    }
+
+    fprintf(stderr, "[sonata] Speaker embedding set (%.1fs audio @ %dHz)\n",
+            (float)n_samples / sample_rate, sample_rate);
+    return 0;
+}
+
+/**
+ * sonata_clear_speaker — Reset Flow model to default voice (no speaker conditioning).
+ *
+ * @param engine  SonataEngine pointer (void*)
+ * @return        0 on success, -1 on error
+ *
+ * Clears the speaker embedding override in the Flow model.
+ */
+static int sonata_clear_speaker(void *engine) {
+    SonataEngine *e = (SonataEngine *)engine;
+    if (!e || !e->flow_engine) return -1;
+
+    sonata_flow_clear_speaker_embedding(e->flow_engine);
+    e->has_speaker_embedding = 0;
+    fprintf(stderr, "[sonata] Speaker embedding cleared (default voice)\n");
+    return 0;
+}
+
 static void sonata_destroy_engine(void *engine) {
     SonataEngine *e = (SonataEngine *)engine;
     if (!e) return;
@@ -2006,23 +2189,27 @@ static void sonata_destroy_engine(void *engine) {
     if (e->lm_engine) sonata_lm_destroy(e->lm_engine);
     if (e->istft) sonata_istft_destroy(e->istft);
     if (e->tokenizer) spm_destroy(e->tokenizer);
+    if (e->speaker_encoder) speaker_encoder_destroy(e->speaker_encoder);
     pthread_mutex_destroy(&e->crossfade_mutex);
     free(e->audio_buf);
     free(e->collect_buf);
     free(e->mag_scratch);
     free(e->phase_scratch);
+    free(e->cached_speaker_embedding);
     free(e);
 }
 
 static TtsInterface tts_create_sonata(
     const char *lm_weights, const char *lm_config, const char *tokenizer_path,
     const char *flow_weights, const char *flow_config,
-    const char *dec_weights, const char *dec_config
+    const char *dec_weights, const char *dec_config,
+    int first_chunk_size
 ) {
     TtsInterface iface = {0};
     iface.type = TTS_ENGINE_SONATA;
     iface.engine = sonata_engine_create(lm_weights, lm_config, tokenizer_path,
-                                         flow_weights, flow_config, dec_weights, dec_config);
+                                         flow_weights, flow_config, dec_weights, dec_config,
+                                         first_chunk_size);
     iface.sample_rate = 24000;
     iface.frame_size = SONATA_HOP;
     iface.set_text = sonata_set_text;
@@ -2046,7 +2233,13 @@ static TtsInterface tts_create_sonata(
  * via a uniform function-pointer interface, matching SttInterface/TtsInterface.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-typedef enum { LLM_ENGINE_CLAUDE, LLM_ENGINE_GEMINI, LLM_ENGINE_LOCAL } LLMEngineType;
+typedef enum {
+    LLM_ENGINE_CLAUDE,
+    LLM_ENGINE_GEMINI,
+    LLM_ENGINE_LOCAL,
+    LLM_ENGINE_GEMINI_LIVE,
+    LLM_ENGINE_OPENAI_REALTIME
+} LLMEngineType;
 
 typedef struct {
     void           *engine;
@@ -2548,12 +2741,15 @@ static void claude_commit_turn(ClaudeClient *c, const char *user_text) {
     }
 }
 
-/* Start a streaming request to Claude Messages API */
+/* Start a streaming request to Claude Messages API.
+ * Uses curl_easy_reset for connection reuse — avoids TCP+TLS handshake per turn. */
 static int claude_send(ClaudeClient *c, const char *user_text) {
     if (c->easy) {
         curl_multi_remove_handle(c->multi, c->easy);
-        curl_easy_cleanup(c->easy);
-        c->easy = NULL;
+        curl_easy_reset(c->easy);
+    } else {
+        c->easy = curl_easy_init();
+        if (!c->easy) return -1;
     }
     if (c->headers) {
         curl_slist_free_all(c->headers);
@@ -2570,9 +2766,6 @@ static int claude_send(ClaudeClient *c, const char *user_text) {
     c->request_active = true;
     c->response_accum_len = 0;
     if (c->response_accum) c->response_accum[0] = '\0';
-
-    c->easy = curl_easy_init();
-    if (!c->easy) return -1;
 
     /* Build JSON body */
     cJSON *body = cJSON_CreateObject();
@@ -2932,11 +3125,14 @@ static void gemini_commit_turn(GeminiClient *g, const char *user_text) {
     }
 }
 
+/* Uses curl_easy_reset for connection reuse — avoids TCP+TLS handshake per turn. */
 static int gemini_send(GeminiClient *g, const char *user_text) {
     if (g->easy) {
         curl_multi_remove_handle(g->multi, g->easy);
-        curl_easy_cleanup(g->easy);
-        g->easy = NULL;
+        curl_easy_reset(g->easy);
+    } else {
+        g->easy = curl_easy_init();
+        if (!g->easy) return -1;
     }
     if (g->headers) {
         curl_slist_free_all(g->headers);
@@ -2953,9 +3149,6 @@ static int gemini_send(GeminiClient *g, const char *user_text) {
     g->request_active = true;
     g->response_accum_len = 0;
     if (g->response_accum) g->response_accum[0] = '\0';
-
-    g->easy = curl_easy_init();
-    if (!g->easy) return -1;
 
     /* Build JSON body */
     cJSON *body = cJSON_CreateObject();
@@ -3219,6 +3412,33 @@ static LLMClient llm_create_local(LocalLLMClient *c) {
     };
 }
 
+/* Streaming LLM adapter (Gemini Live / OpenAI Realtime) */
+static int  llm_streaming_send(void *e, const char *t)   { return streaming_llm_send_text((StreamingLLM *)e, t); }
+static int  llm_streaming_poll(void *e, int ms)          { return streaming_llm_poll((StreamingLLM *)e, ms); }
+static const char *llm_streaming_peek(void *e, int *n)   { return streaming_llm_peek_text((StreamingLLM *)e, n); }
+static void llm_streaming_consume(void *e, int n)        { streaming_llm_consume_text((StreamingLLM *)e, n); }
+static void llm_streaming_cancel(void *e)                { streaming_llm_cancel((StreamingLLM *)e); }
+static void llm_streaming_commit(void *e, const char *t) { streaming_llm_commit_turn((StreamingLLM *)e, t); }
+static bool llm_streaming_done(void *e)                  { return streaming_llm_is_done((StreamingLLM *)e); }
+static bool llm_streaming_error(void *e)                 { return streaming_llm_has_error((StreamingLLM *)e); }
+static void llm_streaming_cleanup(void *e)               { streaming_llm_disconnect((StreamingLLM *)e); }
+
+static LLMClient llm_create_streaming(StreamingLLM *sllm, LLMEngineType type) {
+    return (LLMClient){
+        .engine           = sllm,
+        .type             = type,
+        .send             = llm_streaming_send,
+        .poll             = llm_streaming_poll,
+        .peek_tokens      = llm_streaming_peek,
+        .consume_tokens   = llm_streaming_consume,
+        .cancel           = llm_streaming_cancel,
+        .commit_turn      = llm_streaming_commit,
+        .is_response_done = llm_streaming_done,
+        .has_error        = llm_streaming_error,
+        .cleanup          = llm_streaming_cleanup,
+    };
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * Prosody-Aware System Prompt
  *
@@ -3310,6 +3530,7 @@ typedef struct {
     const char *sonata_draft_weights; /* Draft model for speculative decoding (optional) */
     const char *sonata_draft_config;  /* Draft model config (optional) */
     int         sonata_speculate_k;   /* Tokens to speculate per step (default: 5) */
+    int         sonata_first_chunk;   /* First TTS chunk token count (default: 8) */
     int         sonata_self_draft;    /* 1 = reuse LM weights as 4-layer draft model */
     const char *sonata_ref_wav;       /* Reference WAV for voice cloning (optional) */
 
@@ -3350,6 +3571,26 @@ typedef struct {
 
     /* Backchannel generation (scaffolding) */
     int         backchannel;
+
+    /* VAP (Voice Activity Projection) for full-duplex turn-taking */
+    const char *vap_model_path;   /* --vap-model: path to .vap weights */
+    int         vap_enabled;      /* --vap: enable VAP-based turn-taking */
+    int         neural_barge_in;  /* --neural-barge-in: use VAP for barge-in (default when VAP loaded) */
+
+    /* Intent router: fast path / backchannel routing */
+    const char *intent_router_path;
+    int         intent_router_enabled;
+
+    /* Response cache (pre-synthesized fast-path audio) */
+    const char *response_cache_path;
+
+    /* Streaming TTS (token-by-token with rollback) */
+    int         streaming_tts_enabled;
+
+    /* Speculative generation (default when VAP loaded) */
+    int         speculative_enabled;
+    int         speculative_max_drafts;
+    int         speculative_min_words;
     float pitch;        /* Pitch multiplier (1.0 = no change) */
     float volume_db;    /* Volume in dB (0.0 = no change) */
     int   hw_resample;  /* 1 = AudioConverter, 0 = FIR fallback */
@@ -3363,6 +3604,7 @@ typedef struct {
     /* Sentence buffering */
     int   sentbuf_mode;     /* SENTBUF_MODE_SENTENCE or SENTBUF_MODE_SPECULATIVE */
     int   sentbuf_min_words; /* Min words for speculative mode clause flush */
+    int   eager_words;      /* Eager sub-sentence flush threshold (default: 4) */
 
     /* Remote microphone (phone-as-mic via WebSocket) */
     int   remote_mic;       /* 1 = start web remote mic server */
@@ -3423,6 +3665,7 @@ static PipelineConfig default_config(void) {
         .sonata_draft_weights = NULL,
         .sonata_draft_config  = NULL,
         .sonata_speculate_k   = 5,
+        .sonata_first_chunk   = 8,
         .sonata_self_draft    = 0,
         .sonata_ref_wav       = NULL,
         .sonata_storm_weights = NULL,
@@ -3449,6 +3692,7 @@ static PipelineConfig default_config(void) {
         .opus_output   = NULL,
         .sentbuf_mode  = SENTBUF_MODE_SPECULATIVE,
         .sentbuf_min_words = 5,
+        .eager_words   = 4,
         .remote_mic    = 0,
         .remote_port   = 8088,
         .config_file   = NULL,
@@ -3461,6 +3705,16 @@ static PipelineConfig default_config(void) {
         .diarizer_threshold = 0.5f,
         .diarizer_max_speakers = 4,
         .backchannel        = 0,
+        .vap_model_path     = NULL,
+        .vap_enabled        = 0,
+        .neural_barge_in    = 0,
+        .intent_router_path  = NULL,
+        .intent_router_enabled = 0,
+        .response_cache_path = NULL,
+        .streaming_tts_enabled = 0,
+        .speculative_enabled = 0,
+        .speculative_max_drafts = 2,
+        .speculative_min_words  = 3,
     };
 }
 
@@ -3541,6 +3795,7 @@ static void load_config_file(PipelineConfig *cfg, const char *path) {
     /* TTS */
     cJSON *tts = cJSON_GetObjectItemCaseSensitive(root, "tts");
     if (tts) {
+        cfg->streaming_tts_enabled = json_bool(tts, "streaming", cfg->streaming_tts_enabled);
         const char *eng = json_str(tts, "engine", NULL);
         if (eng) {
             if (strcmp(eng, "sonata") == 0) cfg->tts_engine = TTS_ENGINE_SONATA;
@@ -3575,6 +3830,7 @@ static void load_config_file(PipelineConfig *cfg, const char *path) {
         cfg->sonata_flow_steps = json_int(sonata, "flow_steps", cfg->sonata_flow_steps);
         cfg->sonata_heun = json_bool(sonata, "heun", cfg->sonata_heun);
         cfg->sonata_speculate_k = json_int(sonata, "speculate_k", cfg->sonata_speculate_k);
+        cfg->sonata_first_chunk = json_int(sonata, "first_chunk", cfg->sonata_first_chunk);
         cfg->sonata_self_draft = json_bool(sonata, "self_draft", cfg->sonata_self_draft);
         cfg->sonata_draft_weights = json_str(sonata, "draft_weights", cfg->sonata_draft_weights);
         cfg->sonata_draft_config = json_str(sonata, "draft_config", cfg->sonata_draft_config);
@@ -3609,6 +3865,8 @@ static void load_config_file(PipelineConfig *cfg, const char *path) {
             if (strcmp(eng, "claude") == 0) cfg->llm_engine = LLM_ENGINE_CLAUDE;
             else if (strcmp(eng, "gemini") == 0) cfg->llm_engine = LLM_ENGINE_GEMINI;
             else if (strcmp(eng, "local") == 0) cfg->llm_engine = LLM_ENGINE_LOCAL;
+            else if (strcmp(eng, "gemini-live") == 0) cfg->llm_engine = LLM_ENGINE_GEMINI_LIVE;
+            else if (strcmp(eng, "openai-rt") == 0) cfg->llm_engine = LLM_ENGINE_OPENAI_REALTIME;
         }
         cfg->llm_model = json_str(llm, "model", cfg->llm_model);
         cfg->system_prompt = json_str(llm, "system_prompt", cfg->system_prompt);
@@ -3627,6 +3885,35 @@ static void load_config_file(PipelineConfig *cfg, const char *path) {
         cfg->spatial = json_bool(audio, "spatial", cfg->spatial);
         cfg->spatial_az = json_float(audio, "spatial_azimuth", cfg->spatial_az);
         cfg->hw_resample = json_bool(audio, "hw_resample", cfg->hw_resample);
+        cfg->eager_words = json_int(audio, "eager_words", cfg->eager_words);
+    }
+
+    /* VAP (full-duplex turn-taking) */
+    cJSON *vap = cJSON_GetObjectItemCaseSensitive(root, "vap");
+    if (vap) {
+        cfg->vap_model_path = json_str(vap, "model", cfg->vap_model_path);
+        cfg->vap_enabled = json_bool(vap, "enabled", cfg->vap_enabled);
+        cfg->neural_barge_in = json_bool(vap, "neural_barge_in", cfg->neural_barge_in);
+    }
+
+    /* Intent router */
+    cJSON *ir = cJSON_GetObjectItemCaseSensitive(root, "intent_router");
+    if (ir) {
+        cfg->intent_router_path = json_str(ir, "path", cfg->intent_router_path);
+        cfg->intent_router_enabled = json_bool(ir, "enabled", cfg->intent_router_enabled);
+    }
+
+    /* Response cache */
+    cJSON *rcache = cJSON_GetObjectItemCaseSensitive(root, "response_cache");
+    if (rcache)
+        cfg->response_cache_path = json_str(rcache, "path", cfg->response_cache_path);
+
+    /* Speculative generation */
+    cJSON *spec = cJSON_GetObjectItemCaseSensitive(root, "speculative");
+    if (spec) {
+        cfg->speculative_enabled = json_bool(spec, "enabled", cfg->speculative_enabled);
+        cfg->speculative_max_drafts = json_int(spec, "max_drafts", cfg->speculative_max_drafts);
+        cfg->speculative_min_words = json_int(spec, "min_words", cfg->speculative_min_words);
     }
 
     /* Server */
@@ -3705,6 +3992,31 @@ typedef struct {
     /* Backchannel generation: "mhm", "yeah" during user speech */
     BackchannelGen    *backchannel;
 
+    /* ── Full-duplex modules (optional) ── */
+    void              *audio_mixer;     /* AudioMixer* */
+    StreamingLLM     *streaming_llm;    /* StreamingLLM* for Gemini Live / OpenAI Realtime */
+    void              *intent_router;   /* IntentRouter* */
+    void              *neural_backchannel; /* NeuralBackchannel* */
+    void              *spec_gen;        /* SpeculativeGen* */
+    ResponseCache    *response_cache;   /* Pre-synthesized fast-path audio */
+    StreamingTTS     *streaming_tts;    /* Streaming TTS with rollback */
+    int               use_streaming_tts; /* 1 = token-by-token streaming TTS */
+    int               streaming_token_idx; /* Token index for streaming TTS */
+    int               streaming_committed_samples; /* Samples sent to speaker (for commit) */
+    void              *tts_ref;         /* TtsInterface* for callbacks (set each step) */
+
+    /* ── VAP (full-duplex turn-taking) ── */
+    VAPModel          *vap_model;       /* NULL if not loaded */
+    MelSpectrogram    *vap_mel_user;    /* 24kHz mel for capture (user) */
+    MelSpectrogram    *vap_mel_system;   /* 24kHz mel for TTS (system) */
+    float              vap_system_mel[80]; /* Latest system mel frame */
+    float              vap_user_mel[80];   /* Latest user mel frame */
+    int                vap_mel_system_samples; /* Accumulator for 20ms frame */
+    float              vap_mel_system_buf[960]; /* 20ms at 24kHz */
+    VAPPrediction      vap_last_pred;    /* Last VAP prediction (for barge-in/backchannel) */
+    int                vap_enabled;
+    int                neural_barge_in;
+
     /* Audio-based emotion detection from user's voice */
     AudioEmotionDetector *audio_emotion;
     char               audio_emotion_desc[256]; /* Cached description for LLM prompt */
@@ -3742,6 +4054,11 @@ typedef struct {
     AudioWatermark    *watermark;
     int                enable_watermark;
 } AudioPostProcessor;
+
+/* Forward decls for TTS synthesis callbacks (defined before process_segment) */
+static int pipeline_tts_synthesize(void *ctx, const char *text, float *out_pcm, int max_samples);
+static int pipeline_tts_synthesize_chunk(void *ctx, const char *text, int text_len,
+                                         float *out_pcm, int max_samples);
 
 static AudioPostProcessor *postproc_create(PipelineConfig *cfg) {
     AudioPostProcessor *pp = (AudioPostProcessor *)calloc(1, sizeof(AudioPostProcessor));
@@ -3852,6 +4169,89 @@ static AudioPostProcessor *postproc_create(PipelineConfig *cfg) {
     pp->streaming_overlap = 0;
     pp->overlap_word_count = 0;
 
+    /* ── Full-duplex modules ── */
+
+    /* Audio mixer: multi-source blend for TTS + backchannel */
+    {
+        AudioMixerConfig mix_cfg = {
+            .sample_rate = 24000,
+            .block_size = 480,
+            .ducking_gain = 0.3f,
+            .crossfade_samples = 240,
+        };
+        pp->audio_mixer = audio_mixer_create(&mix_cfg);
+    }
+
+    /* Intent router: fast path / backchannel routing */
+    if (cfg->intent_router_enabled) {
+        if (cfg->intent_router_path && cfg->intent_router_path[0])
+            pp->intent_router = intent_router_create(cfg->intent_router_path);
+        else
+            pp->intent_router = intent_router_create_default();
+        if (pp->intent_router)
+            fprintf(stderr, "[intent_router] Enabled\n");
+    }
+
+    /* Neural backchannel (created with NULL TTS; set later if available) */
+    {
+        NBCConfig nbc_cfg = {
+            .sample_rate = 24000,
+            .max_duration_ms = 500,
+            .cache_enabled = 1,
+        };
+        pp->neural_backchannel = nbc_create(&nbc_cfg, NULL);
+    }
+
+    /* Speculative generation (enabled by default when VAP loaded) */
+    if (cfg->speculative_enabled || (cfg->vap_model_path && cfg->vap_enabled)) {
+        SpeculativeConfig spec_cfg = {
+            .max_drafts = cfg->speculative_max_drafts,
+            .min_words_to_spec = cfg->speculative_min_words,
+            .vap_eou_threshold = 0.4f,
+            .vap_turn_threshold = 0.3f,
+            .commit_threshold = 0.8f,
+            .cancel_threshold = 0.2f,
+            .max_spec_tokens = 30,
+        };
+        pp->spec_gen = speculative_gen_create(&spec_cfg);
+        if (pp->spec_gen)
+            fprintf(stderr, "[speculative] Enabled (max_drafts=%d)\n", cfg->speculative_max_drafts);
+    }
+
+    /* Response cache (pre-synthesized fast-path audio) */
+    if (cfg->response_cache_path && cfg->response_cache_path[0]) {
+        ResponseCacheConfig rcfg = {
+            .sample_rate = 24000,
+            .max_variants = 3,
+            .max_audio_seconds = 3,
+        };
+        pp->response_cache = response_cache_create(&rcfg);
+        if (pp->response_cache) {
+            if (response_cache_load(pp->response_cache, cfg->response_cache_path) != 0) {
+                /* No cached file, will need to warm after TTS is ready */
+            }
+            fprintf(stderr, "[response_cache] Enabled (path=%s)\n", cfg->response_cache_path);
+        }
+    }
+
+    /* Streaming TTS (token-by-token with rollback) */
+    if (cfg->streaming_tts_enabled) {
+        StreamingTTSConfig stcfg = {
+            .sample_rate = 24000,
+            .min_tokens_to_start = cfg->eager_words > 0 ? cfg->eager_words : 4,
+            .lookahead_tokens = 2,
+            .commit_latency_ms = 100.0f,
+            .rollback_enabled = 1,
+            .crossfade_samples = 240,
+        };
+        pp->streaming_tts = streaming_tts_create(&stcfg);
+        if (pp->streaming_tts) {
+            streaming_tts_set_synthesizer(pp->streaming_tts, pipeline_tts_synthesize_chunk, pp);
+            pp->use_streaming_tts = 1;
+            fprintf(stderr, "[streaming_tts] Enabled\n");
+        }
+    }
+
     /* ── Human-like quality modules ── */
 
     /* Backchannel generator for active listening */
@@ -3897,6 +4297,51 @@ static AudioPostProcessor *postproc_create(PipelineConfig *cfg) {
     pp->last_tts_emotion = EMOTION_NEUTRAL;
     pp->barge_in_energy_scale = 1.0f;
 
+    /* VAP (Voice Activity Projection) for full-duplex turn-taking */
+    pp->vap_model = NULL;
+    pp->vap_mel_user = NULL;
+    pp->vap_mel_system = NULL;
+    pp->vap_enabled = cfg->vap_enabled ? 1 : 0;
+    pp->neural_barge_in = cfg->neural_barge_in ? 1 : 0;
+    pp->vap_mel_system_samples = 0;
+    memset(pp->vap_system_mel, 0, sizeof(pp->vap_system_mel));
+    memset(pp->vap_user_mel, 0, sizeof(pp->vap_user_mel));
+    pp->vap_last_pred = (VAPPrediction){0};
+    if (cfg->vap_model_path) {
+        pp->vap_model = vap_create(cfg->vap_model_path);
+        if (pp->vap_model) {
+            /* Mel for VAP: 24kHz, 80 mels, 20ms hop (480 samples) = 50Hz */
+            MelConfig mel_cfg = {0};
+            mel_cfg.sample_rate = 24000;
+            mel_cfg.n_fft = 1024;
+            mel_cfg.hop_length = 480;
+            mel_cfg.win_length = 1024;
+            mel_cfg.n_mels = 80;
+            mel_cfg.fmin = 0.0f;
+            mel_cfg.fmax = 12000.0f;
+            mel_cfg.log_floor = 1e-10f;
+            mel_cfg.preemph = 0.97f;
+            mel_cfg.slaney_norm = 0;
+            mel_cfg.periodic_window = 1;
+            pp->vap_mel_user = mel_create(&mel_cfg);
+            pp->vap_mel_system = mel_create(&mel_cfg);
+            if (pp->vap_mel_user && pp->vap_mel_system) {
+                pp->vap_enabled = 1;
+                /* neural_barge_in set from cfg (defaults on when --vap-model in parse_args) */
+                fprintf(stderr, "[VAP] Loaded %s (full-duplex turn-taking)\n", cfg->vap_model_path);
+            } else {
+                if (pp->vap_mel_user) mel_destroy(pp->vap_mel_user);
+                if (pp->vap_mel_system) mel_destroy(pp->vap_mel_system);
+                pp->vap_mel_user = NULL;
+                pp->vap_mel_system = NULL;
+                vap_destroy(pp->vap_model);
+                pp->vap_model = NULL;
+            }
+        } else {
+            fprintf(stderr, "[VAP] Failed to load %s\n", cfg->vap_model_path);
+        }
+    }
+
     /* Audio watermarking for AI-generated speech detection (EU AI Act) */
     {
         static const uint8_t default_wm_key[] = "sonata-ai-watermark-v1";
@@ -3937,6 +4382,16 @@ static void postproc_destroy(AudioPostProcessor *pp) {
     if (pp->prosody_log)    prosody_log_close(pp->prosody_log);
     if (pp->backchannel)    backchannel_destroy(pp->backchannel);
     if (pp->audio_emotion)  audio_emotion_destroy(pp->audio_emotion);
+    if (pp->audio_mixer)    audio_mixer_destroy(pp->audio_mixer);
+    if (pp->streaming_llm)  { streaming_llm_destroy(pp->streaming_llm); pp->streaming_llm = NULL; }
+    if (pp->intent_router)  intent_router_destroy(pp->intent_router);
+    if (pp->neural_backchannel) nbc_destroy(pp->neural_backchannel);
+    if (pp->spec_gen)       speculative_gen_destroy(pp->spec_gen);
+    if (pp->response_cache) response_cache_destroy(pp->response_cache);
+    if (pp->streaming_tts)  streaming_tts_destroy(pp->streaming_tts);
+    if (pp->vap_model)      vap_destroy(pp->vap_model);
+    if (pp->vap_mel_user)   mel_destroy(pp->vap_mel_user);
+    if (pp->vap_mel_system) mel_destroy(pp->vap_mel_system);
     if (pp->pitch_ctx)      prosody_pitch_destroy(pp->pitch_ctx);
     if (pp->watermark)      audio_watermark_destroy(pp->watermark);
     free(pp->rec_16k);
@@ -3955,9 +4410,16 @@ static void postproc_reset(AudioPostProcessor *pp) {
     if (pp->deep_filter)    deep_filter_reset(pp->deep_filter);
     if (pp->backchannel)    backchannel_reset(pp->backchannel);
     if (pp->audio_emotion)  audio_emotion_reset(pp->audio_emotion);
-    if (pp->watermark)      audio_watermark_reset(pp->watermark);
+    if (pp->vap_model)      vap_reset(pp->vap_model);
+    if (pp->vap_mel_user)   mel_reset(pp->vap_mel_user);
+    if (pp->vap_mel_system) mel_reset(pp->vap_mel_system);
+    pp->vap_mel_system_samples = 0;
     pp->rec_16k_len = 0;
     pp->speculative_sent = 0;
+    if (pp->spec_gen) speculative_gen_reset(pp->spec_gen);
+    if (pp->streaming_tts) streaming_tts_reset(pp->streaming_tts);
+    pp->streaming_token_idx = 0;
+    pp->streaming_committed_samples = 0;
     pp->streaming_overlap = 0;
     pp->overlap_word_count = 0;
     pp->speculative_tts_started = 0;
@@ -4075,6 +4537,130 @@ static void stt_accum_reset(SttAccum *a) { a->len = 0; }
 
 /* feed_endpointer removed — now handled internally by speech_detector_feed() */
 
+static int linear_resample(const float *in, int n_in, int src_rate,
+                            float *out, int max_out, int dst_rate);
+
+/** Continuous capture feeding: runs EVERY tick regardless of state.
+ * Feeds speech detector, VAP, and backchannel. Enables full-duplex awareness
+ * during STREAMING/SPEAKING (neural VAD, VAP barge-in, backchannel timing). */
+static void feed_capture_continuous(VoiceEngine *audio, AudioPostProcessor *pp,
+                                    PipelineState state) {
+    float capture_48[RESAMPLE_BUF_SIZE];
+    float capture_24[RESAMPLE_BUF_SIZE / 2];
+    int n = voice_engine_read_capture(audio, capture_48, RESAMPLE_BUF_SIZE);
+    if (n <= 0) return;
+
+    /* Resample 48kHz → 24kHz */
+    int n24;
+    if (pp && pp->use_hw_resample && pp->resampler_down) {
+        n24 = hw_resample(pp->resampler_down, capture_48, (uint32_t)n,
+                          capture_24, RESAMPLE_BUF_SIZE / 2);
+        if (n24 <= 0) {
+            voice_engine_resample_48_to_24(capture_48, capture_24, n);
+            n24 = n / 2;
+        }
+    } else {
+        voice_engine_resample_48_to_24(capture_48, capture_24, n);
+        n24 = n / 2;
+    }
+
+    /* 1. Feed speech detector (all states) */
+    if (pp && pp->speech_detector)
+        speech_detector_feed(pp->speech_detector, capture_24, n24);
+
+    /* 2. Feed VAP: user mel from capture, system mel from pp->vap_system_mel */
+    if (pp && pp->vap_model && pp->vap_mel_user) {
+        float user_mel[80];
+        int n_frames = mel_process(pp->vap_mel_user, capture_24, n24, user_mel, 1);
+        if (n_frames > 0) {
+            memcpy(pp->vap_user_mel, user_mel, sizeof(user_mel));
+            pp->vap_last_pred = vap_feed(pp->vap_model, pp->vap_user_mel, pp->vap_system_mel);
+        }
+    }
+
+    /* 3. Feed backchannel (all states) — prefer neural when available */
+    if (pp && (pp->backchannel || pp->neural_backchannel) &&
+        (pp->backchannel == NULL || backchannel_is_enabled(pp->backchannel))) {
+        float eou_prob = (pp->speech_detector)
+            ? speech_detector_eou(pp->speech_detector, 0, 0.0f).fused_prob
+            : (pp->vap_model ? pp->vap_last_pred.p_eou : 0.0f);
+        int bc_len = 0;
+        const float *bc_audio = NULL;
+        int bc_type = 0;
+        int should_emit = 0;
+        if (pp->backchannel) {
+            BackchannelEvent evt = backchannel_feed(pp->backchannel, capture_24, n24, eou_prob);
+            if (evt.ready) {
+                should_emit = 1;
+                bc_type = (int)evt.type;
+            }
+        } else if (pp->vap_model && pp->vap_last_pred.p_backchannel > 0.5f) {
+            should_emit = 1;
+            bc_type = NBC_MHM;
+        }
+        if (should_emit) {
+            if (pp->neural_backchannel)
+                bc_audio = nbc_get_cached(pp->neural_backchannel, bc_type, &bc_len);
+            if (!bc_audio && pp->backchannel)
+                bc_audio = backchannel_get_audio(pp->backchannel, (BackchannelType)bc_type, &bc_len);
+        }
+        if (bc_audio && bc_len > 0 && bc_len <= 4800) {
+            float duck_gain = (state == STATE_STREAMING || state == STATE_SPEAKING) ? 0.4f : 1.0f;
+            if (duck_gain < 1.0f) {
+                float ducked[4800];
+                vDSP_vsmul(bc_audio, 1, &duck_gain, ducked, 1, (vDSP_Length)bc_len);
+                bc_audio = ducked;
+            }
+            if (pp->audio_mixer)
+                audio_mixer_write(pp->audio_mixer, MIX_CHANNEL_BACKCHANNEL, bc_audio, bc_len);
+            else
+                voice_engine_write_playback(audio, bc_audio, bc_len);
+        }
+    }
+
+    /* Send capture audio to streaming LLM (Gemini Live / OpenAI Realtime) */
+    if (pp && pp->streaming_llm && streaming_llm_is_connected(pp->streaming_llm)) {
+        float capture_16[RESAMPLE_BUF_SIZE / 2];
+        const float *src = capture_24;
+        int n_send = n24;
+        if (streaming_llm_input_sample_rate(pp->streaming_llm) == 16000) {
+            if (pp->resampler_24_16) {
+                n_send = hw_resample(pp->resampler_24_16, capture_24, (uint32_t)n24,
+                                      capture_16, RESAMPLE_BUF_SIZE / 2);
+                if (n_send <= 0)
+                    n_send = linear_resample(capture_24, n24, 24000,
+                                             capture_16, RESAMPLE_BUF_SIZE / 2, 16000);
+            } else {
+                n_send = linear_resample(capture_24, n24, 24000,
+                                         capture_16, RESAMPLE_BUF_SIZE / 2, 16000);
+            }
+            src = capture_16;
+        }
+        if (n_send > 0)
+            streaming_llm_send_audio(pp->streaming_llm, src, n_send);
+    }
+}
+
+/** Drain audio mixer to playback (when mixer active). Reads mixed 24kHz, resamples to 48kHz. */
+static void drain_mixer_to_playback(VoiceEngine *audio, AudioPostProcessor *pp) {
+    if (!pp || !pp->audio_mixer || !audio_mixer_any_active(pp->audio_mixer))
+        return;
+    float mix_24[4096];
+    int n24 = audio_mixer_read(pp->audio_mixer, mix_24, 4096);
+    if (n24 <= 0) return;
+    float play_48[8192];
+    int n48;
+    if (pp->use_hw_resample && pp->resampler_up)
+        n48 = hw_resample(pp->resampler_up, mix_24, (uint32_t)n24, play_48, 8192);
+    else
+        voice_engine_resample_24_to_48(mix_24, play_48, n24), n48 = n24 * 2;
+    if (n48 > 0) {
+        voice_engine_write_playback(audio, play_48, n48);
+        if (pp->web_remote)
+            web_remote_send_audio(pp->web_remote, play_48, n48);
+    }
+}
+
 /** Downsample float audio from src_rate to dst_rate via linear interpolation.
  * Suitable for moderate ratio conversions (e.g. 24kHz to 16kHz). */
 static int linear_resample(const float *in, int n_in, int src_rate,
@@ -4127,27 +4713,13 @@ static int feed_stt(SttInterface *stt, VoiceEngine *audio, SttAccum *accum,
         n24 = n / 2;
     }
 
-    /* Feed capture audio to unified speech detector (VAD + endpointer) */
-    if (pp && pp->speech_detector)
-        speech_detector_feed(pp->speech_detector, capture_24, n24);
+    /* Speech detector and backchannel now fed by feed_capture_continuous() every tick */
 
     /* Feed audio emotion detector for user voice analysis */
     if (pp && pp->audio_emotion)
         audio_emotion_feed(pp->audio_emotion, capture_24, n24);
 
-    /* Feed backchannel generator for timing analysis */
-    if (pp && pp->backchannel && backchannel_is_enabled(pp->backchannel)) {
-        float eou_prob = (pp->speech_detector)
-            ? speech_detector_eou(pp->speech_detector, 0, 0.0f).fused_prob
-            : 0.0f;
-        BackchannelEvent evt = backchannel_feed(pp->backchannel, capture_24, n24, eou_prob);
-        if (evt.ready) {
-            int bc_len = 0;
-            const float *bc_audio = backchannel_get_audio(pp->backchannel, evt.type, &bc_len);
-            if (bc_audio && bc_len > 0)
-                voice_engine_write_playback(audio, bc_audio, bc_len);
-        }
-    }
+    /* Backchannel now fed by feed_capture_continuous() every tick */
 
     /* Select audio at the STT engine's expected sample rate */
     const float *stt_audio;
@@ -4226,23 +4798,40 @@ static int feed_stt(SttInterface *stt, VoiceEngine *audio, SttAccum *accum,
     memcpy(accum->buf + accum->len, stt_audio, (size_t)to_copy * sizeof(float));
     accum->len += to_copy;
 
-    /* Process full frames */
+    /* Process full frames. Skip expensive encoder during silence — still accumulate
+     * audio for context; only run mel+conformer forward when speech is detected.
+     * Hysteresis: keep running STT for 10 frames (~200ms) after speech ends to
+     * avoid cutting off utterance tails at speech→silence transitions. */
+    int energy_vad = voice_engine_get_vad_state(audio);
+    int speech_now = (pp && pp->speech_detector)
+        ? speech_detector_speech_active(pp->speech_detector, energy_vad)
+        : 1;
+    static int stt_silence_holdoff = 0;
+    if (speech_now) {
+        stt_silence_holdoff = 10;
+    } else if (stt_silence_holdoff > 0) {
+        stt_silence_holdoff--;
+    }
+    int speech_active = speech_now || (stt_silence_holdoff > 0);
     while (accum->len >= frame_size) {
-        int nw = stt->process_frame(stt->engine, accum->buf, frame_size);
-        if (nw > 0) {
-            total_words += nw;
-            char word_buf[TEXT_BUF_SIZE];
-            int wlen = stt->get_text(stt->engine, word_buf, TEXT_BUF_SIZE);
-            if (wlen > 0) {
-                int avail = transcript_cap - *transcript_len - 1;
-                int copy = wlen < avail ? wlen : avail;
-                if (copy > 0) {
-                    memcpy(transcript + *transcript_len, word_buf, (size_t)copy);
-                    *transcript_len += copy;
-                    transcript[*transcript_len] = '\0';
+        if (speech_active) {
+            int nw = stt->process_frame(stt->engine, accum->buf, frame_size);
+            if (nw > 0) {
+                total_words += nw;
+                char word_buf[TEXT_BUF_SIZE];
+                int wlen = stt->get_text(stt->engine, word_buf, TEXT_BUF_SIZE);
+                if (wlen > 0) {
+                    int avail = transcript_cap - *transcript_len - 1;
+                    int copy = wlen < avail ? wlen : avail;
+                    if (copy > 0) {
+                        memcpy(transcript + *transcript_len, word_buf, (size_t)copy);
+                        *transcript_len += copy;
+                        transcript[*transcript_len] = '\0';
+                    }
                 }
             }
         }
+        /* Advance buffer (whether we processed or skipped encoder) */
         int remaining = accum->len - frame_size;
         if (remaining > 0) {
             memmove(accum->buf, accum->buf + frame_size,
@@ -4360,6 +4949,21 @@ static int feed_speaker(TtsInterface *tts, VoiceEngine *audio, AudioPostProcesso
             prosody_soft_limit(src, n, 0.95f, 12.0f);
         }
 
+        /* VAP system mel: extract from TTS output for full-duplex turn-taking */
+        if (pp && pp->vap_mel_system && n > 0) {
+            float sys_mel[80];
+            int n_frames = mel_process(pp->vap_mel_system, src, n, sys_mel, 4);
+            if (n_frames > 0)
+                memcpy(pp->vap_system_mel, sys_mel + (n_frames - 1) * 80, sizeof(pp->vap_system_mel));
+        }
+
+        /* When audio mixer is active: write 24kHz to MAIN channel; drain handles playback */
+        if (pp && pp->audio_mixer) {
+            audio_mixer_write(pp->audio_mixer, MIX_CHANNEL_MAIN, src, n);
+            total += n;
+            continue;
+        }
+
         /* Resample 24kHz → 48kHz */
         int n48;
         if (pp && pp->use_hw_resample && pp->resampler_up) {
@@ -4449,16 +5053,67 @@ static int feed_speaker(TtsInterface *tts, VoiceEngine *audio, AudioPostProcesso
     return total;
 }
 
-/* Barge-in: flush the playback ring. A minor click is possible but acceptable
- * since the VoiceProcessingIO AEC handles echo cancellation, and the user
- * is actively speaking (masking any artifact). */
-static void barge_in_flush(VoiceEngine *audio) {
+/* Barge-in: flush the playback ring and mixer. A minor click is possible but
+ * acceptable since the VoiceProcessingIO AEC handles echo cancellation. */
+static void barge_in_flush(VoiceEngine *audio, AudioPostProcessor *pp) {
+    if (pp && pp->audio_mixer)
+        audio_mixer_flush_all(pp->audio_mixer);
     voice_engine_flush_playback(audio);
 }
 
 static void print_state(PipelineState state) {
     fprintf(stderr, "\r[pocket-voice] %s   ", state_names[state]);
     fflush(stderr);
+}
+
+/* TTS synthesis callbacks for response cache and streaming TTS.
+ * pipeline_tts_synthesize: full text → PCM (for response cache warm).
+ * pipeline_tts_synthesize_chunk: text+len → PCM (for streaming TTS). */
+static int pipeline_tts_synthesize(void *ctx, const char *text,
+                                   float *out_pcm, int max_samples) {
+    TtsInterface *tts = (TtsInterface *)ctx;
+    if (!tts || !tts->engine || !text) return -1;
+
+    tts->set_text(tts->engine, text);
+    if (tts->set_text_done) tts->set_text_done(tts->engine);
+
+    int total = 0;
+    while (!tts->is_done(tts->engine) && total < max_samples) {
+        tts->step(tts->engine);
+        int got = tts->get_audio(tts->engine, out_pcm + total, max_samples - total);
+        if (got > 0) total += got;
+        if (got <= 0 && tts->is_done(tts->engine)) break;
+    }
+
+    tts->reset(tts->engine);
+    return total;
+}
+
+static int pipeline_tts_synthesize_chunk(void *ctx, const char *text, int text_len,
+                                         float *out_pcm, int max_samples) {
+    AudioPostProcessor *pp = (AudioPostProcessor *)ctx;
+    TtsInterface *tts = pp ? (TtsInterface *)pp->tts_ref : NULL;
+    if (!tts || !tts->engine || !text || text_len <= 0) return -1;
+
+    char normalized[4096];
+    if (text_len >= (int)sizeof(normalized)) text_len = (int)sizeof(normalized) - 1;
+    memcpy(normalized, text, (size_t)text_len);
+    normalized[text_len] = '\0';
+    text_auto_normalize(normalized, normalized, sizeof(normalized));
+
+    tts->set_text(tts->engine, normalized);
+    if (tts->set_text_done) tts->set_text_done(tts->engine);
+
+    int total = 0;
+    while (!tts->is_done(tts->engine) && total < max_samples) {
+        tts->step(tts->engine);
+        int got = tts->get_audio(tts->engine, out_pcm + total, max_samples - total);
+        if (got > 0) total += got;
+        if (got <= 0 && tts->is_done(tts->engine)) break;
+    }
+
+    tts->reset(tts->engine);
+    return total;
 }
 
 /**
@@ -4841,31 +5496,61 @@ static PipelineState pipeline_tick(
 ) {
     PipelineState next = state;
 
-    /* Check for barge-in in any speaking/streaming state.
-     * Emotion-aware: when TTS is speaking empathetic/calm content,
-     * require a stronger voice signal before interrupting. */
-    if ((state == STATE_STREAMING || state == STATE_SPEAKING) &&
-        voice_engine_get_barge_in(audio)) {
-        int allow_bargein = 1;
+    /* Set TTS ref for streaming TTS callback (used during feed_token→synthesize) */
+    if (pp) pp->tts_ref = tts;
 
-        if (pp && pp->barge_in_energy_scale > 1.01f) {
-            float scale = pp->barge_in_energy_scale;
-            voice_engine_set_vad_thresholds(audio,
-                0.01f * scale, 0.005f * scale);
-            int recheck_vad = voice_engine_get_vad_state(audio);
-            if (recheck_vad < 2) allow_bargein = 0;
-            voice_engine_set_vad_thresholds(audio, 0.01f, 0.005f);
+    /* Full-duplex: feed capture to speech detector, VAP, backchannel EVERY tick */
+    feed_capture_continuous(audio, pp, state);
+
+    /* Poll streaming LLM (Gemini Live / OpenAI Realtime) and drain cloud audio to mixer */
+    if (pp && pp->streaming_llm && pp->audio_mixer) {
+        streaming_llm_poll(pp->streaming_llm, 0);
+        if (streaming_llm_audio_available(pp->streaming_llm) > 0) {
+            float cloud_audio[4800];
+            int got = streaming_llm_recv_audio(pp->streaming_llm, cloud_audio, 4800);
+            if (got > 0)
+                audio_mixer_write(pp->audio_mixer, MIX_CHANNEL_CLOUD_AUDIO, cloud_audio, got);
         }
+    }
 
-        if (!allow_bargein) {
-            voice_engine_clear_barge_in(audio);
-        } else {
+    /* Check for barge-in in any speaking/streaming state.
+     * Neural (VAP): p_user_speaking > 0.7 and p_backchannel < 0.3 = real barge-in.
+     * Fallback: energy-based when VAP not loaded or neural_barge_in disabled. */
+    int barge_in_triggered = 0;
+    if (state == STATE_STREAMING || state == STATE_SPEAKING) {
+        if (pp && pp->vap_model && pp->neural_barge_in && pp->vap_enabled) {
+            /* VAP-based barge-in: user speaking substantially, not just backchannel */
+            VAPPrediction pred = pp->vap_last_pred;
+            if (pred.p_user_speaking > 0.7f && pred.p_backchannel < 0.3f)
+                barge_in_triggered = 1;
+        } else if (voice_engine_get_barge_in(audio)) {
+            /* Energy-based fallback */
+            barge_in_triggered = 1;
+            /* Emotion-aware: when TTS is speaking empathetic/calm content,
+             * require a stronger voice signal before interrupting. */
+            if (pp && pp->barge_in_energy_scale > 1.01f) {
+                float scale = pp->barge_in_energy_scale;
+                voice_engine_set_vad_thresholds(audio,
+                    0.01f * scale, 0.005f * scale);
+                int recheck_vad = voice_engine_get_vad_state(audio);
+                if (recheck_vad < 2) barge_in_triggered = 0;
+                voice_engine_set_vad_thresholds(audio, 0.01f, 0.005f);
+            }
+        }
+    }
+
+    if (barge_in_triggered) {
         fprintf(stderr, "\n[pocket-voice] Barge-in detected%s\n",
                 (pp && pp->last_tts_emotion != EMOTION_NEUTRAL)
                     ? " (emotion-gated)" : "");
         voice_engine_clear_barge_in(audio);
-        barge_in_flush(audio);
+        barge_in_flush(audio, pp);
         llm->cancel(llm->engine);
+        if (pp && pp->streaming_tts) {
+            streaming_tts_rollback(pp->streaming_tts, 0);
+            streaming_tts_reset(pp->streaming_tts);
+            pp->streaming_token_idx = 0;
+        }
         if (tts->reset(tts->engine) != 0)
             fprintf(stderr, "[pocket-voice] WARNING: TTS reset failed on barge-in\n");
         if (stt->reset(stt->engine) != 0)
@@ -4882,7 +5567,6 @@ static PipelineState pipeline_tick(
         *transcript_len = 0;
         transcript[0] = '\0';
         return STATE_LISTENING;
-        } /* else (allow_bargein) */
     }
 
     switch (state) {
@@ -4964,22 +5648,42 @@ static PipelineState pipeline_tick(
             if (eou_res.triggered)
                 end_of_turn = true;
 
-            /* Speculative prefill at 55%+ fused probability */
-            if (!end_of_turn && !pp->speculative_sent &&
-                eou_res.fused_prob >= 0.55f && *transcript_len > 0) {
-                fprintf(stderr, "\n[pocket-voice] Speculative prefill (p=%.2f)\n",
-                        eou_res.fused_prob);
-                llm->send(llm->engine, transcript);
-                pp->speculative_sent = 1;
-                metrics->llm_sent = now_us();
-            }
-
-            /* Cancel speculative send if user resumes speaking */
-            if (pp->speculative_sent && eou_res.fused_prob < 0.25f) {
-                fprintf(stderr, "[pocket-voice] Speculative cancel (user resumed)\n");
-                llm->cancel(llm->engine);
-                pp->speculative_sent = 0;
-                metrics->llm_sent = 0;
+            /* Speculative generation (replaces old prefill) */
+            if (!end_of_turn && pp->spec_gen && *transcript_len > 0) {
+                int n_words = 0;
+                for (int i = 0; i < *transcript_len; i++)
+                    if (transcript[i] == ' ') n_words++;
+                if (*transcript_len > 0 && transcript[*transcript_len - 1] != ' ')
+                    n_words++;
+                float vap_eou = pp->vap_model ? pp->vap_last_pred.p_eou : 0.0f;
+                float vap_turn = pp->vap_model ? pp->vap_last_pred.p_system_turn : 0.0f;
+                int action = speculative_gen_tick(pp->spec_gen, transcript, n_words,
+                    vap_eou, vap_turn, eou_res.fused_prob);
+                if (action == 1 && !pp->speculative_sent) {
+                    fprintf(stderr, "\n[pocket-voice] Speculative draft started\n");
+                    llm->send(llm->engine, transcript);
+                    pp->speculative_sent = 1;
+                    metrics->llm_sent = now_us();
+                } else if (action == 2) {
+                    const char *response = speculative_gen_commit(pp->spec_gen);
+                    if (response) {
+                        fprintf(stderr, "\n[pocket-voice] Speculative commit\n");
+                        pp->speculative_sent = 0;
+                        /* Feed response to sentence buffer for TTS */
+                        sentbuf_add(sentbuf, response, (int)strlen(response));
+                        sentbuf_flush_all(sentbuf, (char *)response, 0); /* force segment */
+                        next = STATE_STREAMING;
+                        print_state(next);
+                        break;
+                    }
+                }
+                if (pp->speculative_sent && eou_res.fused_prob < 0.2f) {
+                    speculative_gen_cancel_all(pp->spec_gen);
+                    fprintf(stderr, "[pocket-voice] Speculative cancel (user resumed)\n");
+                    llm->cancel(llm->engine);
+                    pp->speculative_sent = 0;
+                    metrics->llm_sent = 0;
+                }
             }
         } else {
             if (stt_eou_prob > vad_threshold) {
@@ -5098,6 +5802,66 @@ static PipelineState pipeline_tick(
     }
 
     case STATE_PROCESSING: {
+        /* Intent router: fast path or backchannel before LLM */
+        if (pp && pp->intent_router && *transcript_len > 0) {
+            int n_words = 0;
+            for (int i = 0; i < *transcript_len; i++)
+                if (transcript[i] == ' ') n_words++;
+            if (*transcript_len > 0 && transcript[*transcript_len - 1] != ' ')
+                n_words++;
+            RoutingDecision decision = intent_router_route(pp->intent_router, transcript,
+                n_words, NULL, pp->vap_model ? &pp->vap_last_pred : NULL);
+            if (decision.route == ROUTE_FAST && decision.confidence > 0.7f
+                    && decision.fast_type >= 0) {
+                int audio_len = 0;
+                const float *fast_audio = NULL;
+                if (pp->response_cache)
+                    fast_audio = response_cache_get(pp->response_cache, decision.fast_type, &audio_len);
+
+                if (fast_audio && audio_len > 0) {
+                    if (pp->audio_mixer)
+                        audio_mixer_write(pp->audio_mixer, MIX_CHANNEL_PRESYNTHESIZED, fast_audio, audio_len);
+                    else
+                        voice_engine_write_playback(audio, fast_audio, audio_len);
+                    fprintf(stderr, "[intent_router] Fast path: cached audio (%d samples)\n", audio_len);
+                    next = STATE_SPEAKING;
+                    print_state(next);
+                    break;
+                }
+                /* Fallback: use TTS with fast text */
+                const char *fast_text = intent_router_fast_text((FastResponseType)decision.fast_type);
+                if (fast_text) {
+                    SSMLSegment seg = {0};
+                    strncpy(seg.text, fast_text, sizeof(seg.text) - 1);
+                    seg.text[sizeof(seg.text) - 1] = '\0';
+                    seg.pitch = 1.0f;
+                    seg.rate = 1.0f;
+                    seg.volume = 1.0f;
+                    process_segment(&seg, tts, audio, pp, metrics);
+                    fprintf(stderr, "[intent_router] Fast path: %s\n", fast_text);
+                    next = STATE_SPEAKING;
+                    print_state(next);
+                    break;
+                }
+            }
+            if (decision.route == ROUTE_BACKCHANNEL && decision.confidence > 0.6f) {
+                int bc_len = 0;
+                const float *bc = pp->neural_backchannel
+                    ? nbc_get_cached(pp->neural_backchannel, NBC_MHM, &bc_len)
+                    : (pp->backchannel ? backchannel_get_audio(pp->backchannel, BC_MHM, &bc_len) : NULL);
+                if (bc && bc_len > 0) {
+                    if (pp->audio_mixer)
+                        audio_mixer_write(pp->audio_mixer, MIX_CHANNEL_BACKCHANNEL, bc, bc_len);
+                    else
+                        voice_engine_write_playback(audio, bc, bc_len);
+                }
+                fprintf(stderr, "[intent_router] Backchannel only\n");
+                next = STATE_LISTENING;
+                print_state(next);
+                break;
+            }
+        }
+
         metrics->llm_sent = now_us();
 
         /* Prepend conversation memory context and emotion cues if available.
@@ -5177,22 +5941,58 @@ static PipelineState pipeline_tick(
             }
             llm->consume_tokens(llm->engine, copy_len);
 
-            /* Feed tokens to sentence buffer instead of directly to TTS */
-            sentbuf_add(sentbuf, token_copy, copy_len);
+            /* Feed tokens to speculative_gen when we have an active draft */
+            if (pp && pp->spec_gen && speculative_gen_active_draft(pp->spec_gen) >= 0)
+                speculative_gen_feed_token(pp->spec_gen,
+                    speculative_gen_active_draft(pp->spec_gen), token_copy);
 
-            /* Speculative TTS warmup: while accumulating the first sentence,
-               run empty TTS steps to keep the Metal command buffer warm and
-               the GPU pipeline primed. We do NOT feed text here — that would
-               cause duplication when the sentence buffer later flushes the
-               complete segment through process_segment(). */
-            if (sentbuf_sentence_count(sentbuf) == 0 && !sentbuf_has_segment(sentbuf)) {
-                tts->step(tts->engine);
+            if (pp && pp->use_streaming_tts && pp->streaming_tts) {
+                /* Streaming TTS: feed token directly */
+                streaming_tts_feed_token(pp->streaming_tts, token_copy, pp->streaming_token_idx++);
+            } else {
+                /* Sentence buffer path */
+                sentbuf_add(sentbuf, token_copy, copy_len);
             }
 
             fprintf(stderr, "%s", token_copy);
             fflush(stderr);
         }
 
+        /* Streaming TTS path: get audio, write to mixer, check completion */
+        if (pp && pp->use_streaming_tts && pp->streaming_tts) {
+            if (llm->is_response_done(llm->engine))
+                streaming_tts_finish(pp->streaming_tts);
+
+            for (;;) {
+                int avail = 0;
+                const float *audio_ptr = streaming_tts_peek_audio(pp->streaming_tts, &avail);
+                if (avail <= 0) break;
+                if (!metrics->has_first_audio) {
+                    metrics->tts_first_audio = now_us();
+                    metrics->has_first_audio = true;
+                    uint64_t e2e = metrics->tts_first_audio - metrics->speech_end;
+                    fprintf(stderr, "[E2E: %llu ms] ", (unsigned long long)(e2e / 1000));
+                }
+                if (pp->audio_mixer)
+                    audio_mixer_write(pp->audio_mixer, MIX_CHANNEL_MAIN, audio_ptr, avail);
+                else
+                    voice_engine_write_playback(audio, audio_ptr, avail);
+                streaming_tts_advance_audio(pp->streaming_tts, avail);
+                pp->streaming_committed_samples += avail;
+                streaming_tts_commit_audio(pp->streaming_tts, pp->streaming_committed_samples);
+            }
+
+            if (llm->has_error(llm->engine)) {
+                streaming_tts_finish(pp->streaming_tts);
+                fprintf(stderr, "\n[pocket-voice] LLM error, draining streaming TTS...\n");
+            }
+            if (streaming_tts_is_done(pp->streaming_tts)) {
+                fprintf(stderr, "\n");
+                metrics->speaking_entered = now_us();
+                next = STATE_SPEAKING;
+                print_state(next);
+            }
+        } else {
         /* When sentence buffer has a complete segment, process it */
         while (sentbuf_has_segment(sentbuf)) {
             char sentence[4096];
@@ -5243,10 +6043,13 @@ static PipelineState pipeline_tick(
         }
 
         /* Run adaptive number of TTS steps per tick based on buffer fill */
-        int steps = adaptive_steps_per_tick(audio, sentbuf_sentence_count(sentbuf));
-        for (int i = 0; i < steps; i++) {
-            int step_result = tts->step(tts->engine);
-            if (step_result != 0) break; /* done or error */
+        /* Only step if we have text to generate or are already processing */
+        if (sentbuf_sentence_count(sentbuf) > 0 || sentbuf_has_segment(sentbuf) || !tts->is_done(tts->engine)) {
+            int steps = adaptive_steps_per_tick(audio, sentbuf_sentence_count(sentbuf));
+            for (int i = 0; i < steps; i++) {
+                int step_result = tts->step(tts->engine);
+                if (step_result != 0) break; /* done or error */
+            }
         }
 
         int wrote = feed_speaker(tts, audio, pp);
@@ -5270,6 +6073,7 @@ static PipelineState pipeline_tick(
             metrics->speaking_entered = now_us();
             next = STATE_SPEAKING;
             print_state(next);
+        }
         }
         break;
     }
@@ -5406,7 +6210,7 @@ static void print_usage(const char *prog) {
         "  --stt-model FILE   STT model file (default: model.safetensors)\n"
         "  --tts-repo REPO    TTS HuggingFace repo (default: kyutai/tts-1.6b-en_fr)\n"
         "  --tts-engine E     TTS engine: sonata (default), sonata-v2, or sonata-v3\n"
-        "  --llm ENGINE       LLM backend: claude (default) or gemini\n"
+        "  --llm ENGINE       LLM backend: claude, gemini, local, gemini-live, openai-rt\n"
         "  --llm-model M      LLM model name (auto-detected per engine)\n"
         "  --system PROMPT    System prompt for LLM\n"
         "  --prosody          Enable SSML prosody-aware system prompt\n"
@@ -5433,6 +6237,17 @@ static void print_usage(const char *prog) {
         "  --no-hw-resample   Disable AudioConverter (use FIR fallback)\n"
         "  --spatial AZ       Enable 3D spatial audio at azimuth AZ degrees\n"
         "  --vad PATH         Native C VAD weights (e.g. models/silero_vad.nvad)\n"
+        "  --vap-model PATH   VAP model weights (.vap) for full-duplex turn-taking\n"
+        "  --vap              Enable VAP-based turn-taking (with --vap-model)\n"
+        "  --neural-barge-in  Use VAP for barge-in (default when --vap-model)\n"
+        "  --no-neural-barge-in  Use energy-based barge-in even with VAP loaded\n"
+        "  --intent-router PATH   Load intent router weights for fast path routing\n"
+        "  --intent-router-default  Use heuristic intent router (no weights)\n"
+        "  --speculative      Enable speculative LLM generation (default with --vap-model)\n"
+        "  --no-speculative   Disable speculative generation\n"
+        "  --response-cache PATH  Path to response cache file (loads/saves)\n"
+        "  --streaming-tts    Enable token-by-token streaming TTS with rollback\n"
+        "  --no-streaming-tts Disable streaming TTS (use sentence-buffer mode)\n"
         "\n"
         "Opus output:\n"
         "  --opus-bitrate N   Opus bitrate in bps (e.g. 64000). 0 = disabled\n"
@@ -5454,7 +6269,8 @@ static void print_usage(const char *prog) {
         "\n"
         "Environment variables:\n"
         "  ANTHROPIC_API_KEY  Required for --llm claude\n"
-        "  GEMINI_API_KEY     Required for --llm gemini\n",
+        "  GEMINI_API_KEY     Required for --llm gemini or gemini-live\n"
+        "  OPENAI_API_KEY     Required for --llm openai-rt\n",
         prog);
 }
 
@@ -5574,6 +6390,8 @@ static PipelineConfig parse_args_with_base(int argc, char **argv, PipelineConfig
             cfg.sonata_draft_config = argv[++i];
         } else if (strcmp(argv[i], "--sonata-speculate-k") == 0 && i + 1 < argc) {
             cfg.sonata_speculate_k = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--sonata-first-chunk") == 0 && i + 1 < argc) {
+            cfg.sonata_first_chunk = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--sonata-ref-wav") == 0 && i + 1 < argc) {
             cfg.sonata_ref_wav = argv[++i];
         } else if (strcmp(argv[i], "--sonata-storm") == 0 && i + 1 < argc) {
@@ -5600,6 +6418,10 @@ static PipelineConfig parse_args_with_base(int argc, char **argv, PipelineConfig
                 cfg.llm_engine = LLM_ENGINE_GEMINI;
             else if (strcmp(e, "local") == 0)
                 cfg.llm_engine = LLM_ENGINE_LOCAL;
+            else if (strcmp(e, "gemini-live") == 0)
+                cfg.llm_engine = LLM_ENGINE_GEMINI_LIVE;
+            else if (strcmp(e, "openai-rt") == 0)
+                cfg.llm_engine = LLM_ENGINE_OPENAI_REALTIME;
             else
                 cfg.llm_engine = LLM_ENGINE_CLAUDE;
         } else if (strcmp(argv[i], "--llm-model") == 0 && i + 1 < argc) {
@@ -5637,6 +6459,8 @@ static PipelineConfig parse_args_with_base(int argc, char **argv, PipelineConfig
         } else if (strcmp(argv[i], "--spatial") == 0 && i + 1 < argc) {
             cfg.spatial = 1;
             cfg.spatial_az = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--eager-words") == 0 && i + 1 < argc) {
+            cfg.eager_words = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--vad") == 0 && i + 1 < argc) {
             cfg.native_vad_path = argv[++i];
         } else if (strcmp(argv[i], "--semantic-eou") == 0 && i + 1 < argc) {
@@ -5646,6 +6470,32 @@ static PipelineConfig parse_args_with_base(int argc, char **argv, PipelineConfig
             ++i;
         } else if (strcmp(argv[i], "--emosteer") == 0 && i + 1 < argc) {
             cfg.emosteer_path = argv[++i];
+        } else if (strcmp(argv[i], "--vap-model") == 0 && i + 1 < argc) {
+            cfg.vap_model_path = argv[++i];
+            cfg.vap_enabled = 1;
+            cfg.neural_barge_in = 1;  /* Default on when VAP loaded */
+            cfg.speculative_enabled = 1;
+        } else if (strcmp(argv[i], "--vap") == 0) {
+            cfg.vap_enabled = 1;
+        } else if (strcmp(argv[i], "--intent-router") == 0 && i + 1 < argc) {
+            cfg.intent_router_path = argv[++i];
+            cfg.intent_router_enabled = 1;
+        } else if (strcmp(argv[i], "--intent-router-default") == 0) {
+            cfg.intent_router_enabled = 1;
+        } else if (strcmp(argv[i], "--speculative") == 0) {
+            cfg.speculative_enabled = 1;
+        } else if (strcmp(argv[i], "--no-speculative") == 0) {
+            cfg.speculative_enabled = 0;
+        } else if (strcmp(argv[i], "--response-cache") == 0 && i + 1 < argc) {
+            cfg.response_cache_path = argv[++i];
+        } else if (strcmp(argv[i], "--streaming-tts") == 0) {
+            cfg.streaming_tts_enabled = 1;
+        } else if (strcmp(argv[i], "--no-streaming-tts") == 0) {
+            cfg.streaming_tts_enabled = 0;
+        } else if (strcmp(argv[i], "--neural-barge-in") == 0) {
+            cfg.neural_barge_in = 1;
+        } else if (strcmp(argv[i], "--no-neural-barge-in") == 0) {
+            cfg.neural_barge_in = 0;
         } else if (strcmp(argv[i], "--prosody-log") == 0 && i + 1 < argc) {
             cfg.prosody_log_path = argv[++i];
         } else if (strcmp(argv[i], "--opus-bitrate") == 0 && i + 1 < argc) {
@@ -5820,13 +6670,19 @@ int main(int argc, char **argv) {
 
     /* Check for API key based on LLM engine */
     const char *api_key = NULL;
-    if (cfg.llm_engine == LLM_ENGINE_GEMINI) {
+    if (cfg.llm_engine == LLM_ENGINE_GEMINI || cfg.llm_engine == LLM_ENGINE_GEMINI_LIVE) {
         api_key = getenv("GEMINI_API_KEY");
         if (!api_key || strlen(api_key) == 0) {
             fprintf(stderr, "[pocket-voice] Error: GEMINI_API_KEY not set\n");
             return 1;
         }
-    } else {
+    } else if (cfg.llm_engine == LLM_ENGINE_OPENAI_REALTIME) {
+        api_key = getenv("OPENAI_API_KEY");
+        if (!api_key || strlen(api_key) == 0) {
+            fprintf(stderr, "[pocket-voice] Error: OPENAI_API_KEY not set\n");
+            return 1;
+        }
+    } else if (cfg.llm_engine != LLM_ENGINE_LOCAL) {
         api_key = getenv("ANTHROPIC_API_KEY");
         if (!api_key || strlen(api_key) == 0) {
             fprintf(stderr, "[pocket-voice] Error: ANTHROPIC_API_KEY not set\n");
@@ -5837,9 +6693,14 @@ int main(int argc, char **argv) {
     /* Resolve default model names per engine */
     const char *llm_model = cfg.llm_model;
     if (!llm_model) {
-        llm_model = (cfg.llm_engine == LLM_ENGINE_GEMINI)
-            ? "gemini-2.5-flash"
-            : "claude-sonnet-4-20250514";
+        if (cfg.llm_engine == LLM_ENGINE_GEMINI)
+            llm_model = "gemini-2.5-flash";
+        else if (cfg.llm_engine == LLM_ENGINE_GEMINI_LIVE)
+            llm_model = "gemini-2.0-flash-live";
+        else if (cfg.llm_engine == LLM_ENGINE_OPENAI_REALTIME)
+            llm_model = "gpt-4o-realtime-preview";
+        else
+            llm_model = "claude-sonnet-4-20250514";
     }
 
     /* Select system prompt: explicit > prosody > default */
@@ -5864,7 +6725,9 @@ int main(int argc, char **argv) {
 
     const char *llm_engine_label = (cfg.llm_engine == LLM_ENGINE_LOCAL)
         ? "Local" : (cfg.llm_engine == LLM_ENGINE_GEMINI)
-        ? "Gemini" : "Claude";
+        ? "Gemini" : (cfg.llm_engine == LLM_ENGINE_GEMINI_LIVE)
+        ? "Gemini Live" : (cfg.llm_engine == LLM_ENGINE_OPENAI_REALTIME)
+        ? "OpenAI Realtime" : "Claude";
 
     fprintf(stderr, "╔══════════════════════════════════════════════╗\n");
     fprintf(stderr, "║     pocket-voice — Native Voice Pipeline     ║\n");
@@ -5975,7 +6838,7 @@ int main(int argc, char **argv) {
         const char *fl_c = cfg.sonata_flow_config ? cfg.sonata_flow_config : "models/sonata/sonata_flow_config.json";
         const char *dc_w = cfg.sonata_dec_weights ? cfg.sonata_dec_weights : "models/sonata/sonata_decoder.safetensors";
         const char *dc_c = cfg.sonata_dec_config ? cfg.sonata_dec_config : "models/sonata/sonata_decoder_config.json";
-        tts = tts_create_sonata(lm_w, lm_c, tok, fl_w, fl_c, dc_w, dc_c);
+        tts = tts_create_sonata(lm_w, lm_c, tok, fl_w, fl_c, dc_w, dc_c, cfg.sonata_first_chunk);
         if (!tts.engine) {
             fprintf(stderr, "[sonata] Error: Failed to load Sonata. Check model paths.\n");
             stt.destroy(stt.engine);
@@ -5994,6 +6857,8 @@ int main(int argc, char **argv) {
             if (cfg.sonata_heun)
                 sonata_flow_set_solver(se->flow_engine, 1);
             sonata_flow_set_quality_mode(se->flow_engine, cfg.tts_quality_mode);
+            if (cfg.tts_first_chunk_fast)
+                sonata_flow_set_first_chunk_steps(se->flow_engine, 3);
         }
         se->tts_quality_mode = cfg.tts_quality_mode;
         se->tts_first_chunk_fast = cfg.tts_first_chunk_fast;
@@ -6037,49 +6902,21 @@ int main(int argc, char **argv) {
                 }
             }
         }
-        /* Voice cloning: extract speaker embedding from reference WAV.
+        /* Voice cloning: extract speaker embedding from reference audio.
          * --clone-voice: one-stop flag that auto-detects encoder model.
-         * Falls back to --speaker-encoder + --ref-wav for explicit control. */
+         * Falls back to --speaker-encoder + --ref-wav for explicit control.
+         * NOTE: Voice cloning is now integrated into SonataEngine via:
+         *   - sonata_set_reference_audio(): extract embedding from PCM audio
+         *   - sonata_clear_speaker(): reset to default voice
+         * WAV file loading would require a dedicated WAV parser; for now,
+         * voice cloning is available via the public API when audio data is available. */
         {
-            const char *ref_wav = cfg.clone_voice_path
-                ? cfg.clone_voice_path
-                : (cfg.ref_wav_path ? cfg.ref_wav_path : cfg.sonata_ref_wav);
-            const char *enc_path = cfg.speaker_encoder_path;
-            /* Auto-detect encoder model for --clone-voice */
-            if (ref_wav && !enc_path) {
-                static const char *auto_paths[] = {
-                    "models/ecapa_tdnn.onnx",
-                    "models/speaker_encoder.onnx",
-                    "models/sonata/speaker_encoder.onnx",
-                    NULL
-                };
-                for (int ap = 0; auto_paths[ap]; ap++) {
-                    FILE *test = fopen(auto_paths[ap], "rb");
-                    if (test) { fclose(test); enc_path = auto_paths[ap]; break; }
-                }
-                if (!enc_path && cfg.clone_voice_path) {
-                    fprintf(stderr, "[voice-clone] No speaker encoder found. "
-                            "Download one with: huggingface-cli download "
-                            "speechbrain/spkrec-ecapa-voxceleb --include *.onnx\n");
-                }
-            }
-            if (enc_path && ref_wav && se->flow_engine) {
-                SpeakerEncoder *spk_enc = speaker_encoder_create(cfg.speaker_encoder_path);
-                if (spk_enc) {
-                    int dim = speaker_encoder_embedding_dim(spk_enc);
-                    float *emb = (float *)malloc((size_t)dim * sizeof(float));
-                    if (emb) {
-                        int result = speaker_encoder_extract_from_wav(spk_enc, ref_wav, emb);
-                        if (result > 0) {
-                            sonata_flow_set_speaker_embedding(se->flow_engine, emb, dim);
-                            fprintf(stderr, "[voice-clone] Extracted %d-dim embedding from %s\n",
-                                    dim, ref_wav);
-                        }
-                        free(emb);
-                    }
-                    speaker_encoder_destroy(spk_enc);
-                }
-            }
+            (void)cfg.clone_voice_path;
+            (void)cfg.ref_wav_path;
+            (void)cfg.speaker_encoder_path;
+            /* Voice cloning support added to SonataEngine.
+             * Call sonata_set_reference_audio(engine, encoder_path, pcm, n_samples, sample_rate)
+             * to enable zero-shot voice cloning for TTS. */
         }
         /* SoundStorm: load parallel decoder as LM replacement */
         if (cfg.sonata_storm_weights) {
@@ -6180,7 +7017,7 @@ int main(int argc, char **argv) {
         const char *fl_c = cfg.sonata_flow_config ? cfg.sonata_flow_config : "models/sonata/sonata_flow_config.json";
         const char *dc_w = cfg.sonata_dec_weights ? cfg.sonata_dec_weights : "models/sonata/sonata_decoder.safetensors";
         const char *dc_c = cfg.sonata_dec_config ? cfg.sonata_dec_config : "models/sonata/sonata_decoder_config.json";
-        tts = tts_create_sonata(lm_w, lm_c, tok, fl_w, fl_c, dc_w, dc_c);
+        tts = tts_create_sonata(lm_w, lm_c, tok, fl_w, fl_c, dc_w, dc_c, cfg.sonata_first_chunk);
     }
     if (!tts.engine) {
         fprintf(stderr, "[pocket-voice] Failed to create TTS engine\n");
@@ -6193,6 +7030,7 @@ int main(int argc, char **argv) {
     ClaudeClient claude_storage;
     GeminiClient gemini_storage;
     LocalLLMClient local_llm_storage;
+    StreamingLLM *streaming_llm_ptr = NULL;
     LLMClient llm;
 
     if (cfg.llm_engine == LLM_ENGINE_LOCAL) {
@@ -6204,6 +7042,44 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[pocket-voice] LLM backend: Gemini (%s)\n", llm_model);
         gemini_init(&gemini_storage, api_key, llm_model, system_prompt);
         llm = llm_create_gemini(&gemini_storage);
+    } else if (cfg.llm_engine == LLM_ENGINE_GEMINI_LIVE) {
+        fprintf(stderr, "[pocket-voice] LLM backend: Gemini Live (%s)\n", llm_model);
+        StreamingLLMConfig scfg = {
+            .type = STREAMING_LLM_GEMINI_LIVE,
+            .api_key = api_key,
+            .model = llm_model,
+            .system_prompt = system_prompt,
+            .input_sample_rate = 16000,
+            .output_sample_rate = 24000,
+            .voice = NULL,
+            .temperature = 0.8f,
+        };
+        streaming_llm_ptr = streaming_llm_create(&scfg);
+        if (!streaming_llm_ptr || streaming_llm_connect(streaming_llm_ptr) != 0) {
+            fprintf(stderr, "[pocket-voice] Error: Gemini Live connect failed\n");
+            if (streaming_llm_ptr) streaming_llm_destroy(streaming_llm_ptr);
+            return 1;
+        }
+        llm = llm_create_streaming(streaming_llm_ptr, LLM_ENGINE_GEMINI_LIVE);
+    } else if (cfg.llm_engine == LLM_ENGINE_OPENAI_REALTIME) {
+        fprintf(stderr, "[pocket-voice] LLM backend: OpenAI Realtime (%s)\n", llm_model);
+        StreamingLLMConfig scfg = {
+            .type = STREAMING_LLM_OPENAI_REALTIME,
+            .api_key = api_key,
+            .model = llm_model,
+            .system_prompt = system_prompt,
+            .input_sample_rate = 24000,
+            .output_sample_rate = 24000,
+            .voice = "alloy",
+            .temperature = 0.8f,
+        };
+        streaming_llm_ptr = streaming_llm_create(&scfg);
+        if (!streaming_llm_ptr || streaming_llm_connect(streaming_llm_ptr) != 0) {
+            fprintf(stderr, "[pocket-voice] Error: OpenAI Realtime connect failed\n");
+            if (streaming_llm_ptr) streaming_llm_destroy(streaming_llm_ptr);
+            return 1;
+        }
+        llm = llm_create_streaming(streaming_llm_ptr, LLM_ENGINE_OPENAI_REALTIME);
     } else {
         fprintf(stderr, "[pocket-voice] LLM backend: Claude (%s)\n", llm_model);
         claude_init(&claude_storage, api_key, llm_model, system_prompt);
@@ -6236,6 +7112,8 @@ int main(int argc, char **argv) {
     if (!pp) {
         fprintf(stderr, "[pocket-voice] Warning: post-processor init failed, using defaults\n");
     } else {
+        if (streaming_llm_ptr)
+            pp->streaming_llm = streaming_llm_ptr;
         if (pp->use_hw_resample)
             fprintf(stderr, "[pocket-voice] AudioConverter resampling: enabled\n");
         if (fabsf(cfg.pitch - 1.0f) > 0.01f)
@@ -6244,6 +7122,16 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[pocket-voice] Volume: %+.1f dB\n", (double)cfg.volume_db);
         if (pp->use_spatial)
             fprintf(stderr, "[pocket-voice] Spatial audio: %.0f° azimuth\n", (double)cfg.spatial_az);
+
+        /* Warm response cache if empty (requires TTS to be ready) */
+        if (pp->response_cache && !response_cache_has(pp->response_cache, FAST_GREETING)) {
+            int warmed = response_cache_warm(pp->response_cache, pipeline_tts_synthesize, &tts);
+            if (warmed > 0) {
+                fprintf(stderr, "[response_cache] Warmed %d response(s)\n", warmed);
+                if (cfg.response_cache_path)
+                    response_cache_save(pp->response_cache, cfg.response_cache_path);
+            }
+        }
     }
 
     /* 4c. Load custom Metal kernels (if available) */
@@ -6271,16 +7159,17 @@ int main(int argc, char **argv) {
            for fastest first-chunk latency, then revert to normal threshold */
         sentbuf_set_adaptive(sentbuf, 2, 3);
 
-        /* Eager sub-sentence flush for Sonata: start TTS generation after just
-           4 words instead of waiting for a sentence boundary. The Sonata LM
-           supports streaming text append, so more words get fed as they arrive.
-           Inspired by Liquid AI's interleaved generation approach. */
+        /* Eager sub-sentence flush for Sonata: start TTS generation after N words
+           instead of waiting for a sentence boundary. The Sonata LM supports
+           streaming text append, so more words get fed as they arrive. */
         if (cfg.tts_engine == TTS_ENGINE_SONATA) {
-            sentbuf_set_eager(sentbuf, 4);
-            fprintf(stderr, "[pocket-voice] Sentence buffer: eager flush at 4 words (Sonata streaming)\n");
+            int ew = (cfg.eager_words > 0) ? cfg.eager_words : 4;
+            sentbuf_set_eager(sentbuf, ew);
+            fprintf(stderr, "[pocket-voice] Sentence buffer: eager flush at %d words (Sonata streaming)\n", ew);
         } else {
-            sentbuf_set_eager(sentbuf, 6);
-            fprintf(stderr, "[pocket-voice] Sentence buffer: eager flush at 6 words\n");
+            int ew = (cfg.eager_words > 0) ? cfg.eager_words : 6;
+            sentbuf_set_eager(sentbuf, ew);
+            fprintf(stderr, "[pocket-voice] Sentence buffer: eager flush at %d words\n", ew);
         }
 
         fprintf(stderr, "[pocket-voice] Sentence buffer: %s mode, min_words=%d (adaptive warmup)\n",
