@@ -1,0 +1,31 @@
+{
+  "checkpoint": "train/checkpoints/flow_v3/flow_v3_step_5000.pt",
+  "step": 5000,
+  "vocoder": "Griffin-Lim",
+  "n_steps": 4,
+  "cfg_scale": 2.0,
+  "heun": false,
+  "phonemes": false,
+  "files": [
+    {
+      "file": "step_5000_0_Hello.wav",
+      "text": "Hello",
+      "duration_sec": 0.18,
+      "rms": 0.033017,
+      "peak": 0.126394,
+      "zcr": 0.1419
+    },
+    {
+      "file": "step_5000_1_this_is_a_test.wav",
+      "text": "this is a test.",
+      "duration_sec": 0.32,
+      "rms": 0.028394,
+      "peak": 0.115386,
+      "zcr": 0.1862
+    }
+  ],
+  "mean_duration_sec": 0.25,
+  "mean_rms": 0.030705,
+  "mean_peak": 0.12089,
+  "mean_zcr": 0.1641
+}

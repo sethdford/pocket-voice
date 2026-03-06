@@ -1,0 +1,22 @@
+{
+  "d_model": 512,
+  "n_layers": 8,
+  "n_heads": 8,
+  "ff_mult": 4.0,
+  "norm_eps": 1e-5,
+  "semantic_vocab_size": 32768,
+  "acoustic_dim": 256,
+  "cond_dim": 256,
+  "sigma_min": 0.0001,
+  "n_steps_inference": 8,
+  "speaker_dim": 256,
+  "n_speakers": 0,
+  "n_emotions": 0,
+  "emotion_dim": 64,
+  "prosody_dim": 0,
+  "use_rope": false,
+  "use_ref_audio": false,
+  "ref_audio_dim": 80,
+  "use_energy_predictor": false,
+  "energy_dim": 128
+}
