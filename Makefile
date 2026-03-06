@@ -228,9 +228,10 @@ $(BUILD)/libphonemizer.dylib: src/phonemizer.c src/phonemizer.h src/cJSON.c src/
 
 
 $(BUILD)/libspeaker_encoder.dylib: src/speaker_encoder.c src/speaker_encoder.h $(SONATA_SPEAKER_DYLIB) | $(BUILD)
+	cp -f $(SONATA_SPEAKER_DYLIB) $(BUILD)/libsonata_speaker.dylib
 	$(CC) $(CFLAGS) -Isrc -shared -fPIC -framework Accelerate \
-	  -Lsrc/sonata_speaker/target/release -lsonata_speaker \
-	  -Wl,-rpath,@loader_path:$(CURDIR)/src/sonata_speaker/target/release \
+	  -L$(BUILD) -lsonata_speaker \
+	  -Wl,-rpath,@loader_path \
 	  -install_name @rpath/libspeaker_encoder.dylib \
 	  -o $@ src/speaker_encoder.c
 

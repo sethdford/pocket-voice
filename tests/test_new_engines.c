@@ -310,15 +310,7 @@ int main(void) {
               "embedding_dim with NULL returns -1 or 0");
     }
 
-    /* Test 11: encode_audio with dummy encoder returns -1 */
-    {
-        float emb[256] = {0};
-        float audio[16000] = {0};
-        SpeakerEncoder *dummy = (SpeakerEncoder *)1;
-        int rc = speaker_encoder_encode_audio(dummy, audio, 16000, 16000, emb);
-        /* Should return -1 (dummy is invalid, native encoder call should fail) */
-        CHECK(rc == -1, "encode_audio with dummy encoder returns -1");
-    }
+    /* Test 11: removed — passing dummy pointer (SpeakerEncoder*)1 causes undefined behavior */
 
     /* Test 12: create with empty string path returns NULL */
     {
