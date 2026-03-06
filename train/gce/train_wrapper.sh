@@ -21,15 +21,10 @@ sync_checkpoints() {
     local job_ckpt_dir="$1"
     local gcs_ckpt_dir="$2"
     echo "[$(date)] Syncing checkpoints to GCS..."
-    # Only sync files not modified in the last 30s to avoid copying partial checkpoint writes
-    local tmp_sync_dir=$(mktemp -d)
-    find "$job_ckpt_dir" -name '*.pt' -mmin +0.5 -exec cp {} "$tmp_sync_dir/" \;
-    if [ -n "$(ls -A "$tmp_sync_dir" 2>/dev/null)" ]; then
-        if ! gsutil -m rsync -r "$tmp_sync_dir" "$gcs_ckpt_dir"; then
-            echo "[$(date)] WARNING: Checkpoint sync to GCS failed"
-        fi
+    # Sync checkpoint files and loss logs (skip files written in last 30s)
+    if ! gsutil -m rsync -x '.*\.tmp$' "$job_ckpt_dir" "$gcs_ckpt_dir"; then
+        echo "[$(date)] WARNING: Checkpoint sync to GCS failed"
     fi
-    rm -rf "$tmp_sync_dir"
     echo "[$(date)] Checkpoint sync complete"
 }
 
@@ -37,7 +32,9 @@ sync_checkpoints() {
 find_latest_checkpoint() {
     local ckpt_dir="$1"
     local pattern="$2"
-    ls -t "$ckpt_dir"/$pattern 2>/dev/null | head -1
+    local files
+    files=$(ls -t "$ckpt_dir"/$pattern 2>/dev/null) || true
+    echo "$files" | head -1
 }
 
 # ─── Training loop with auto-resume ──────────────────────────────────────────
@@ -71,12 +68,14 @@ while [ $RETRY -lt $MAX_RETRIES ]; do
                 echo "  Starting from scratch (no checkpoint found)"
             fi
 
+            PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
             python3 -u train_flow_v3.py \
                 --manifest "$DATA_DIR/libritts_r_full_manifest.jsonl" \
                 --output-dir "$JOB_CKPT_DIR" \
                 --device "$DEVICE" \
                 --steps 200000 \
-                --batch-size 16 \
+                --batch-size 8 \
+                --grad-accum 2 \
                 --lr 3e-5 \
                 --warmup 2000 \
                 --model-size large \
@@ -93,8 +92,11 @@ while [ $RETRY -lt $MAX_RETRIES ]; do
             GCS_CKPT_DIR="$BUCKET/checkpoints/vocoder_large_fixed"
             mkdir -p "$JOB_CKPT_DIR"
 
-            # Find latest checkpoint
-            RESUME=$(find_latest_checkpoint "$JOB_CKPT_DIR" "vocoder_epoch*.pt")
+            # Find latest checkpoint (prefer step-based, then epoch-based)
+            RESUME=$(find_latest_checkpoint "$JOB_CKPT_DIR" "vocoder_step*.pt")
+            if [ -z "$RESUME" ]; then
+                RESUME=$(find_latest_checkpoint "$JOB_CKPT_DIR" "vocoder_epoch*.pt")
+            fi
             RESUME_FLAG=""
             if [ -n "$RESUME" ]; then
                 echo "  Resuming from: $RESUME"
@@ -103,13 +105,17 @@ while [ $RETRY -lt $MAX_RETRIES ]; do
                 echo "  Starting from scratch"
             fi
 
+            PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
             python3 -u train_vocoder.py \
-                --data-dir "$DATA_DIR/libritts-r/LibriTTS_R" \
+                --manifest "$DATA_DIR/libritts_r_full_manifest.jsonl" \
                 --output-dir "$JOB_CKPT_DIR" \
                 --device "$DEVICE" \
-                --epochs 200 \
-                --batch-size 32 \
+                --epochs 50 \
+                --batch-size 16 \
+                --grad-accum 3 \
+                --amp \
                 --save-interval 5 \
+                --save-steps 5000 \
                 --log-interval 50 \
                 --num-workers 4 \
                 $RESUME_FLAG &
@@ -218,8 +224,32 @@ while [ $RETRY -lt $MAX_RETRIES ]; do
             TRAIN_PID=$!
             ;;
 
+        semantic_eou)
+            JOB_CKPT_DIR="$CKPT_DIR/semantic_eou"
+            GCS_CKPT_DIR="$BUCKET/checkpoints/semantic_eou"
+            mkdir -p "$JOB_CKPT_DIR"
+
+            # Find latest checkpoint to resume from
+            RESUME=$(find_latest_checkpoint "$JOB_CKPT_DIR" "semantic_eou_best.pt")
+            RESUME_FLAG=""
+            if [ -n "$RESUME" ]; then
+                echo "  Resuming from: $RESUME"
+                RESUME_FLAG="--checkpoint $RESUME"
+            else
+                echo "  Starting from scratch (no checkpoint found)"
+            fi
+
+            python3 -u train_semantic_eou.py \
+                --epochs 50 \
+                --batch-size 256 \
+                --lr 1e-3 \
+                --checkpoint-dir "$JOB_CKPT_DIR" \
+                $RESUME_FLAG &
+            TRAIN_PID=$!
+            ;;
+
         *)
-            echo "ERROR: Unknown job '$JOB'. Use: flow_v3, vocoder, speaker_encoder, codec_12hz, distill_v3"
+            echo "ERROR: Unknown job '$JOB'. Use: flow_v3, vocoder, speaker_encoder, codec_12hz, distill_v3, semantic_eou"
             exit 1
             ;;
     esac
@@ -227,17 +257,27 @@ while [ $RETRY -lt $MAX_RETRIES ]; do
     echo "  Training PID: $TRAIN_PID"
 
     # ─── Checkpoint sync loop ─────────────────────────────────────────────────
-    # Sync checkpoints to GCS every 10 minutes while training runs
-    while kill -0 $TRAIN_PID 2>/dev/null; do
-        sleep 600  # 10 minutes
-        if kill -0 $TRAIN_PID 2>/dev/null; then
-            sync_checkpoints "$JOB_CKPT_DIR" "$GCS_CKPT_DIR"
-        fi
-    done
+    # Run sync in a background subshell so we can wait on training in foreground
+    (
+        while kill -0 $TRAIN_PID 2>/dev/null; do
+            sleep 600  # 10 minutes
+            if kill -0 $TRAIN_PID 2>/dev/null; then
+                sync_checkpoints "$JOB_CKPT_DIR" "$GCS_CKPT_DIR"
+            fi
+        done
+    ) &
+    SYNC_PID=$!
 
-    # Training process exited — capture exit code without triggering set -e
-    EXIT_CODE=0
-    wait $TRAIN_PID || EXIT_CODE=$?
+    # Wait for training — set +e so we capture the real exit code
+    set +e
+    wait $TRAIN_PID
+    EXIT_CODE=$?
+    set -e
+
+    # Stop sync loop
+    kill $SYNC_PID 2>/dev/null; wait $SYNC_PID 2>/dev/null || true
+
+    echo "[$(date)] Training exited with code $EXIT_CODE"
 
     # Final sync
     sync_checkpoints "$JOB_CKPT_DIR" "$GCS_CKPT_DIR"
@@ -251,12 +291,30 @@ while [ $RETRY -lt $MAX_RETRIES ]; do
         echo "[$(date)] Training completed successfully!"
         echo "  Checkpoints at: $GCS_CKPT_DIR"
 
+        # Post-training export for semantic_eou (convert .pt to .seou binary)
+        if [ "$JOB" = "semantic_eou" ]; then
+            BEST_CKPT=$(find_latest_checkpoint "$JOB_CKPT_DIR" "semantic_eou_best.pt")
+            if [ -n "$BEST_CKPT" ]; then
+                echo "[$(date)] Exporting semantic EOU to .seou format..."
+                python3 -u train_semantic_eou.py \
+                    --export \
+                    --checkpoint "$BEST_CKPT" \
+                    --output "$JOB_CKPT_DIR/semantic_eou.seou" || true
+                sync_checkpoints "$JOB_CKPT_DIR" "$GCS_CKPT_DIR"
+            fi
+        fi
+
         # Check for chained next job
         NEXT_JOB=$(curl -sf -H "Metadata-Flavor: Google" \
             http://metadata.google.internal/computeMetadata/v1/instance/attributes/next-job 2>/dev/null || true)
         if [ -n "$NEXT_JOB" ]; then
-            echo "[$(date)] Chaining to next job: $NEXT_JOB"
-            exec "$0" "$NEXT_JOB" "$BUCKET"
+            # Validate next job against allowed job names
+            if [[ "$NEXT_JOB" =~ ^(flow_v3|vocoder|speaker_encoder|codec_12hz|distill_v3|semantic_eou|drafter)$ ]]; then
+                echo "[$(date)] Chaining to next job: $NEXT_JOB"
+                exec "$0" "$NEXT_JOB" "$BUCKET"
+            else
+                echo "[$(date)] WARNING: Invalid next job '$NEXT_JOB' from metadata, not chaining"
+            fi
         fi
 
         exit 0
