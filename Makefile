@@ -179,9 +179,9 @@ $(BUILD)/libbnns_conformer.dylib: src/bnns_conformer.c src/bnns_conformer.h | $(
 	$(CC) $(CFLAGS) -shared -fPIC -DACCELERATE_NEW_LAPACK -framework Accelerate \
 	  -install_name @rpath/libbnns_conformer.dylib -o $@ src/bnns_conformer.c
 
-$(BUILD)/libbnns_convnext_decoder.dylib: src/bnns_convnext_decoder.c src/bnns_convnext_decoder.h | $(BUILD)
-	$(CC) $(CFLAGS) -shared -fPIC -DACCELERATE_NEW_LAPACK -framework Accelerate \
-	  -install_name @rpath/libbnns_convnext_decoder.dylib -o $@ src/bnns_convnext_decoder.c
+$(BUILD)/libbnns_convnext_decoder.dylib: src/bnns_convnext_decoder.c src/bnns_convnext_decoder.h $(BUILD)/cJSON.o | $(BUILD)
+	$(CC) $(CFLAGS) -shared -fPIC -DACCELERATE_NEW_LAPACK -Isrc -framework Accelerate \
+	  -install_name @rpath/libbnns_convnext_decoder.dylib -o $@ src/bnns_convnext_decoder.c $(BUILD)/cJSON.o
 
 $(BUILD)/libwebsocket.dylib: src/websocket.c src/websocket.h | $(BUILD)
 	$(CC) $(CFLAGS) -shared -fPIC -framework Security \
@@ -227,9 +227,10 @@ $(BUILD)/libphonemizer.dylib: src/phonemizer.c src/phonemizer.h src/cJSON.c src/
 
 
 
-$(BUILD)/libspeaker_encoder.dylib: src/speaker_encoder.c src/speaker_encoder.h | $(BUILD)
-	$(CC) $(CFLAGS) $(PIPER_CFLAGS) -Isrc -shared -fPIC -DACCELERATE_NEW_LAPACK -framework Accelerate \
-	  $(ONNX_LDFLAGS) \
+$(BUILD)/libspeaker_encoder.dylib: src/speaker_encoder.c src/speaker_encoder.h $(SONATA_SPEAKER_DYLIB) | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc -shared -fPIC -framework Accelerate \
+	  -Lsrc/sonata_speaker/target/release -lsonata_speaker \
+	  -Wl,-rpath,@loader_path:$(CURDIR)/src/sonata_speaker/target/release \
 	  -install_name @rpath/libspeaker_encoder.dylib \
 	  -o $@ src/speaker_encoder.c
 
@@ -262,9 +263,17 @@ $(BUILD)/libsonata_refiner.dylib: src/sonata_refiner.c src/sonata_refiner.h | $(
 	$(CC) $(CFLAGS) -shared -fPIC -DACCELERATE_NEW_LAPACK -Isrc -framework Accelerate \
 	  -install_name @rpath/libsonata_refiner.dylib -o $@ src/sonata_refiner.c
 
+$(BUILD)/libvap_model.dylib: src/vap_model.c src/vap_model.h | $(BUILD)
+	$(CC) $(CFLAGS) -shared -fPIC -DACCELERATE_NEW_LAPACK -Isrc -framework Accelerate \
+	  -install_name @rpath/libvap_model.dylib -o $@ src/vap_model.c
+
 $(BUILD)/libsonata_istft.dylib: src/sonata_istft.c src/sonata_istft.h | $(BUILD)
 	$(CC) $(CFLAGS) -shared -fPIC -DACCELERATE_NEW_LAPACK -framework Accelerate \
 	  -install_name @rpath/libsonata_istft.dylib -o $@ src/sonata_istft.c
+
+$(BUILD)/libcodec_12hz.dylib: src/codec_12hz.c src/codec_12hz.h | $(BUILD)
+	$(CC) $(CFLAGS) -shared -fPIC -DACCELERATE_NEW_LAPACK -framework Accelerate \
+	  -install_name @rpath/libcodec_12hz.dylib -o $@ src/codec_12hz.c
 
 $(BUILD)/libnoise_gate.dylib: src/noise_gate.c src/noise_gate.h | $(BUILD)
 	$(CC) $(CFLAGS) -shared -fPIC -DACCELERATE_NEW_LAPACK -framework Accelerate \
@@ -297,9 +306,40 @@ $(BUILD)/libbackchannel.dylib: src/backchannel.c src/backchannel.h | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc -shared -fPIC -framework Accelerate \
 	  -install_name @rpath/libbackchannel.dylib -o $@ src/backchannel.c
 
+$(BUILD)/libneural_backchannel.dylib: src/neural_backchannel.c src/neural_backchannel.h \
+                                      $(BUILD)/libbreath_synthesis.dylib | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc -shared -fPIC -framework Accelerate \
+	  -L$(BUILD) -lbreath_synthesis -Wl,-rpath,@loader_path \
+	  -install_name @rpath/libneural_backchannel.dylib -o $@ src/neural_backchannel.c
+
+$(BUILD)/libintent_router.dylib: src/intent_router.c src/intent_router.h | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc -shared -fPIC -DACCELERATE_NEW_LAPACK -framework Accelerate \
+	  -install_name @rpath/libintent_router.dylib -o $@ src/intent_router.c
+
+$(BUILD)/libresponse_cache.dylib: src/response_cache.c src/response_cache.h src/intent_router.h | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc -shared -fPIC \
+	  -install_name @rpath/libresponse_cache.dylib -o $@ src/response_cache.c
+
 $(BUILD)/libaudio_emotion.dylib: src/audio_emotion.c src/audio_emotion.h | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc -shared -fPIC -framework Accelerate \
 	  -install_name @rpath/libaudio_emotion.dylib -o $@ src/audio_emotion.c
+
+$(BUILD)/libaudio_mixer.dylib: src/audio_mixer.c src/audio_mixer.h | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc -shared -fPIC -framework Accelerate \
+	  -install_name @rpath/libaudio_mixer.dylib -o $@ src/audio_mixer.c
+
+$(BUILD)/libspeculative_gen.dylib: src/speculative_gen.c src/speculative_gen.h | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc -shared -fPIC -lpthread \
+	  -install_name @rpath/libspeculative_gen.dylib -o $@ src/speculative_gen.c
+
+$(BUILD)/libstreaming_tts.dylib: src/streaming_tts.c src/streaming_tts.h | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc -shared -fPIC -framework Accelerate -lpthread \
+	  -install_name @rpath/libstreaming_tts.dylib -o $@ src/streaming_tts.c
+
+$(BUILD)/libstreaming_llm.dylib: src/streaming_llm.c src/streaming_llm.h $(BUILD)/cJSON.o | $(BUILD)
+	$(CC) $(CFLAGS) $(CURL_CFLAGS) -Isrc -shared -fPIC \
+	  -L$(HOMEBREW_PREFIX)/lib -lcurl \
+	  -install_name @rpath/libstreaming_llm.dylib -o $@ src/streaming_llm.c $(BUILD)/cJSON.o
 
 $(BUILD)/tensor_ops.metallib: src/tensor_ops.metal | $(BUILD)
 	xcrun -sdk macosx metal -c -O3 -o $(BUILD)/tensor_ops.air src/tensor_ops.metal
@@ -338,10 +378,19 @@ libs: $(BUILD)/libpocket_voice.dylib $(BUILD)/libvdsp_prosody.dylib \
       $(BUILD)/libapple_perf.dylib \
       $(BUILD)/libconversation_memory.dylib \
       $(BUILD)/libbackchannel.dylib \
+      $(BUILD)/libneural_backchannel.dylib \
+      $(BUILD)/libintent_router.dylib \
+      $(BUILD)/libresponse_cache.dylib \
       $(BUILD)/libaudio_emotion.dylib \
+      $(BUILD)/libaudio_mixer.dylib \
+      $(BUILD)/libspeculative_gen.dylib \
+      $(BUILD)/libstreaming_tts.dylib \
+      $(BUILD)/libstreaming_llm.dylib \
       $(BUILD)/libsonata_istft.dylib \
+      $(BUILD)/libcodec_12hz.dylib \
       $(BUILD)/libsonata_stt.dylib \
       $(BUILD)/libsonata_refiner.dylib \
+      $(BUILD)/libvap_model.dylib \
       $(BUILD)/tensor_ops.metallib
 
 # ─── Rust cdylibs ─────────────────────────────────────────────────────────
@@ -390,7 +439,8 @@ sonata: src/pocket_voice_pipeline.c libs $(STT_DYLIB) $(LLM_DYLIB) $(SONATA_LM_D
 	  -lspm_tokenizer -lnoise_gate -ldeep_filter -laudio_watermark \
 	  -lspeaker_encoder -lnative_vad -lspeech_detector -lsemantic_eou -lphonemizer -lprosody_predict \
 	  -lprosody_log -lemphasis_predict -lvoice_onboard -lsonata_istft -lsonata_stt -lsonata_refiner -lweb_remote -lwebsocket -lhttp_api -lapple_perf \
-	  -lbackchannel -laudio_emotion -lconversation_memory -lspeaker_diarizer \
+	  -lbackchannel -laudio_emotion -lconversation_memory -lspeaker_diarizer -lvap_model \
+	  -lneural_backchannel -lintent_router -lresponse_cache -lstreaming_tts -laudio_mixer -lspeculative_gen -lstreaming_llm \
 	  $(OPUS_LDFLAGS) -Lsrc/llm/target/release -lpocket_llm \
 	  $(STT_DYLIB) $(LLM_DYLIB) $(SONATA_LM_DYLIB) $(SONATA_FLOW_DYLIB) $(SONATA_STORM_DYLIB) \
 	  -Wl,-rpath,@executable_path/$(BUILD) \
@@ -564,6 +614,18 @@ test-native-vad: tests/test_native_vad.c $(BUILD)/libnative_vad.dylib | $(BUILD)
 	  -o $(BUILD)/test-native-vad tests/test_native_vad.c
 	./$(BUILD)/test-native-vad
 
+test-vap: tests/test_vap.c $(BUILD)/libvap_model.dylib | $(BUILD)
+	$(CC) $(CFLAGS) -DACCELERATE_NEW_LAPACK -Isrc -framework Accelerate \
+	  -L$(BUILD) -lvap_model -Wl,-rpath,@executable_path \
+	  -o $(BUILD)/test-vap tests/test_vap.c
+	./$(BUILD)/test-vap
+
+test-audio-mixer: tests/test_audio_mixer.c $(BUILD)/libaudio_mixer.dylib | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc -framework Accelerate \
+	  -L$(BUILD) -laudio_mixer -Wl,-rpath,@executable_path \
+	  -o $(BUILD)/test-audio-mixer tests/test_audio_mixer.c
+	./$(BUILD)/test-audio-mixer
+
 test-speech-detector: tests/test_speech_detector.c $(BUILD)/libspeech_detector.dylib | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc \
 	  -L$(BUILD) -lspeech_detector -lnative_vad -lmimi_endpointer -lfused_eou \
@@ -719,6 +781,13 @@ test-deep-filter: tests/test_deep_filter.c $(BUILD)/libdeep_filter.dylib | $(BUI
 	  -o $(BUILD)/test-deep-filter tests/test_deep_filter.c
 	./$(BUILD)/test-deep-filter
 
+test-codec-12hz: tests/test_codec_12hz.c $(BUILD)/libcodec_12hz.dylib | $(BUILD)
+	$(CC) $(CFLAGS) -DACCELERATE_NEW_LAPACK -Isrc -framework Accelerate \
+	  -L$(BUILD) -lcodec_12hz \
+	  -Wl,-rpath,$(CURDIR)/$(BUILD) -lm \
+	  -o $(BUILD)/test-codec-12hz tests/test_codec_12hz.c
+	./$(BUILD)/test-codec-12hz
+
 test-vdsp-prosody: tests/test_vdsp_prosody.c $(BUILD)/libvdsp_prosody.dylib | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc -framework Accelerate \
 	  -L$(BUILD) -lvdsp_prosody \
@@ -776,6 +845,9 @@ test-flow-quality-modes: tests/test_flow_quality_modes.c $(SONATA_FLOW_DYLIB) | 
 	  -lsonata_flow -lm \
 	  -o $(BUILD)/test-flow-quality-modes tests/test_flow_quality_modes.c
 	./$(BUILD)/test-flow-quality-modes
+
+test-sonata-flow-distilled: $(SONATA_FLOW_DYLIB)
+	cd src/sonata_flow && cargo test --lib --release distilled
 
 test-sonata-v3: tests/test_sonata_v3.c $(SONATA_FLOW_DYLIB) | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc \
@@ -835,6 +907,51 @@ test-backchannel: tests/test_backchannel.c $(BUILD)/libbackchannel.dylib | $(BUI
 	  -Wl,-rpath,$(CURDIR)/$(BUILD) -lm \
 	  -o $(BUILD)/test-backchannel tests/test_backchannel.c
 	./$(BUILD)/test-backchannel
+
+test-neural-backchannel: tests/test_neural_backchannel.c $(BUILD)/libneural_backchannel.dylib | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc -framework Accelerate \
+	  -L$(BUILD) -lneural_backchannel \
+	  -Wl,-rpath,@executable_path -lm \
+	  -o $(BUILD)/test-neural-backchannel tests/test_neural_backchannel.c
+	./$(BUILD)/test-neural-backchannel
+
+test-intent-router: tests/test_intent_router.c $(BUILD)/libintent_router.dylib | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc -DACCELERATE_NEW_LAPACK -framework Accelerate \
+	  -L$(BUILD) -lintent_router \
+	  -Wl,-rpath,@executable_path -lm \
+	  -o $(BUILD)/test-intent-router tests/test_intent_router.c
+	./$(BUILD)/test-intent-router
+
+test-response-cache: tests/test_response_cache.c $(BUILD)/libresponse_cache.dylib | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc -L$(BUILD) -lresponse_cache \
+	  -Wl,-rpath,@executable_path -o $(BUILD)/test-response-cache tests/test_response_cache.c
+	./$(BUILD)/test-response-cache
+
+test-speculative-gen: tests/test_speculative_gen.c $(BUILD)/libspeculative_gen.dylib | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc -L$(BUILD) -lspeculative_gen -lpthread \
+	  -Wl,-rpath,@executable_path -o $(BUILD)/test-speculative-gen tests/test_speculative_gen.c
+	./$(BUILD)/test-speculative-gen
+
+test-streaming-tts: tests/test_streaming_tts.c $(BUILD)/libstreaming_tts.dylib | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc -L$(BUILD) -lstreaming_tts -lpthread \
+	  -framework Accelerate -Wl,-rpath,@executable_path -o $(BUILD)/test-streaming-tts tests/test_streaming_tts.c
+	./$(BUILD)/test-streaming-tts
+
+test-streaming-llm: tests/test_streaming_llm.c $(BUILD)/libstreaming_llm.dylib | $(BUILD)
+	$(CC) $(CFLAGS) $(CURL_CFLAGS) -Isrc \
+	  -L$(BUILD) -lstreaming_llm $(CURL_LDFLAGS) \
+	  -Wl,-rpath,@executable_path -o $(BUILD)/test-streaming-llm tests/test_streaming_llm.c
+	./$(BUILD)/test-streaming-llm
+
+test-full-duplex: tests/test_full_duplex.c $(BUILD)/libvap_model.dylib $(BUILD)/libaudio_mixer.dylib \
+	$(BUILD)/libneural_backchannel.dylib $(BUILD)/libintent_router.dylib \
+	$(BUILD)/libspeculative_gen.dylib $(BUILD)/libspeech_detector.dylib $(BUILD)/libbackchannel.dylib | $(BUILD)
+	$(CC) $(CFLAGS) -DACCELERATE_NEW_LAPACK -Isrc -framework Accelerate \
+	  -L$(BUILD) -lvap_model -laudio_mixer -lneural_backchannel -lbreath_synthesis -lintent_router \
+	  -lspeculative_gen -lspeech_detector -lnative_vad -lmimi_endpointer -lfused_eou -lbackchannel \
+	  -Wl,-rpath,@executable_path -lm \
+	  -o $(BUILD)/test-full-duplex tests/test_full_duplex.c
+	./$(BUILD)/test-full-duplex
 
 test-sonata-refiner: tests/test_sonata_refiner.c $(BUILD)/libsonata_refiner.dylib | $(BUILD)
 	$(CC) $(CFLAGS) -DACCELERATE_NEW_LAPACK -Isrc -framework Accelerate \
@@ -1009,19 +1126,23 @@ test-audio-watermark: tests/test_audio_watermark.c \
 	  -o $(BUILD)/test-audio-watermark tests/test_audio_watermark.c
 	./$(BUILD)/test-audio-watermark
 
-test-speaker-encoder: tests/test_speaker_encoder.c $(SONATA_SPEAKER_DYLIB) | $(BUILD)
+test-gru-drafter: tests/test_gru_drafter.c $(SONATA_LM_DYLIB) | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc -ldl \
+	  -o $(BUILD)/test-gru-drafter tests/test_gru_drafter.c
+	./$(BUILD)/test-gru-drafter
+
+test-speaker-encoder: tests/test_speaker_encoder.c $(BUILD)/libspeaker_encoder.dylib $(SONATA_SPEAKER_DYLIB) | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc \
-	  -L$(BUILD) -Lsrc/sonata_speaker/target/release \
-	  -Wl,-rpath,$(CURDIR)/src/sonata_speaker/target/release \
-	  -lsonata_speaker \
+	  -L$(BUILD) -lspeaker_encoder \
+	  -Wl,-rpath,$(CURDIR)/$(BUILD):$(CURDIR)/src/sonata_speaker/target/release \
 	  -o $(BUILD)/test-speaker-encoder tests/test_speaker_encoder.c
 	./$(BUILD)/test-speaker-encoder
 
-.PHONY: test test-eou test-semantic-eou test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-roundtrip test-llm-prosody test-websocket test-optimizations test-sonata test-sonata-quality test-sonata-stt test-sonata-v3 test-beam-search bench-sonata bench-quality bench-live bench-industry test-apple-perf test-quality-improvements test-real-models test-native-vad bench-vad test-speech-detector test-fused-eou-parallel test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-sonata-storm test-audio-emotion test-sonata-flow-ffi test-flow-quality-modes test-sonata-lm-ffi test-sonata-lm-dual-head test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-sonata-refiner test-tdt-decoder test-web-remote test-opus-codec test-audio-converter test-spatial-audio test-metal-loader test-metal-dispatch test-bnns-convnext test-coverage-gaps test-correctness-audit test-integration-audit test-security-audit test-assumptions bench-audit bench test-research-stt test-research-eou test-research-istft test-research-metal test-audio-watermark test-deep-filter test-speaker-encoder
+.PHONY: test test-eou test-semantic-eou test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-roundtrip test-llm-prosody test-websocket test-optimizations test-sonata test-sonata-quality test-sonata-stt test-sonata-v3 test-beam-search bench-sonata bench-quality bench-live bench-industry test-apple-perf test-quality-improvements test-real-models test-native-vad bench-vad test-speech-detector test-fused-eou-parallel test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-sonata-storm test-audio-emotion test-audio-mixer test-sonata-flow-ffi test-flow-quality-modes test-sonata-flow-distilled test-sonata-lm-ffi test-sonata-lm-dual-head test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-neural-backchannel test-intent-router test-response-cache test-speculative-gen test-streaming-tts test-streaming-llm test-full-duplex test-sonata-refiner test-tdt-decoder test-web-remote test-opus-codec test-audio-converter test-spatial-audio test-metal-loader test-metal-dispatch test-bnns-convnext test-coverage-gaps test-correctness-audit test-integration-audit test-security-audit test-assumptions bench-audit bench test-research-stt test-research-eou test-research-istft test-research-metal test-audio-watermark test-deep-filter test-codec-12hz test-gru-drafter test-speaker-encoder
 
 bench: libs sonata
 	@bash scripts/benchmark.sh --all
-test: bench-quality test-quality test-eou test-semantic-eou test-roundtrip test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-llm-prosody test-optimizations test-beam-search test-sonata test-sonata-v3 test-sonata-quality test-sonata-stt test-real-models test-websocket test-native-vad test-speech-detector test-fused-eou-parallel test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-quality-improvements test-sonata-storm test-audio-emotion test-sonata-flow-ffi test-flow-quality-modes test-sonata-lm-ffi test-sonata-lm-dual-head test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-sonata-refiner test-tdt-decoder test-web-remote test-opus-codec test-audio-converter test-spatial-audio test-metal-loader test-metal-dispatch test-bnns-convnext test-coverage-gaps test-integration-audit test-correctness-audit test-security-audit test-assumptions test-research-stt test-research-eou test-research-istft test-research-metal test-audio-watermark test-deep-filter test-speaker-encoder
+test: bench-quality test-quality test-eou test-semantic-eou test-roundtrip test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-llm-prosody test-optimizations test-beam-search test-sonata test-sonata-v3 test-sonata-quality test-sonata-stt test-real-models test-websocket test-native-vad test-speech-detector test-fused-eou-parallel test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-quality-improvements test-sonata-storm test-audio-emotion test-audio-mixer test-sonata-flow-ffi test-flow-quality-modes test-sonata-flow-distilled test-sonata-lm-ffi test-sonata-lm-dual-head test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-neural-backchannel test-intent-router test-response-cache test-speculative-gen test-streaming-tts test-streaming-llm test-full-duplex test-sonata-refiner test-tdt-decoder test-web-remote test-opus-codec test-audio-converter test-spatial-audio test-metal-loader test-metal-dispatch test-bnns-convnext test-coverage-gaps test-integration-audit test-correctness-audit test-security-audit test-assumptions test-research-stt test-research-eou test-research-istft test-research-metal test-audio-watermark test-deep-filter test-speaker-encoder
 	@echo ""
 	@echo "═══ Quality Benchmark Self-Tests ═══"
 	./$(BUILD)/bench-quality

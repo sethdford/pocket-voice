@@ -754,6 +754,10 @@ def train(args):
                 n_interleaved = 0
                 t0 = time.time()
 
+            # Periodic MPS cache flush to prevent memory fragmentation
+            if step % 500 == 0 and device.type == "mps":
+                torch.mps.empty_cache()
+
             if step % args.save_every == 0:
                 save_dict = {
                     "model": model.state_dict(),

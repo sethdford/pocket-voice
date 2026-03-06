@@ -2,13 +2,15 @@
 # launch.sh — Create a preemptible L4 VM and start training
 set -euo pipefail
 
-JOB="${1:?Usage: ./launch.sh <flow_v3|vocoder|speaker_encoder|codec_12hz|distill_v3> [--on-demand]}"
+JOB="${1:?Usage: ./launch.sh <flow_v3|vocoder|speaker_encoder|codec_12hz|distill_v3> [--on-demand] [--gpu=l4|a100]}"
 ON_DEMAND=false
 NEXT_JOB=""
+GPU_TYPE="l4"
 for arg in "${@:2}"; do
     case "$arg" in
         --on-demand) ON_DEMAND=true ;;
         --next-job=*) NEXT_JOB="${arg#--next-job=}" ;;
+        --gpu=*) GPU_TYPE="${arg#--gpu=}" ;;
     esac
 done
 
@@ -22,8 +24,23 @@ PROJECT="${GCE_PROJECT:?Set GCE_PROJECT to your GCP project ID}"
 BUCKET="${GCE_BUCKET:-gs://sonata-training-${PROJECT}}"
 ZONE="${GCE_ZONE:-us-central1-a}"
 VM_NAME="sonata-train-${JOB//_/-}"
-MACHINE_TYPE="g2-standard-8"  # 1x L4 24GB, 8 vCPU, 32GB RAM
 BOOT_DISK_SIZE="100GB"
+
+# GPU configuration
+case "$GPU_TYPE" in
+    l4)
+        MACHINE_TYPE="g2-standard-8"       # 1x L4 24GB, 8 vCPU, 32GB RAM (~$0.22/hr SPOT)
+        ACCELERATOR="type=nvidia-l4,count=1"
+        ;;
+    a100)
+        MACHINE_TYPE="a2-highgpu-1g"       # 1x A100 40GB, 12 vCPU, 85GB RAM (~$1.10/hr SPOT)
+        ACCELERATOR="type=nvidia-tesla-a100,count=1"
+        ;;
+    *)
+        echo "ERROR: Unknown GPU '$GPU_TYPE'. Use: l4, a100"
+        exit 1
+        ;;
+esac
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -31,7 +48,7 @@ REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 echo "=== Launching GCE Training VM ==="
 echo "  Job:      $JOB"
 echo "  VM:       $VM_NAME"
-echo "  Machine:  $MACHINE_TYPE"
+echo "  Machine:  $MACHINE_TYPE ($GPU_TYPE)"
 echo "  Zone:     $ZONE"
 echo "  Bucket:   $BUCKET"
 if $ON_DEMAND; then
@@ -136,7 +153,7 @@ gcloud compute instances create "$VM_NAME" \
     --project="$PROJECT" \
     --zone="$ZONE" \
     --machine-type="$MACHINE_TYPE" \
-    --accelerator="type=nvidia-l4,count=1" \
+    --accelerator="$ACCELERATOR" \
     --boot-disk-size="$BOOT_DISK_SIZE" \
     --image-family="pytorch-2-7-cu128-ubuntu-2204-nvidia-570" \
     --image-project="deeplearning-platform-release" \

@@ -15,7 +15,7 @@ The flagship **Sonata TTS** is a from-scratch SOTA speech synthesis system:
 - **Streaming Chunked Generation**: Adaptive chunk sizes (12 first / 20-80 subsequent tokens) with prosody-aware boundary detection and crossfade
 - **Sub-sentence Streaming**: Eager 4-word flush + LM text append — starts audio before full sentence arrives
 
-Supports Claude, Gemini, and on-device Llama 3.2 as LLM backends.
+Supports Claude, Gemini, Gemini Live, OpenAI Realtime, and on-device Llama 3.2 as LLM backends.
 
 ## Code Structure
 
@@ -37,6 +37,7 @@ sonata/
 │   ├── pocket_voice.c              # CoreAudio VoiceProcessingIO: mic/speaker, ring buffers, VAD
 │   ├── vdsp_prosody.c              # AMX-backed: pitch shift (STFT), volume, biquad EQ, limiter
 │   ├── audio_converter.c           # Apple AudioConverter: HW sample-rate conversion
+│   ├── audio_mixer.c / .h          # 4-channel lock-free mixer with ducking, crossfade, soft limiter
 │   ├── spatial_audio.c             # HRTF binaural 3D audio positioning
 │   ├── opus_codec.c                # libopus: real-time audio compression
 │   ├── conformer_stt.c / .h        # Pure C FastConformer CTC STT engine
@@ -53,6 +54,7 @@ sonata/
 │   ├── sonata_istft.c / .h         # Sonata iSTFT decoder: mag+phase → audio via vDSP (5000x RT)
 │   ├── sonata_stt.c / .h           # Sonata STT: CTC streaming ASR (RoPE conformer, beam, EOU, timestamps)
 │   ├── sonata_refiner.c / .h       # Sonata Refiner: semantic → text encoder-decoder (GQA, KV cache)
+│   ├── speculative_gen.c / .h     # Multi-draft speculative LLM generation with prefix validation
 │   ├── spm_tokenizer.c / .h        # SentencePiece tokenizer (pure C, greedy unigram)
 │   ├── prosody_predict.c / .h      # Text-based prosody: syllables, emotion, adaptation, EmoSteer
 │   ├── prosody_log.c / .h          # Real-time JSONL prosody logging for dashboard visualization
@@ -63,11 +65,15 @@ sonata/
 │   ├── speaker_diarizer.c / .h     # ONNX speaker diarization (multi-speaker segmentation)
 │   ├── noise_gate.c / .h           # Spectral noise gate for STT preprocessing (vDSP FFT)
 │   ├── native_vad.c / .h           # Pure C VAD: learned STFT + Conv + LSTM, AMX-accelerated
+│   ├── intent_router.c / .h        # Neural MLP response routing: fast/medium/full/backchannel
+│   ├── neural_backchannel.c / .h   # TTS-synthesized voice-matched backchannels (9 types)
+│   ├── response_cache.c / .h       # Pre-synthesized audio cache for instant fast-path responses
 │   ├── speech_detector.c / .h      # Unified VAD + EOU: wraps native_vad + mimi_ep + fused_eou
 │   ├── bnns_conformer.c / .h       # BNNS Conformer: ANE-offloaded STT encoder
 │   ├── bnns_convnext_decoder.c / .h # BNNS ConvNeXt decoder: ANE-offloaded Sonata decoder
 │   ├── tdt_decoder.c / .h          # Token-and-Duration Transducer decoder
 │   ├── ctc_beam_decoder.cpp / .h   # CTC prefix beam search with optional KenLM LM
+│   ├── vap_model.c / .h            # Voice Activity Projection: transformer turn-taking at 50Hz
 │   ├── voice_quality.c / .h        # Voice quality measurement (Accelerate-based)
 │   ├── latency_profiler.c / .h     # mach_absolute_time nanosecond latency profiling
 │   ├── metal_loader.c / .h         # Metal shader loader (Objective-C bridge)
@@ -80,6 +86,8 @@ sonata/
 │   ├── tensor_ops.metal            # Metal compute shaders for GPU tensor operations
 │   ├── silero_vad.h                # (deprecated) Silero ONNX VAD header — use native_vad instead
 │   ├── sonata_storm.h              # Sonata Storm FFI header (Rust cdylib interface)
+│   ├── streaming_llm.c / .h        # Gemini Live + OpenAI Realtime WebSocket audio LLM backends
+│   ├── streaming_tts.c / .h        # Continuous speculative TTS with token-level rollback
 │   ├── cJSON.c / cJSON.h           # Lightweight JSON parser (vendored, MIT)
 │   ├── neon_audio.h                # ARM NEON SIMD: float↔int16, copy, crossfade (header-only)
 │   ├── arena.h                     # Bump-pointer arena allocator (header-only)
@@ -158,6 +166,15 @@ sonata/
 │   ├── test_phonemizer_v3.c        # Phonemizer v3 tests
 │   ├── test_pipeline_threading.c   # Pipeline threading / vm_ring tests
 │   ├── test_phase2_regressions.c   # Phase 2 regression tests
+│   ├── test_audio_mixer.c          # Audio mixer: ducking, crossfade, soft limiter (19 tests)
+│   ├── test_full_duplex.c          # Full-duplex integration: all modules working together (46 tests)
+│   ├── test_intent_router.c        # Intent router: routing paths, confidence, heuristic (26 tests)
+│   ├── test_neural_backchannel.c   # Neural backchannel: cache, generate, speaker match (27 tests)
+│   ├── test_response_cache.c       # Response cache: warm, save/load, variants (55 tests)
+│   ├── test_speculative_gen.c      # Speculative gen: drafts, commit, cancel, prefix (38 tests)
+│   ├── test_streaming_llm.c        # Streaming LLM: Gemini/OpenAI protocol, base64 (23 tests)
+│   ├── test_streaming_tts.c       # Streaming TTS: feed, rollback, crossfade (39 tests)
+│   ├── test_vap.c                 # VAP model: KV cache, smoothing, streaming (23 tests)
 │   ├── bench_sonata.c              # Sonata TTS benchmark: LM, Flow+Decoder, iSTFT, E2E
 │   ├── bench_live.c                # Live STT benchmark with real audio
 │   └── bench_industry.c            # Industry benchmark comparison
@@ -194,6 +211,8 @@ sonata/
 │       ├── acquire_data.py           # Dataset download and manifest building
 │       ├── stt.py                    # Sonata STT: SonataCTC + SonataRefiner + SubwordCTCTokenizer
 │       ├── train_stt.py              # STT training: CTC + refiner with SpecAugment, speed perturb
+│       ├── train_vap.py              # VAP model training (Fisher/Switchboard/synthetic)
+│       ├── train_intent_router.py     # Intent router MLP training from conversation logs
 │       └── train_all.sh              # Unified training pipeline (codec→LM→flow→emosteer)
 ├── tools/
 │   ├── gen_wav.c                    # WAV file generation utility
@@ -272,6 +291,17 @@ make test-sonata-flow-ffi      # Sonata Flow Rust FFI tests
 make test-sonata-lm-ffi        # Sonata LM Rust FFI tests
 make test-pipeline-threading   # Pipeline threading / vm_ring tests
 make test-phase2-regressions   # Phase 2 regression tests
+
+# Full-duplex / SOTA tests
+make test-vap                 # VAP turn-taking model (23 tests)
+make test-audio-mixer          # Audio mixer ducking/crossfade (19 tests)
+make test-neural-backchannel   # Neural backchannel synthesis (27 tests)
+make test-intent-router        # Intent router paths (26 tests)
+make test-speculative-gen      # Speculative generation drafts (38 tests)
+make test-full-duplex          # Full-duplex integration (46 tests)
+make test-response-cache       # Response cache warm/save/load (55 tests)
+make test-streaming-llm        # Streaming LLM protocols (23 tests)
+make test-streaming-tts        # Streaming TTS rollback (39 tests)
 
 # Additional test targets (not in `make test` aggregate)
 make test-sonata-quality       # Sonata audio quality: WAV gen, stats, round-trip WER
@@ -371,6 +401,14 @@ Listening → Recording → Processing → Streaming → Speaking → Listening
 25. **Flow v3 interleaved encoding**: Flow v3 uses interleaved text-mel encoding — no separate encoder → duration → decoder; phoneme and mel frames are jointly encoded and generated in one stream.
 26. **BigVGAN-lite SnakeAlpha**: Sonata Vocoder uses SnakeAlpha activation for improved phase modeling and anti-aliased multi-periodicity (AMPBlock).
 27. **Dragon-FM streaming**: Flow v3 streaming provides bidirectional attention within chunks (Dragon-FM) for higher quality streaming TTS while maintaining causal constraints across chunks.
+28. **Voice Activity Projection (VAP)**: Single transformer model replaces three rule-based systems (barge-in detection, backchannel timing, EOU weights). Predicts 4 turn-taking signals at 50Hz from dual-speaker mel features. Causal self-attention with KV cache for streaming.
+29. **Full-duplex pipeline**: Speech detector, VAP model, and backchannel generator run continuously during ALL pipeline states, including STREAMING and SPEAKING. Capture audio is always processed, enabling neural barge-in and backchannel during playback.
+30. **4-channel audio mixer**: TTS, backchannel, pre-synthesized cache, and cloud audio LLM all route through a priority mixer with ducking. Backchannels reduce main TTS volume by 0.4x during overlap. Lock-free SPSC rings per channel.
+31. **Neural intent routing**: Learned MLP classifies user utterances into fast/medium/full/backchannel response paths. Fast path serves pre-synthesized audio in <50ms. Heuristic fallback when no trained weights.
+32. **Multi-draft speculation**: Instead of single-shot speculative prefill at 70% EOU, maintains 2 concurrent LLM drafts with transcript prefix validation. VAP's `p_eou` and `p_system_turn` trigger speculation earlier and more accurately.
+33. **Response cache persistence**: Pre-synthesized audio for 7 response types × 3 variants, saved to disk for cross-launch reuse. Warmed at startup via TTS callback. Voice-matched when speaker embedding is set.
+34. **Streaming audio LLM backends**: Gemini Live and OpenAI Realtime integrated via WebSocket. Audio sent/received bidirectionally while local STT+TTS runs in parallel for post-processing and quality control.
+35. **Token-level TTS rollback**: LLM tokens feed directly to TTS without sentence buffering. Audio segments track token-to-sample mapping. On barge-in or prediction error, uncommitted audio rolls back with crossfade at splice point.
 
 ### Audio Post-Processing Chain
 
@@ -400,17 +438,26 @@ All three Apple Silicon compute units run concurrently:
 The orchestrator. Handles:
 
 - CLI argument parsing
-- LLM API connection via `LLMClient` abstraction (Claude, Gemini via libcurl SSE)
+- LLM API connection via `LLMClient` abstraction (Claude, Gemini, Gemini Live, OpenAI Realtime via libcurl SSE or WebSocket)
 - State machine transitions
 - Coordinator between STT, TTS, and audio subsystems
 - `AudioPostProcessor` struct managing all post-processing state
 - Fused 3-signal EOU detection and speculative prefill logic
 - Mimi endpointer feeding from capture audio mel-energy features
 - Auto-intonation rules (question, exclamation, comma, semicolon, em-dash, quoted speech)
+- **Full-duplex operation**: Continuous speech detection during all states (including STREAMING and SPEAKING)
+- **VAP-based neural barge-in and backchannel timing** when `--vap-model` and `--neural-barge-in` enabled
+- **Audio mixer** for concurrent output sources (TTS, backchannel, cache, cloud)
+- **Intent routing** for fast-path pre-synthesized responses
+- **Multi-draft speculative generation** with transcript prefix validation
+- **Streaming TTS** with token-level rollback on barge-in or prediction error
+- **Streaming audio LLM backends** (Gemini Live, OpenAI Realtime)
+- **Response cache** for pre-synthesized audio
 
 Key structs:
 
 - `LLMClient`: Function-pointer interface for swappable LLM backends (init, send, poll, peek_tokens, cancel, commit_turn)
+- `LLMEngineType`: `LLM_ENGINE_CLAUDE`, `LLM_ENGINE_GEMINI`, `LLM_ENGINE_LOCAL`, `LLM_ENGINE_GEMINI_LIVE`, `LLM_ENGINE_OPENAI_REALTIME`
 - `ClaudeClient`: Anthropic Messages API SSE implementation
 - `GeminiClient`: Google Gemini streamGenerateContent SSE implementation
 - `PipelineConfig`: All CLI-configurable options (including `llm_engine`, `prosody_prompt`)
@@ -1015,6 +1062,118 @@ Pure C CTC speech recognition engine symmetric to Sonata TTS. Two-pass architect
 
 - Handles both RoPE (separate Wq/Wk/Wv) and legacy (fused in_proj) weight layouts
 
+### Voice Activity Projection (`src/vap_model.c`)
+
+Transformer-based turn-taking predictor that replaces rule-based EOU and backchannel timing:
+
+- Architecture: Input projection (160→d_model) → N causal transformer layers → 4 linear heads → sigmoid
+- Default config: d_model=128, n_layers=4, n_heads=4, ff_dim=256 (~2M params)
+- Input: concatenated user mel [80] + system mel [80] = [160] at 50Hz (20ms per frame)
+- Output: 4 predictions per frame:
+  - `p_user_speaking` — voice activity projection for user
+  - `p_system_turn` — when the system should take a turn
+  - `p_backchannel` — backchannel timing appropriateness
+  - `p_eou` — end of user utterance
+- KV cache for streaming (single frame at a time, ring buffer at context_len)
+- RMSNorm + SiLU activation (consistent with Sonata LM/Refiner)
+- All matrix ops via `cblas_sgemm`/`cblas_sgemv` (AMX-accelerated)
+- EMA smoothing on predictions (configurable alpha, default 0.3)
+- Binary weight format: `.vap` (header + float32 weights)
+- Pipeline integration: replaces energy-based barge-in, rule-based backchannel timing, and fixed EOU weights
+- CLI: `--vap-model PATH`, `--neural-barge-in`
+
+### Audio Mixer (`src/audio_mixer.c`)
+
+4-channel lock-free audio mixer for concurrent output sources:
+
+- Channels: MAIN (TTS), BACKCHANNEL, PRESYNTHESIZED (fast cache), CLOUD_AUDIO (streaming LLM)
+- Per-channel SPSC ring buffers (48k samples = 2s at 24kHz)
+- Priority-based ducking: lower-priority channels attenuated when higher-priority plays
+- Crossfade: per-channel fade state (0→1) for smooth activation/deactivation
+- Soft limiter: cubic soft clip, NEON-optimized
+- vDSP for gain and summing operations
+- Lock-free with `__atomic` head/tail per channel
+- Default priorities: MAIN=10, CLOUD=9, PRESYNTHESIZED=8, BACKCHANNEL=5
+
+### Neural Backchannel (`src/neural_backchannel.c`)
+
+TTS-synthesized backchannels that match the current speaker voice and emotion:
+
+- 9 backchannel types: MHM, YEAH, RIGHT, OKAY, UH_HUH, I_SEE, SURE, HMHM, LAUGH
+- Text-to-speech synthesis via weak-linked TTS engine callback
+- Pre-generation cache: `nbc_warm_cache()` synthesizes all types at startup
+- Speaker embedding: voice-matched backchannels via `nbc_set_speaker()`
+- Emotion conditioning: emotion-appropriate responses via `nbc_set_emotion()`
+- Fallback: pink-noise breath-style synthesis when no TTS engine available
+- WAV file override: `nbc_load_wav()` for custom recordings
+
+### Intent Router (`src/intent_router.c`)
+
+Learned response path classifier for minimizing latency:
+
+- Routes: FAST (<50ms), MEDIUM (local LLM), FULL (cloud LLM), BACKCHANNEL
+- Neural path: MLP (20→128→64→4) with cblas_sgemv, softmax output
+- 20 input features: word count, avg length, question mark, greeting/thanks/bye detection, question words, optional audio/VAP features
+- Heuristic fallback: pattern-matching rules when no neural weights loaded
+- Fast responses: 7 types (greeting, acknowledge, thinking, yes, no, thanks, goodbye)
+- Binary weight format: `.router` (header + float32)
+- CLI: `--intent-router PATH`, `--intent-router-default`
+
+### Speculative Generation (`src/speculative_gen.c`)
+
+Multi-draft speculative LLM generation starting before EOU:
+
+- Manages 2 concurrent draft LLM responses
+- VAP-informed: uses `p_eou` and `p_system_turn` to decide when to speculate
+- Transcript prefix validation: drafts remain valid as long as user speech extends, not diverges
+- Commit: best valid draft selected when EOU confirmed (most tokens, highest EOU)
+- Cancel: all drafts cancelled when EOU drops below threshold
+- Thread-safe: pthread_mutex for cross-thread token feeding
+- Pipeline integration: replaces single-shot speculative prefill
+- CLI: `--speculative`, `--no-speculative`
+
+### Response Cache (`src/response_cache.c`)
+
+Pre-synthesized audio for instant fast-path responses:
+
+- 7 response types × 3 text variants each (greetings, acknowledgments, etc.)
+- Warm at startup via TTS synthesis callback
+- Persistent: save/load binary format for cross-launch reuse
+- Variant rotation: incrementing counter for natural variety
+- Speaker embedding support: voice-matched cache via `response_cache_set_speaker()`
+- WAV file addition: `response_cache_add_wav()` for custom recordings
+- CLI: `--response-cache PATH`
+
+### Streaming LLM (`src/streaming_llm.c`)
+
+Gemini Live and OpenAI Realtime WebSocket audio backends:
+
+- Gemini Live: `wss://generativelanguage.googleapis.com` with BidiGenerateContent
+- OpenAI Realtime: `wss://api.openai.com/v1/realtime`
+- Text mode: LLMClient-compatible (send text, peek/consume tokens)
+- Audio mode: send PCM audio in, receive PCM audio out (bidirectional streaming)
+- Base64: self-contained encode/decode (no external dependency)
+- Audio encoding: float32 PCM for Gemini, int16 PCM for OpenAI
+- Lock-free audio receive ring buffer
+- Server VAD: configurable (use API's VAD or our own VAP/EOU)
+- LLMClient adapter: `streaming_llm_as_llm_client()` for drop-in use
+- CLI: `--llm gemini-live`, `--llm openai-rt`
+
+### Streaming TTS (`src/streaming_tts.c`)
+
+Continuous speculative TTS with token-level rollback:
+
+- Token-by-token: LLM tokens feed directly to TTS without sentence buffering
+- First chunk: eager synthesis after min_tokens_to_start (default: 4 tokens)
+- Lookahead buffer: keeps 2 tokens un-synthesized to avoid word boundary issues
+- Audio segment tracking: maps token ranges to audio sample ranges
+- Rollback: invalidate uncommitted audio from any token index forward
+- Crossfade: vDSP-accelerated fade at rollback splice points
+- Commit: mark audio as sent-to-speaker (non-rollbackable)
+- Stats: latency, rollback count, samples generated/committed/rolled back
+- Thread-safe: pthread_mutex for concurrent feed/get
+- CLI: `--streaming-tts`, `--no-streaming-tts`
+
 ## Build System
 
 The `Makefile` builds in three stages:
@@ -1308,6 +1467,31 @@ Quality targets (when models are trained):
 ### CLI Quick Reference (TTS + STT)
 
 ```bash
+# Full-duplex with VAP turn-taking
+./sonata --vap-model models/vap.vap --neural-barge-in
+
+# Intent routing with response cache
+./sonata --intent-router-default --response-cache models/response_cache.bin
+
+# Streaming TTS (token-level, no sentence buffering)
+./sonata --streaming-tts
+
+# Gemini Live audio streaming
+GEMINI_API_KEY=... ./sonata --llm gemini-live
+
+# OpenAI Realtime audio streaming
+OPENAI_API_KEY=... ./sonata --llm openai-rt
+
+# Full SOTA pipeline (all features)
+./sonata --vap-model models/vap.vap --intent-router-default \
+  --response-cache models/response_cache.bin --streaming-tts --speculative
+
+# Train VAP model
+python train/sonata/train_vap.py --synthetic 500 --epochs 10 --export --output models/vap.vap
+
+# Train intent router
+python train/sonata/train_intent_router.py --synthetic --output models/intent.router
+
 # Native C VAD (recommended — no ONNX dependency, AMX-accelerated)
 ./sonata --vad models/silero_vad.nvad
 
