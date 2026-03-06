@@ -428,16 +428,36 @@ def train(args):
             return
         g2p = PhonemeFrontend()
 
+    # Load teacher checkpoint first to infer config
+    teacher_state, ckpt_cfg = load_teacher_checkpoint(args.teacher_checkpoint)
+
+    # Infer n_speakers and speaker_dim from checkpoint config or state_dict
+    n_speakers = args.n_speakers
+    speaker_dim = None
+    if n_speakers == 0 and ckpt_cfg.get("n_speakers", 0) > 0:
+        n_speakers = ckpt_cfg["n_speakers"]
+        print(f"  Inferred n_speakers={n_speakers} from teacher checkpoint config")
+    if n_speakers == 0 and "speaker_emb.weight" in teacher_state:
+        n_speakers = teacher_state["speaker_emb.weight"].shape[0]
+        print(f"  Inferred n_speakers={n_speakers} from teacher state_dict")
+    if "speaker_emb.weight" in teacher_state:
+        speaker_dim = teacher_state["speaker_emb.weight"].shape[1]
+        print(f"  Inferred speaker_dim={speaker_dim} from teacher state_dict")
+
     if args.model_size == "large":
-        cfg = FlowV3LargeConfig(n_speakers=args.n_speakers)
+        cfg = FlowV3LargeConfig(n_speakers=n_speakers)
     else:
-        cfg = FlowV3Config(n_speakers=args.n_speakers)
+        cfg = FlowV3Config(n_speakers=n_speakers)
+
+    # Override speaker_dim to match teacher if needed
+    if speaker_dim is not None and cfg.speaker_dim != speaker_dim:
+        print(f"  Overriding speaker_dim: {cfg.speaker_dim} → {speaker_dim} (to match teacher)")
+        cfg.speaker_dim = speaker_dim
 
     if g2p is not None:
         cfg.char_vocab_size = g2p.vocab_size
 
     # Load teacher
-    teacher_state, ckpt_cfg = load_teacher_checkpoint(args.teacher_checkpoint)
     teacher = SonataFlowV3(cfg, cfg_dropout_prob=0.0).to(device)
     teacher.load_state_dict(teacher_state, strict=False)
     teacher.eval()

@@ -417,7 +417,7 @@ class FlowV3LargeConfig(FlowV3Config):
     n_heads: int = 12
     ff_mult: float = 4.0
     cond_dim: int = 768
-    speaker_dim: int = 256
+    speaker_dim: int = 384  # matches trained flow_v3_final.pt teacher checkpoint
     window_size: int = 512
     chunk_size: int = 50
 
