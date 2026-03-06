@@ -234,17 +234,16 @@ static void test_load_weights_nonexistent(void) {
 }
 
 static void test_load_mlmodelc_nonexistent(void) {
-    TEST("bnns_convnext: load_mlmodelc non-existent path returns 0");
-    /* load_mlmodelc is a stub that just logs and returns 0 */
+    TEST("bnns_convnext: load_mlmodelc non-existent path returns -1");
     BNNSConvNeXtDecoder *dec = bnns_convnext_create(
         TEST_LAYERS, TEST_DEC_DIM, TEST_KERNEL, TEST_FF_MULT,
         TEST_INPUT_DIM, TEST_NFFT);
     if (!dec) FAIL("create failed");
 
     int ret = bnns_convnext_load_mlmodelc(dec, "/nonexistent/model.mlmodelc");
-    if (ret != 0) {
+    if (ret != -1) {
         bnns_convnext_destroy(dec);
-        FAIL("expected 0 from stub (placeholder)");
+        FAIL("expected -1 for non-existent mlmodelc path");
     }
 
     bnns_convnext_destroy(dec);

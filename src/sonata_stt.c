@@ -148,6 +148,11 @@ struct SonataSTT {
     float *mel_buf;
     float *logits_buf;
 
+    /* Precomputed RoPE (cos/sin) and SiLU/GLU workspace */
+    float *rope_cos;
+    float *rope_sin;
+    float *silu_tmp;
+
     /* Streaming state */
     float *stream_audio;
     int    stream_pos;
@@ -205,15 +210,13 @@ static void linear_forward(float *out, const float *x, const float *W,
     }
 }
 
-static void silu_inplace(float *x, int n) {
+static void silu_inplace(float *x, int n, float *workspace) {
     /* Fused SiLU via vvexpf + NEON — 3 passes instead of per-element expf */
-    float tmp[4096];
-    float *t = (n <= 4096) ? tmp : (float *)malloc(n * sizeof(float));
-    if (!t) { for (int i = 0; i < n; i++) x[i] = x[i] / (1.0f + expf(-x[i])); return; }
+    float *t = workspace;
     vDSP_vneg(x, 1, t, 1, n);
     int ni = n;
     vvexpf(t, t, &ni);
-#if defined(__ARM_NEON__)
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
     int i = 0;
     float32x4_t one = vdupq_n_f32(1.0f);
     for (; i + 4 <= n; i += 4) {
@@ -225,7 +228,6 @@ static void silu_inplace(float *x, int n) {
 #else
     for (int i = 0; i < n; i++) x[i] = x[i] / (1.0f + t[i]);
 #endif
-    if (t != tmp) free(t);
 }
 
 static void softmax_row(float *x, int len) {
@@ -250,17 +252,20 @@ static void feed_forward(float *out, const float *x, const BlockWeights *bw,
                           const float *up_w, const float *up_b,
                           const float *down_w, const float *down_b,
                           float *buf_norm, float *buf_ff,
+                          float *silu_ws,
                           int T, int D, int ff_dim) {
     layer_norm(buf_norm, x, ln_w, ln_b, T, D);
     linear_forward(buf_ff, buf_norm, up_w, up_b, T, D, ff_dim);
-    silu_inplace(buf_ff, T * ff_dim);
+    silu_inplace(buf_ff, T * ff_dim, silu_ws);
     linear_forward(out, buf_ff, down_w, down_b, T, ff_dim, D);
 }
 
 static void mhsa_forward(float *out, const float *x, const BlockWeights *bw,
                           float *buf_norm, float *buf_qkv, float *buf_attn,
+                          const float *rope_cos, const float *rope_sin,
                           int T, int D, int n_heads) {
     int head_dim = D / n_heads;
+    int half_dim = head_dim / 2;
     layer_norm(buf_norm, x, bw->attn_ln_w, bw->attn_ln_b, T, D);
 
     linear_forward(buf_qkv, buf_norm, bw->attn_qkv_w, bw->attn_qkv_b, T, D, 3 * D);
@@ -269,16 +274,14 @@ static void mhsa_forward(float *out, const float *x, const BlockWeights *bw,
     float *K = buf_qkv + T * D;
     float *V = buf_qkv + T * 2 * D;
 
-    /* Apply RoPE (Rotary Position Encoding) to Q and K */
-    int half_dim = head_dim / 2;
+    /* Apply RoPE (Rotary Position Encoding) to Q and K — precomputed tables */
     for (int t = 0; t < T; t++) {
         for (int h = 0; h < n_heads; h++) {
             float *qt = Q + t * D + h * head_dim;
             float *kt = K + t * D + h * head_dim;
             for (int i = 0; i < half_dim; i++) {
-                float theta = (float)t * powf(10000.0f, -(2.0f * i) / (float)head_dim);
-                float cos_t = cosf(theta);
-                float sin_t = sinf(theta);
+                float cos_t = rope_cos[t * half_dim + i];
+                float sin_t = rope_sin[t * half_dim + i];
                 float q0 = qt[2*i], q1 = qt[2*i+1];
                 qt[2*i]   = q0 * cos_t - q1 * sin_t;
                 qt[2*i+1] = q0 * sin_t + q1 * cos_t;
@@ -335,6 +338,7 @@ static void mhsa_forward(float *out, const float *x, const BlockWeights *bw,
 
 static void conv_module(float *out, const float *x, const BlockWeights *bw,
                          float *buf_norm, float *buf_conv, float *buf_pw1,
+                         float *silu_ws,
                          int T, int D, int kernel) {
     if (T > 2048) return;  /* stack buffers below are sized for T <= 2048 */
     layer_norm(buf_norm, x, bw->conv_ln_w, bw->conv_ln_b, T, D);
@@ -343,12 +347,34 @@ static void conv_module(float *out, const float *x, const BlockWeights *bw,
     float *pw1_out = buf_pw1;
     linear_forward(pw1_out, buf_norm, bw->conv_pw1_w, bw->conv_pw1_b, T, D, 2 * D);
 
-    for (int t = 0; t < T; t++) {
-        float *a = pw1_out + t * 2 * D;
-        float *b_half = a + D;
-        float *dest = buf_norm + t * D;
-        for (int i = 0; i < D; i++)
-            dest[i] = a[i] * (1.0f / (1.0f + expf(-b_half[i])));
+    /* Vectorized GLU: dest = a * sigmoid(b) */
+    {
+        int total = T * D;
+        float *sig_buf = silu_ws;
+        /* Gather all b_half values contiguously */
+        for (int t = 0; t < T; t++)
+            memcpy(sig_buf + t * D, pw1_out + t * 2 * D + D, (size_t)D * sizeof(float));
+        /* sigmoid(b) = 1/(1+exp(-b)) via vDSP */
+        vDSP_vneg(sig_buf, 1, sig_buf, 1, total);
+        int ni = total;
+        vvexpf(sig_buf, sig_buf, &ni);
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
+        int k = 0;
+        float32x4_t one = vdupq_n_f32(1.0f);
+        for (; k + 4 <= total; k += 4) {
+            float32x4_t e = vld1q_f32(sig_buf + k);
+            vst1q_f32(sig_buf + k, vdivq_f32(one, vaddq_f32(one, e)));
+        }
+        for (; k < total; k++) sig_buf[k] = 1.0f / (1.0f + sig_buf[k]);
+#else
+        for (int k = 0; k < total; k++) sig_buf[k] = 1.0f / (1.0f + sig_buf[k]);
+#endif
+        /* dest = a * sigmoid(b) */
+        for (int t = 0; t < T; t++) {
+            float *a = pw1_out + t * 2 * D;
+            float *dest = buf_norm + t * D;
+            vDSP_vmul(a, 1, sig_buf + t * D, 1, dest, 1, D);
+        }
     }
 
     int pad = kernel / 2;
@@ -381,32 +407,34 @@ static void conv_module(float *out, const float *x, const BlockWeights *bw,
             dw_out[t * D + i] = dw_out[t * D + i] * scale + bias;
     }
 
-    silu_inplace(dw_out, T * D);
+    silu_inplace(dw_out, T * D, silu_ws);
     linear_forward(out, dw_out, bw->conv_pw2_w, bw->conv_pw2_b, T, D, D);
 }
 
 static void conformer_block(float *x, const BlockWeights *bw,
                               float *buf_b, float *buf_ff, float *buf_qkv,
                               float *buf_attn, float *buf_conv, float *buf_pw1,
+                              const float *rope_cos, const float *rope_sin,
+                              float *silu_ws,
                               int T, int D, int ff_dim, int n_heads, int conv_kernel) {
     feed_forward(buf_b, x, bw,
                  bw->ff1_ln_w, bw->ff1_ln_b,
                  bw->ff1_up_w, bw->ff1_up_b,
                  bw->ff1_down_w, bw->ff1_down_b,
-                 buf_conv, buf_ff, T, D, ff_dim);
+                 buf_conv, buf_ff, silu_ws, T, D, ff_dim);
     for (int i = 0; i < T * D; i++) x[i] += 0.5f * buf_b[i];
 
-    mhsa_forward(buf_b, x, bw, buf_conv, buf_qkv, buf_attn, T, D, n_heads);
+    mhsa_forward(buf_b, x, bw, buf_conv, buf_qkv, buf_attn, rope_cos, rope_sin, T, D, n_heads);
     vDSP_vadd(x, 1, buf_b, 1, x, 1, T * D);
 
-    conv_module(buf_b, x, bw, buf_conv + T * D, buf_conv, buf_pw1, T, D, conv_kernel);
+    conv_module(buf_b, x, bw, buf_conv + T * D, buf_conv, buf_pw1, silu_ws, T, D, conv_kernel);
     vDSP_vadd(x, 1, buf_b, 1, x, 1, T * D);
 
     feed_forward(buf_b, x, bw,
                  bw->ff2_ln_w, bw->ff2_ln_b,
                  bw->ff2_up_w, bw->ff2_up_b,
                  bw->ff2_down_w, bw->ff2_down_b,
-                 buf_conv, buf_ff, T, D, ff_dim);
+                 buf_conv, buf_ff, silu_ws, T, D, ff_dim);
     for (int i = 0; i < T * D; i++) x[i] += 0.5f * buf_b[i];
 
     layer_norm(buf_b, x, bw->final_ln_w, bw->final_ln_b, T, D);
@@ -534,12 +562,13 @@ static int run_encoder(SonataSTT *stt, const float *pcm, int n_samples,
         conformer_block(x, &stt->blocks[l],
                         stt->buf_b, stt->buf_ff, stt->buf_qkv,
                         stt->buf_attn, stt->buf_conv, stt->buf_pw1,
+                        stt->rope_cos, stt->rope_sin, stt->silu_tmp,
                         n_frames, D, ff, stt->n_heads, stt->conv_kernel);
     }
 
     layer_norm(stt->buf_b, x, stt->adapter_ln_w, stt->adapter_ln_b, n_frames, D);
     linear_forward(x, stt->buf_b, stt->adapter_w, stt->adapter_b, n_frames, D, D);
-    silu_inplace(x, n_frames * D);
+    silu_inplace(x, n_frames * D, stt->silu_tmp);
 
     linear_forward(out_logits, x, stt->ctc_w, stt->ctc_b,
                    n_frames, D, stt->text_vocab);
@@ -738,6 +767,32 @@ SonataSTT *sonata_stt_create(const char *weights_path) {
     stt->mel_buf = calloc(MAX_FRAMES * stt->n_mels, sizeof(float));
     stt->logits_buf = calloc(MAX_FRAMES * (size_t)stt->text_vocab, sizeof(float));
 
+    /* RoPE precomputation */
+    int half_dim = stt->head_dim / 2;
+    stt->rope_cos = malloc((size_t)MAX_FRAMES * half_dim * sizeof(float));
+    stt->rope_sin = malloc((size_t)MAX_FRAMES * half_dim * sizeof(float));
+    if (!stt->rope_cos || !stt->rope_sin) {
+        fprintf(stderr, "[sonata_stt] Failed to allocate RoPE tables\n");
+        free(stt->rope_cos);
+        free(stt->rope_sin);
+        goto cleanup_create;
+    }
+    for (int i = 0; i < half_dim; i++) {
+        float freq = 1.0f / powf(10000.0f, 2.0f * i / (float)stt->head_dim);
+        for (int t = 0; t < MAX_FRAMES; t++) {
+            float angle = (float)t * freq;
+            stt->rope_cos[t * half_dim + i] = cosf(angle);
+            stt->rope_sin[t * half_dim + i] = sinf(angle);
+        }
+    }
+
+    /* SiLU/GLU workspace (avoid malloc in hot path) */
+    stt->silu_tmp = calloc((size_t)MAX_FRAMES * MAX_FF_DIM, sizeof(float));
+    if (!stt->silu_tmp) {
+        fprintf(stderr, "[sonata_stt] Failed to allocate silu workspace\n");
+        goto cleanup_create;
+    }
+
     stt->align_token_id = calloc(MAX_FRAMES, sizeof(int));
     stt->align_frame = calloc(MAX_FRAMES, sizeof(int));
     stt->align_prob = calloc(MAX_FRAMES, sizeof(float));
@@ -757,6 +812,26 @@ SonataSTT *sonata_stt_create(const char *weights_path) {
             (float)hdr->n_weights / 1e6f);
 
     return stt;
+
+cleanup_create:
+    mel_destroy(stt->mel);
+    free(stt->blocks);
+    free(stt->buf_a);
+    free(stt->buf_b);
+    free(stt->buf_ff);
+    free(stt->buf_qkv);
+    free(stt->buf_attn);
+    free(stt->buf_conv);
+    free(stt->buf_pw1);
+    free(stt->mel_buf);
+    free(stt->logits_buf);
+    free(stt->rope_cos);
+    free(stt->rope_sin);
+    free(stt->silu_tmp);
+    if (stt->mmap_base)
+        munmap(stt->mmap_base, stt->mmap_size);
+    free(stt);
+    return NULL;
 }
 
 void sonata_stt_destroy(SonataSTT *stt) {
@@ -772,6 +847,9 @@ void sonata_stt_destroy(SonataSTT *stt) {
     free(stt->buf_pw1);
     free(stt->mel_buf);
     free(stt->logits_buf);
+    free(stt->rope_cos);
+    free(stt->rope_sin);
+    free(stt->silu_tmp);
     free(stt->align_token_id);
     free(stt->align_frame);
     free(stt->align_prob);

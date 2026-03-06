@@ -71,6 +71,11 @@ static cblas_hgemm_fn get_cblas_hgemm(void) {
 #define MAX_TRANSCRIPT  16384
 #define CHUNK_FRAMES    8000   /* Mel frames per chunk (~80s at 10ms hop) */
 #define MAX_SUB_CONVS   6      /* Max conv layers in subsampling */
+/* Worst-case im2col for Conv2D subsampling: col_h * out_spatial.
+   First stage (c_in=1,K=3): 9 * ~4000 * ~40 ≈ 1.4e6.
+   Later stage (c_in=D,K=3,G=1): D*9 * ~2000*20 ≈ 92e6. Cap at 4M (~16MB) with
+   fallback to scalar path for rare oversized cases. */
+#define MAX_CONV2D_COL_NEED  (4000000UL)
 #define MAX_PRED_LAYERS 4      /* Max LSTM layers in TDT prediction net */
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -163,6 +168,7 @@ typedef struct {
     float *conv_mid;
     float *logits;
     float *sub_work;       /* Large buffer for subsampling intermediates */
+    float *conv2d_col;     /* [MAX_CONV2D_COL_NEED] im2col buffer for Conv2D hot path */
     float *rel_pe;         /* Scratch for relative PE [2*T, D] — allocated per max T */
     float *rel_pe_proj;    /* Scratch for projected PE [2*T, D] */
 
@@ -823,18 +829,16 @@ static void conv2d_forward(float *out, const float *in,
             }
         }
     } else if (groups == 1) {
-        /* Standard conv: im2col + GEMM (AMX-accelerated) */
+        /* Standard conv: im2col + GEMM (AMX-accelerated).
+           work_buf must be pre-allocated by caller (conv2d_col from workspace). */
         int col_h = C_in * Kh * Kw;
         size_t col_need = (size_t)col_h * out_spatial;
-        float *col = (col_need <= work_sz && work_buf) ? work_buf
-                     : (float *)malloc(col_need * sizeof(float));
-        if (col) {
-            im2col(in, col, C_in, T_in, F_in, Kh, Kw, Sh, Sw, T_out, F_out);
+        if (col_need <= work_sz && work_buf) {
+            im2col(in, work_buf, C_in, T_in, F_in, Kh, Kw, Sh, Sw, T_out, F_out);
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                         C_out, out_spatial, col_h,
-                        1.0f, W, col_h, col, out_spatial,
+                        1.0f, W, col_h, work_buf, out_spatial,
                         0.0f, out, out_spatial);
-            if (col != work_buf) free(col);
             if (bias) {
                 for (int co = 0; co < C_out; co++) {
                     float b = bias[co];
@@ -844,7 +848,8 @@ static void conv2d_forward(float *out, const float *in,
             }
             return;
         }
-        /* Fall through to scalar if malloc fails */
+        /* Buffer too small: fall through to scalar path (should not happen with
+           correctly sized workspace). */
     }
 
     if (groups > 1 || (groups == 1 && Kh > 1)) {
@@ -976,7 +981,7 @@ static int conv1d_subsample_forward(float *out, const float *mel_in, int T,
  */
 static int dw_striding_forward(float *out, const float *mel_in, int T,
                                const SubsamplingWeights *sw, int n_mels, int D,
-                               float *work) {
+                               float *work, float *conv2d_col, size_t conv2d_col_cap) {
     int C_cur = 1, T_cur = T, F_cur = n_mels;
 
     float *cur  = work;
@@ -997,7 +1002,7 @@ static int dw_striding_forward(float *out, const float *mel_in, int T,
 
         conv2d_forward(next, cur, sw->convs[i].w, sw->convs[i].b,
                        c_in, c_out, T_cur, F_cur, K, K, S, S, G,
-                       NULL, 0);
+                       conv2d_col, conv2d_col_cap);
 
         int out_n = c_out * T_next * F_next;
 
@@ -1041,7 +1046,8 @@ static int subsample_forward(float *out, const float *mel_in, int T,
     case CSTT_SUB_DW_STRIDING:
     case CSTT_SUB_CONV2D:
         return dw_striding_forward(out, mel_in, T, sw, n_mels, D,
-                                   stt->work.sub_work);
+                                   stt->work.sub_work,
+                                   stt->work.conv2d_col, MAX_CONV2D_COL_NEED);
     default:
         return conv1d_subsample_forward(out, mel_in, T, sw, n_mels, D,
                                                stt->work.sub_work);
@@ -2450,6 +2456,9 @@ static int workspace_alloc(Workspace *ws, const CSTTHeader *h) {
     size_t sub_sz = 2 * (size_t)D * CHUNK_FRAMES * n_mels;
     ws->sub_work = (float *)calloc(sub_sz, sizeof(float));
 
+    /* Pre-allocated im2col buffer for Conv2D hot path (avoids malloc in inference) */
+    ws->conv2d_col = (float *)calloc(MAX_CONV2D_COL_NEED, sizeof(float));
+
     /* Relative PE scratch: max pe_len = 2*MAX_SEQ_LEN + CACHE_MAX_CONTEXT - 1
        (asymmetric case: Q[T] x K[T + CACHE_MAX_CONTEXT]) */
     if (h->flags & CSTT_FLAG_REL_PE) {
@@ -2530,7 +2539,7 @@ static int workspace_alloc(Workspace *ws, const CSTTHeader *h) {
 
     if (!ws->buf_a || !ws->buf_b || !ws->residual || !ws->qkv ||
         !ws->attn_scores || !ws->ff_mid || !ws->conv_mid ||
-        !ws->logits || !ws->sub_work || !ws->silu_tmp ||
+        !ws->logits || !ws->sub_work || !ws->conv2d_col || !ws->silu_tmp ||
         !ws->cache_k_full || !ws->cache_v_full || !ws->cache_scores ||
         !ws->cache_qh || !ws->cache_kh || !ws->cache_vh || !ws->cache_ctx ||
         !ws->cache_conv_merged || !ws->cache_conv_out ||
@@ -2554,6 +2563,7 @@ static void workspace_free(Workspace *ws) {
     free(ws->conv_mid);
     free(ws->logits);
     free(ws->sub_work);
+    free(ws->conv2d_col);
     free(ws->rel_pe);
     free(ws->rel_pe_proj);
     free(ws->silu_tmp);

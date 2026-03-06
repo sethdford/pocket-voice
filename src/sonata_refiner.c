@@ -14,6 +14,9 @@
 #define ACCELERATE_NEW_LAPACK
 #endif
 #include <Accelerate/Accelerate.h>
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -146,6 +149,8 @@ struct SonataRefiner {
     float *dec_buf;      /* working buffer for decoder */
     float *buf_a;
     float *buf_b;
+    float *silu_ws;      /* workspace for vectorized SiLU */
+    float *buf_attn;     /* encoder MHSA: Qh,Kh,Vh,scores */
 };
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -154,10 +159,11 @@ struct SonataRefiner {
 
 static void rms_norm(float *out, const float *x, const float *w,
                      int n, float eps) {
-    float sum_sq = 0.0f;
-    for (int i = 0; i < n; i++) sum_sq += x[i] * x[i];
+    float sum_sq;
+    vDSP_svesq(x, 1, &sum_sq, n);
     float rms = 1.0f / sqrtf(sum_sq / (float)n + eps);
-    for (int i = 0; i < n; i++) out[i] = x[i] * rms * w[i];
+    vDSP_vsmul(x, 1, &rms, out, 1, n);
+    vDSP_vmul(out, 1, w, 1, out, 1, n);
 }
 
 static void rms_norm_rows(float *out, const float *x, const float *w,
@@ -177,9 +183,22 @@ static void linear(float *out, const float *x, const float *W, const float *b,
     }
 }
 
-static void silu_inplace(float *x, int n) {
-    for (int i = 0; i < n; i++)
-        x[i] = x[i] / (1.0f + expf(-x[i]));
+static void silu_inplace(float *x, int n, float *workspace) {
+    vDSP_vneg(x, 1, workspace, 1, n);
+    int ni = n;
+    vvexpf(workspace, workspace, &ni);
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
+    int i = 0;
+    float32x4_t one = vdupq_n_f32(1.0f);
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t xi = vld1q_f32(x + i);
+        float32x4_t ei = vld1q_f32(workspace + i);
+        vst1q_f32(x + i, vdivq_f32(xi, vaddq_f32(one, ei)));
+    }
+    for (; i < n; i++) x[i] = x[i] / (1.0f + workspace[i]);
+#else
+    for (int i = 0; i < n; i++) x[i] = x[i] / (1.0f + workspace[i]);
+#endif
 }
 
 static void softmax_row(float *x, int len) {
@@ -200,9 +219,7 @@ static void encoder_mhsa(float *out, const float *x, const EncLayerWeights *lw,
                          int T, int D, int n_heads) {
     int head_dim = D / n_heads;
     rms_norm_rows(buf_norm, x, lw->attn_norm_w, T, D, 1e-5f);
-
-    linear(buf_qkv, buf_norm, lw->attn_in_proj_w, lw->attn_in_proj_b,
-          T, D, 3 * D);
+    linear(buf_qkv, buf_norm, lw->attn_in_proj_w, lw->attn_in_proj_b, T, D, 3 * D);
 
     float *Q = buf_qkv;
     float *K = buf_qkv + T * D;
@@ -212,24 +229,35 @@ static void encoder_mhsa(float *out, const float *x, const EncLayerWeights *lw,
     memset(out, 0, T * D * sizeof(float));
 
     for (int h = 0; h < n_heads; h++) {
-        for (int qi = 0; qi < T; qi++) {
-            for (int ki = 0; ki < T; ki++) {
-                float dot = 0;
-                const float *qr = Q + qi * D + h * head_dim;
-                const float *kr = K + ki * D + h * head_dim;
-                vDSP_dotpr(qr, 1, kr, 1, &dot, head_dim);
-                buf_attn[qi * T + ki] = dot * scale;
-            }
-            softmax_row(buf_attn + qi * T, T);
+        /* Gather head-strided Q,K,V into contiguous blocks for GEMM */
+        float *Qh = buf_attn;
+        float *Kh = buf_attn + T * head_dim;
+        float *Vh = buf_attn + 2 * T * head_dim;
+        float *scores = buf_attn + 3 * T * head_dim;
+
+        for (int t = 0; t < T; t++) {
+            memcpy(Qh + t * head_dim, Q + t * D + h * head_dim, head_dim * sizeof(float));
+            memcpy(Kh + t * head_dim, K + t * D + h * head_dim, head_dim * sizeof(float));
+            memcpy(Vh + t * head_dim, V + t * D + h * head_dim, head_dim * sizeof(float));
         }
-        for (int qi = 0; qi < T; qi++) {
-            float *orow = out + qi * D + h * head_dim;
-            for (int vi = 0; vi < T; vi++) {
-                float w = buf_attn[qi * T + vi];
-                const float *vr = V + vi * D + h * head_dim;
-                for (int d = 0; d < head_dim; d++) orow[d] += w * vr[d];
-            }
-        }
+
+        /* scores = scale * Qh @ Kh^T */
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    T, T, head_dim,
+                    scale, Qh, head_dim, Kh, head_dim,
+                    0.0f, scores, T);
+
+        for (int qi = 0; qi < T; qi++)
+            softmax_row(scores + qi * T, T);
+
+        /* context = scores @ Vh */
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    T, head_dim, T,
+                    1.0f, scores, T, Vh, head_dim,
+                    0.0f, Qh, head_dim);
+
+        for (int t = 0; t < T; t++)
+            memcpy(out + t * D + h * head_dim, Qh + t * head_dim, head_dim * sizeof(float));
     }
 
     memcpy(buf_norm, out, T * D * sizeof(float));
@@ -237,10 +265,11 @@ static void encoder_mhsa(float *out, const float *x, const EncLayerWeights *lw,
 }
 
 static void encoder_ffn(float *out, const float *x, const EncLayerWeights *lw,
-                       float *buf_norm, float *buf_ff, int T, int D, int ff) {
+                       float *buf_norm, float *buf_ff, float *silu_ws,
+                       int T, int D, int ff) {
     rms_norm_rows(buf_norm, x, lw->ffn_norm_w, T, D, 1e-5f);
     linear(buf_ff, buf_norm, lw->ffn_up_w, lw->ffn_up_b, T, D, ff);
-    silu_inplace(buf_ff, T * ff);
+    silu_inplace(buf_ff, T * ff, silu_ws);
     linear(out, buf_ff, lw->ffn_down_w, lw->ffn_down_b, T, ff, D);
 }
 
@@ -252,17 +281,15 @@ static void encoder_forward(SonataRefiner *ref, const float *x, int T,
 
     float *buf = ref->buf_a;
     float *buf2 = ref->buf_b;
-    size_t buf_sz = (size_t)T * D * 4 + T * T;  /* qkv + attn */
-    if (buf_sz < (size_t)T * ff * 2) buf_sz = (size_t)T * ff * 2;
     float *tmp = ref->dec_buf;
 
     memcpy(enc_out, x, (size_t)T * D * sizeof(float));
 
     for (int l = 0; l < ref->enc_n_layers; l++) {
         const EncLayerWeights *lw = &ref->enc_layers[l];
-        encoder_mhsa(buf, enc_out, lw, buf2, tmp, tmp + T * 3 * D, T, D, n_heads);
+        encoder_mhsa(buf, enc_out, lw, buf2, tmp, ref->buf_attn, T, D, n_heads);
         for (int i = 0; i < T * D; i++) enc_out[i] += buf[i];
-        encoder_ffn(buf, enc_out, lw, buf2, tmp, T, D, ff);
+        encoder_ffn(buf, enc_out, lw, buf2, tmp, ref->silu_ws, T, D, ff);
         for (int i = 0; i < T * D; i++) enc_out[i] += buf[i];
     }
     rms_norm_rows(enc_out, enc_out, ref->enc_norm_w, T, D, 1e-5f);
@@ -402,12 +429,12 @@ static void decoder_cross_attn_step(float *out, const float *x,
 
 static void decoder_ffn_step(float *out, const float *x,
                              const DecLayerWeights *lw, float *buf_norm,
-                             float *buf_ff, int D, int ff) {
+                             float *buf_ff, float *silu_ws, int D, int ff) {
     rms_norm(buf_norm, x, lw->ffn_norm_w, D, 1e-5f);
     cblas_sgemv(CblasRowMajor, CblasNoTrans, ff, D, 1.0f, lw->ffn_up_w, D,
                 buf_norm, 1, 0.0f, buf_ff, 1);
     vDSP_vadd(buf_ff, 1, lw->ffn_up_b, 1, buf_ff, 1, ff);
-    silu_inplace(buf_ff, ff);
+    silu_inplace(buf_ff, ff, silu_ws);
     cblas_sgemv(CblasRowMajor, CblasNoTrans, D, ff, 1.0f, lw->ffn_down_w, ff,
                 buf_ff, 1, 0.0f, out, 1);
     vDSP_vadd(out, 1, lw->ffn_down_b, 1, out, 1, D);
@@ -602,8 +629,15 @@ SonataRefiner *sonata_refiner_create(const char *model_path) {
         }
     }
 
+    int enc_head_dim = enc_d_model / enc_n_heads;
+    size_t silu_ws_sz = (size_t)MAX_AUDIO_LEN * enc_d_ff;
+    if (silu_ws_sz < (size_t)MAX_TEXT_LEN * dec_d_ff)
+        silu_ws_sz = (size_t)MAX_TEXT_LEN * dec_d_ff;
+    size_t buf_attn_sz = (size_t)3 * MAX_AUDIO_LEN * enc_head_dim +
+                        (size_t)MAX_AUDIO_LEN * MAX_AUDIO_LEN;
+
     ref->enc_out = malloc((size_t)MAX_AUDIO_LEN * enc_d_model * sizeof(float));
-    /* Scratch must fit encoder MHSA (T*3*D + T*T) and decoder KV+scratch */
+    /* Scratch must fit encoder MHSA (T*3*D + buf_attn) and decoder KV+scratch */
     size_t enc_scratch = (size_t)MAX_AUDIO_LEN * enc_d_model * 3 +
                          (size_t)MAX_AUDIO_LEN * MAX_AUDIO_LEN;
     size_t dec_scratch = (size_t)MAX_AUDIO_LEN * enc_d_model * 2 +
@@ -613,12 +647,17 @@ SonataRefiner *sonata_refiner_create(const char *model_path) {
     ref->dec_buf = malloc(scratch_sz * sizeof(float));
     ref->buf_a = malloc((size_t)MAX_AUDIO_LEN * enc_d_model * 4 * sizeof(float));
     ref->buf_b = malloc((size_t)MAX_AUDIO_LEN * enc_d_model * 4 * sizeof(float));
+    ref->silu_ws = malloc(silu_ws_sz * sizeof(float));
+    ref->buf_attn = malloc(buf_attn_sz * sizeof(float));
 
-    if (!ref->enc_out || !ref->dec_buf || !ref->buf_a || !ref->buf_b) {
+    if (!ref->enc_out || !ref->dec_buf || !ref->buf_a || !ref->buf_b ||
+        !ref->silu_ws || !ref->buf_attn) {
         free(ref->enc_out);
         free(ref->dec_buf);
         free(ref->buf_a);
         free(ref->buf_b);
+        free(ref->silu_ws);
+        free(ref->buf_attn);
         free(ref->rope_cos);
         free(ref->rope_sin);
         free(ref->dec_layers);
@@ -645,6 +684,8 @@ void sonata_refiner_destroy(SonataRefiner *ref) {
     free(ref->dec_buf);
     free(ref->buf_a);
     free(ref->buf_b);
+    free(ref->silu_ws);
+    free(ref->buf_attn);
     if (ref->mmap_base)
         munmap(ref->mmap_base, ref->mmap_size);
     free(ref);
@@ -726,7 +767,7 @@ int sonata_refiner_process(SonataRefiner *ref,
 
             float *ff_out = dec_tmp;
             decoder_ffn_step(ff_out, dec_hidden, lw, dec_tmp + dec_D,
-                            dec_tmp + dec_D * 2, dec_D, ref->dec_d_ff);
+                            dec_tmp + dec_D * 2, ref->silu_ws, dec_D, ref->dec_d_ff);
             for (int i = 0; i < dec_D; i++) dec_hidden[i] += ff_out[i];
         }
         rms_norm(dec_tmp, dec_hidden, ref->dec_norm_w, dec_D, 1e-5f);
