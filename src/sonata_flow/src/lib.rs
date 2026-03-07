@@ -3091,13 +3091,20 @@ impl FlowV3CausalSlidingWindowAttention {
 
         let qkv = self.qkv.forward(x)?;
         let qkv = qkv.reshape((b, t, 3, self.n_heads, self.head_dim))?;
-        let q = qkv.narrow(2, 0, 1)?.squeeze(2)?;
-        let mut k = qkv.narrow(2, 1, 1)?.squeeze(2)?;
-        let mut v = qkv.narrow(2, 2, 1)?.squeeze(2)?;
+        // (b, t, n_heads, head_dim) → (b, n_heads, t, head_dim) for attention
+        let q = qkv.narrow(2, 0, 1)?.squeeze(2)?.transpose(1, 2)?.contiguous()?;
+        let mut k = qkv.narrow(2, 1, 1)?.squeeze(2)?.transpose(1, 2)?.contiguous()?;
+        let mut v = qkv.narrow(2, 2, 1)?.squeeze(2)?.transpose(1, 2)?.contiguous()?;
 
-        let q = self.apply_rope(&q, offset)?;
-        k = self.apply_rope(&k, offset)?;
+        // apply_rope expects 3D (b*n_heads, t, head_dim)
+        let q = self.apply_rope(
+            &q.reshape((b * self.n_heads, t, self.head_dim))?, offset)?
+            .reshape((b, self.n_heads, t, self.head_dim))?;
+        k = self.apply_rope(
+            &k.reshape((b * self.n_heads, t, self.head_dim))?, offset)?
+            .reshape((b, self.n_heads, t, self.head_dim))?;
 
+        // KV cache — concat on dim 2 (time)
         let prefix_len = kv_cache.as_ref().map(|(ck, _)| ck.dim(2).unwrap_or(0)).unwrap_or(0);
         if prefix_len > 0 {
             if let Some((ck, cv)) = kv_cache {
@@ -3113,10 +3120,9 @@ impl FlowV3CausalSlidingWindowAttention {
 
         let new_cache = (k.clone(), v.clone());
 
+        // q/k/v are (b, n_heads, t, head_dim) — matmul directly
         let scale = (self.head_dim as f64).sqrt();
-        let q_t = q.transpose(1, 2)?.contiguous()?;
-        let k_t = k.transpose(1, 2)?.contiguous()?;
-        let mut scores = q_t.matmul(&k_t.transpose(2, 3)?)?;
+        let mut scores = q.contiguous()?.matmul(&k.contiguous()?.transpose(2, 3)?)?;
         scores = scores.affine(1.0 / scale, 0.0)?;
 
         let t_trim_actual = k.dim(2)?;
@@ -3126,9 +3132,9 @@ impl FlowV3CausalSlidingWindowAttention {
         }
 
         let attn = candle_nn::ops::softmax(&scores, D::Minus1)?;
-        let v_t = v.transpose(1, 2)?;
-        let out = attn.matmul(&v_t)?;
-        let out = out.transpose(1, 2)?.reshape((b, t, self.n_heads * self.head_dim))?;
+        let out = attn.matmul(&v.contiguous()?)?;
+        // (b, n_heads, t, head_dim) → (b, t, n_heads * head_dim)
+        let out = out.transpose(1, 2)?.contiguous()?.reshape((b, t, self.n_heads * self.head_dim))?;
         let out = self.out.forward(&out)?;
         Ok((out, new_cache))
     }
@@ -3171,7 +3177,7 @@ impl FlowV3DurationPredictor {
 
     fn forward(&self, text_enc: &Tensor) -> Result<Tensor> {
         let x = text_enc.transpose(1, 2)?;
-        let x = x.pad_with_zeros(2, 1, 1)?;
+        // Conv1d with kernel=3, padding=1 (same-padding) — don't double-pad
         let x = x.conv1d(&self.conv1_weight, 1, 1, 1, 1)?;
         let x = x.broadcast_add(&self.conv1_bias.reshape((1, self.d_model, 1))?)?;
         let x = x.relu()?;
@@ -3182,7 +3188,6 @@ impl FlowV3DurationPredictor {
         let x = x.broadcast_mul(&self.norm1_weight)?.broadcast_add(&self.norm1_bias)?;
 
         let x = x.transpose(1, 2)?;
-        let x = x.pad_with_zeros(2, 1, 1)?;
         let x = x.conv1d(&self.conv2_weight, 1, 1, 1, 1)?;
         let x = x.broadcast_add(&self.conv2_bias.reshape((1, self.d_model, 1))?)?;
         let x = x.relu()?;
@@ -3200,7 +3205,7 @@ impl FlowV3DurationPredictor {
         let (b, _, d) = text_enc.dims3()?;
         let device = text_enc.device();
         let dtype = text_enc.dtype();
-        let text_s = text_enc.to_vec3::<f32>()?;
+        let text_s = text_enc.to_dtype(DType::F32)?.to_vec3::<f32>()?;
 
         let mut data = vec![0.0f32; b * target_len * d];
         for bi in 0..b {
@@ -3356,11 +3361,13 @@ impl SonataFlowV3Model {
     }
 
     fn build_conditioning(&self, t: &Tensor, t_seq: usize, speaker_id: Option<u32>, force_uncond: bool) -> Result<Tensor> {
-        let (b, _) = t.dims2()?;
+        // t may be (b,) or (b, 1) — flatten to (b,) for time_emb
+        let t_flat = if t.rank() == 2 { t.squeeze(1)? } else { t.clone() };
+        let b = t_flat.dims1()?;
         let device = t.device();
         let dtype = t.dtype();
 
-        let time_cond = self.time_emb.forward(t)?;
+        let time_cond = self.time_emb.forward(&t_flat)?;
         let target = Tensor::zeros((b, t_seq, self.config.cond_dim), dtype, device)?;
         let time_cond = time_cond.unsqueeze(1)?.broadcast_as(target.shape())?;
         let mut parts = vec![time_cond];
@@ -3500,7 +3507,7 @@ impl SonataFlowV3Model {
         for i in 0..n_steps {
             let t_val = t_schedule[i];
             let dt = t_schedule[i + 1] - t_schedule[i]; // positive: 0→1 (noise→signal)
-            let t = Tensor::from_vec(vec![t_val as f32; b], b, device)?.to_dtype(dtype)?;
+            let t = Tensor::from_vec(vec![t_val as f32; b], (b, 1), device)?.to_dtype(dtype)?;
 
             let cache_ref = caches.as_deref();
             let (v1, new_caches) = if use_cfg {
@@ -3566,7 +3573,7 @@ impl SonataFlowV3Model {
         } else {
             (self.duration_predictor.forward(&text_enc)?, 0.0)
         };
-        let mut dur = log_dur.exp()?.clamp(1.0e-6, 1e6)?;
+        let mut dur = log_dur.exp()?.clamp(1.0e-6, 1e6)?.to_dtype(DType::F32)?;
         let nonpad = char_ids.ne(0u32)?.to_dtype(DType::F32)?;
         dur = dur.broadcast_mul(&nonpad)?;
         let mut dur_int: Vec<Vec<u32>> = Vec::with_capacity(b);
@@ -3618,7 +3625,7 @@ impl SonataFlowV3Model {
                 t_schedule[i]
             };
             let dt = t_schedule[i + 1] - t_schedule[i]; // positive: 0→1 (noise→signal)
-            let t = Tensor::from_vec(vec![t_val as f32; b], b, device)?.to_dtype(dtype)?;
+            let t = Tensor::from_vec(vec![t_val as f32; b], (b, 1), device)?.to_dtype(dtype)?;
 
             let v1 = if use_cfg {
                 let v_cond = self.predict_velocity(&x, &t, &text_cond, speaker_id, false, ref_mel, emotion_id)?;
@@ -3782,7 +3789,8 @@ pub extern "C" fn sonata_flow_v3_create(
             #[cfg(not(feature = "metal"))]
             let device = Device::Cpu;
 
-            let dtype = DType::F16;
+            // Use F32 for correctness — F16 dtype mixing causes issues in ODE sampling
+            let dtype = DType::F32;
             let config_content = std::fs::read_to_string(config_str)
                 .map_err(|e| candle_core::Error::Msg(format!("Config: {}", e)))?;
             let config: FlowV3Config = serde_json::from_str(&config_content)
@@ -3961,7 +3969,7 @@ pub extern "C" fn sonata_flow_v3_stream_start(
         let char_tensor = Tensor::from_vec(ids.clone(), (1, ids.len()), &eng.device)?;
         let text_enc = eng.model.interleaved_enc.encode_text(&char_tensor)?;
         let log_dur = eng.model.duration_predictor.forward(&text_enc)?;
-        let mut dur = log_dur.exp()?.clamp(1.0e-6, 1e6)?;
+        let mut dur = log_dur.exp()?.clamp(1.0e-6, 1e6)?.to_dtype(DType::F32)?;
         let nonpad = char_tensor.ne(0u32)?.to_dtype(DType::F32)?;
         dur = dur.broadcast_mul(&nonpad)?;
         let t_text = ids.len();
@@ -4239,14 +4247,14 @@ fn vocoder_get_padding(kernel: usize, dilation: usize) -> usize {
 
 /// SnakeAlpha: x + (1/(alpha+eps)) * sin(alpha*x)^2. Alpha shape (1, channels, 1).
 fn snake_alpha_forward(x: &Tensor, alpha: &Tensor) -> Result<Tensor> {
-    let eps = 1e-9f64;
-    let eps_t = Tensor::new(eps, x.device())?.broadcast_as(alpha.shape())?;
+    let eps = 1e-9f32;
+    let eps_t = Tensor::new(eps, x.device())?.to_dtype(alpha.dtype())?.broadcast_as(alpha.shape())?;
     let alpha_safe = (alpha + &eps_t)?;
     let inv_alpha = alpha_safe.recip()?;
-    let ax = (alpha * x)?;
+    let ax = x.broadcast_mul(alpha)?;
     let sin_ax = ax.sin()?;
     let sin_sq = (&sin_ax * &sin_ax)?;
-    let term = (&sin_sq * &inv_alpha)?;
+    let term = sin_sq.broadcast_mul(&inv_alpha)?;
     (x + &term)
 }
 

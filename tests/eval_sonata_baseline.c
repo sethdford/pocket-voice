@@ -1,8 +1,8 @@
 /**
- * eval_sonata_baseline.c — Sonata TTS evaluation harness for C baseline.
+ * eval_sonata_baseline.c — Sonata TTS evaluation harness.
  *
- * Generates speech for test sentences via Sonata LM + Flow + ConvDecoder,
- * writes WAV files, and outputs a JSON report with audio statistics,
+ * V3 pipeline: Text → Flow V3 → mel → Vocoder → audio (24kHz)
+ * Writes WAV files and outputs a JSON report with audio statistics,
  * timings, prosody MOS, and optional round-trip WER via Conformer STT.
  *
  * Usage: ./eval-sonata-baseline [--out-dir <path>] [--report <path>]
@@ -28,27 +28,19 @@ typedef struct { float cosine_sim; float euclidean_dist; int n_coeffs; } Speaker
 extern SpeakerSimResult speaker_similarity(const float *audio_a, int len_a,
                                             const float *audio_b, int len_b, int sr);
 
-/* ─── FFI: Sonata LM ──────────────────────────────────────────────────── */
-extern void *sonata_lm_create(const char *weights, const char *config);
-extern void  sonata_lm_destroy(void *e);
-extern int   sonata_lm_set_text(void *e, const unsigned int *ids, int n);
-extern int   sonata_lm_step(void *e, int *out);
-extern int   sonata_lm_reset(void *e);
-extern int   sonata_lm_is_done(void *e);
-extern int   sonata_lm_set_params(void *e, float temp, int top_k, float top_p, float rep);
+/* ─── FFI: Sonata Flow V3 (text → mel) ───────────────────────────────── */
+extern void *sonata_flow_v3_create(const char *weights, const char *config);
+extern void  sonata_flow_v3_destroy(void *e);
+extern int   sonata_flow_v3_set_speaker(void *e, int speaker_id);
+extern int   sonata_flow_v3_generate(void *e, const char *text, int text_len,
+                                      const int *phoneme_ids, int phoneme_len,
+                                      int target_frames, float *out_mel, int max_frames);
 
-/* ─── FFI: Sonata Flow + ConvDecoder ──────────────────────────────────── */
-extern void *sonata_flow_create(const char *fw, const char *fc, const char *dw, const char *dc);
-extern void  sonata_flow_destroy(void *e);
-extern int   sonata_flow_generate_audio(void *e, const int *tokens, int n, float *out, int max);
-extern int   sonata_flow_decoder_type(void *e);
-extern int   sonata_flow_samples_per_frame(void *e);
-
-/* ─── FFI: SPM Tokenizer ──────────────────────────────────────────────── */
-typedef struct SPMTokenizer SPMTokenizer;
-extern SPMTokenizer *spm_create(const uint8_t *data, uint32_t size);
-extern void  spm_destroy(SPMTokenizer *t);
-extern int   spm_encode(SPMTokenizer *t, const char *text, int32_t *ids, int max);
+/* ─── FFI: Sonata Vocoder (mel → audio) ──────────────────────────────── */
+extern void *sonata_vocoder_create(const char *weights, const char *config);
+extern void  sonata_vocoder_destroy(void *e);
+extern int   sonata_vocoder_generate(void *e, const float *mel, int n_frames,
+                                      int mel_dim, float *out_audio, int max_samples);
 
 /* ─── FFI: Conformer STT (optional — may not have model) ─────────────── */
 typedef struct ConformerSTT ConformerSTT;
@@ -64,9 +56,11 @@ typedef struct { int sub, del, ins, ref_words, hyp_words; float wer, cer, accura
 extern WERResult wer_compute(const char *ref, const char *hyp);
 
 /* ─── Constants ───────────────────────────────────────────────────────── */
-#define SAMPLE_RATE 24000
-#define MAX_TOKENS  300
-#define MAX_AUDIO   (MAX_TOKENS * 480 + 8192)
+#define SAMPLE_RATE   24000
+#define MEL_DIM       80
+#define MAX_MEL_FRAMES 800
+#define HOP_LENGTH    480
+#define MAX_AUDIO     (MAX_MEL_FRAMES * HOP_LENGTH + 8192)
 
 static mach_timebase_info_data_t g_tb;
 static double now_ms(void) {
@@ -133,6 +127,7 @@ static void write_wav(const char *path, const float *audio, int n, int sr) {
 static float *resample_24k_to_16k(const float *src, int src_n, int *dst_n) {
     double ratio = 24000.0 / 16000.0;
     *dst_n = (int)((double)src_n / ratio);
+    if (*dst_n <= 0) return NULL;
     float *dst = (float *)malloc(*dst_n * sizeof(float));
     if (!dst) return NULL;
 
@@ -168,10 +163,8 @@ static AudioStats compute_stats(const float *audio, int n, int sr) {
     float mean = 0.0f;
     vDSP_meanv(audio, 1, &mean, n);
 
-    /* Compute RMS using vDSP */
     float *centered = (float *)malloc(n * sizeof(float));
     if (!centered) {
-        /* Fallback: manual computation */
         float sum_sq = 0;
         for (int i = 0; i < n; i++) sum_sq += audio[i] * audio[i];
         s.rms = sqrtf(sum_sq / n);
@@ -184,52 +177,21 @@ static AudioStats compute_stats(const float *audio, int n, int sr) {
         free(centered);
     }
 
-    /* Peak */
     vDSP_maxv(audio, 1, &s.peak, n);
     float neg_peak = 0.0f;
     vDSP_minv(audio, 1, &neg_peak, n);
     neg_peak = fabsf(neg_peak);
     if (neg_peak > s.peak) s.peak = neg_peak;
 
-    /* Zero crossing rate */
     int zero_crossings = 0;
     for (int i = 1; i < n; i++) {
         if ((audio[i] >= 0) != (audio[i-1] >= 0)) zero_crossings++;
     }
     s.zero_crossing_rate = (float)zero_crossings / n;
 
-    /* Silence detection */
     s.is_silence = (s.rms < 0.001f);
 
     return s;
-}
-
-/* ─── Helper: Load tokenizer ──────────────────────────────────────────── */
-static SPMTokenizer *load_tokenizer(const char *path) {
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        fprintf(stderr, "Error: could not open tokenizer at %s\n", path);
-        return NULL;
-    }
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    uint8_t *data = (uint8_t *)malloc(sz);
-    if (!data) { fclose(f); return NULL; }
-
-    size_t nread = fread(data, 1, sz, f);
-    fclose(f);
-
-    if ((long)nread != sz) {
-        fprintf(stderr, "Error: short read on tokenizer\n");
-        free(data);
-        return NULL;
-    }
-
-    SPMTokenizer *tok = spm_create(data, (uint32_t)sz);
-    free(data);
-    return tok;
 }
 
 /* ─── Test sentences (same as eval_comprehensive.py) ───────────────────── */
@@ -252,10 +214,10 @@ typedef struct {
     int idx;
     const char *text;
     char wav_path[256];
-    int n_tokens;
+    int n_mel_frames;
     AudioStats stats;
-    double lm_time_ms;
     double flow_time_ms;
+    double vocoder_time_ms;
     float prosody_mos;
     float wer;
     int wer_valid;
@@ -283,38 +245,29 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Warning: could not create output directories\n");
     }
 
-    fprintf(stderr, "\n═══ Sonata TTS Evaluation Harness ═══\n");
+    fprintf(stderr, "\n═══ Sonata TTS V3 Evaluation Harness ═══\n");
     fprintf(stderr, "Output dir: %s\n", out_dir);
     fprintf(stderr, "Report: %s\n", report_path);
 
-    /* Load tokenizer */
-    fprintf(stderr, "\nLoading SPM tokenizer...\n");
-    SPMTokenizer *tokenizer = load_tokenizer("models/tokenizer.model");
-    if (!tokenizer) {
-        fprintf(stderr, "Fatal: could not load tokenizer\n");
-        return 1;
-    }
-
-    /* Load Sonata LM */
-    fprintf(stderr, "Loading Sonata LM...\n");
-    void *lm = sonata_lm_create("models/sonata/sonata_lm.safetensors",
-                                 "models/sonata/sonata_lm_config.json");
-    if (!lm) {
-        fprintf(stderr, "Fatal: could not load Sonata LM\n");
-        spm_destroy(tokenizer);
-        return 1;
-    }
-
-    /* Load Sonata Flow + Decoder */
-    fprintf(stderr, "Loading Sonata Flow...\n");
-    void *flow = sonata_flow_create("models/sonata/sonata_flow.safetensors",
-                                     "models/sonata/sonata_flow_config.json",
-                                     "models/sonata/sonata_decoder.safetensors",
-                                     "models/sonata/sonata_decoder_config.json");
+    /* Load Flow V3 (text → mel) */
+    fprintf(stderr, "\nLoading Sonata Flow V3...\n");
+    void *flow = sonata_flow_v3_create("models/sonata/sonata_flow.safetensors",
+                                        "models/sonata/sonata_flow_config.json");
     if (!flow) {
-        fprintf(stderr, "Fatal: could not load Sonata Flow\n");
-        sonata_lm_destroy(lm);
-        spm_destroy(tokenizer);
+        fprintf(stderr, "Fatal: could not load Sonata Flow V3\n");
+        return 1;
+    }
+
+    /* Set default speaker */
+    sonata_flow_v3_set_speaker(flow, 0);
+
+    /* Load Vocoder (mel → audio) */
+    fprintf(stderr, "Loading Sonata Vocoder...\n");
+    void *vocoder = sonata_vocoder_create("models/sonata/sonata_vocoder.safetensors",
+                                           "models/sonata/sonata_vocoder_config.json");
+    if (!vocoder) {
+        fprintf(stderr, "Fatal: could not load Sonata Vocoder\n");
+        sonata_flow_v3_destroy(flow);
         return 1;
     }
 
@@ -326,27 +279,24 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Note: Conformer STT not available, WER will be skipped\n");
     }
 
-    /* Allocate result arrays */
+    /* Allocate result arrays and buffers */
     SentenceResult *results = (SentenceResult *)calloc(N_TEST_SENTENCES, sizeof(SentenceResult));
     if (!results) {
         fprintf(stderr, "Fatal: could not allocate results\n");
         return 1;
     }
 
+    float *mel_buf = (float *)malloc(MAX_MEL_FRAMES * MEL_DIM * sizeof(float));
     float *audio_buf = (float *)malloc(MAX_AUDIO * sizeof(float));
-    int *tokens_buf = (int *)malloc(MAX_TOKENS * sizeof(int));
-    if (!audio_buf || !tokens_buf) {
+    if (!mel_buf || !audio_buf) {
         fprintf(stderr, "Fatal: could not allocate buffers\n");
         return 1;
     }
 
-    /* Set LM parameters */
-    sonata_lm_set_params(lm, 0.7f, 50, 0.9f, 1.2f);
-
     /* Process each test sentence */
     fprintf(stderr, "\nProcessing %d test sentences...\n", (int)N_TEST_SENTENCES);
 
-    double total_lm_time = 0.0, total_flow_time = 0.0;
+    double total_flow_time = 0.0, total_vocoder_time = 0.0;
     double total_audio_duration = 0.0;
     float total_prosody_mos = 0.0;
     float total_wer = 0.0;
@@ -361,70 +311,48 @@ int main(int argc, char *argv[]) {
 
         fprintf(stderr, "[%d/%d] \"%s\"\n", idx + 1, (int)N_TEST_SENTENCES, res->text);
 
-        /* Tokenize */
-        memset(tokens_buf, 0, MAX_TOKENS * sizeof(int));
-        res->n_tokens = spm_encode(tokenizer, res->text, tokens_buf, MAX_TOKENS);
-        if (res->n_tokens <= 0) {
-            fprintf(stderr, "  Error: tokenization failed\n");
-            continue;
-        }
-        fprintf(stderr, "  Tokens: %d\n", res->n_tokens);
+        int text_len = (int)strlen(res->text);
 
-        /* LM inference with timing */
-        double lm_start = now_ms();
-
-        if (sonata_lm_reset(lm) != 0) {
-            fprintf(stderr, "  Error: LM reset failed\n");
-            continue;
-        }
-        if (sonata_lm_set_text(lm, (unsigned int *)tokens_buf, res->n_tokens) != 0) {
-            fprintf(stderr, "  Error: LM set_text failed\n");
-            continue;
-        }
-
-        int semantic_token_count = 0;
-        int semantic_tokens[MAX_TOKENS];
-        memset(semantic_tokens, 0, sizeof(semantic_tokens));
-
-        while (!sonata_lm_is_done(lm) && semantic_token_count < MAX_TOKENS) {
-            int token = 0;
-            if (sonata_lm_step(lm, &token) != 0) {
-                fprintf(stderr, "  Error: LM step failed\n");
-                break;
-            }
-            semantic_tokens[semantic_token_count++] = token;
-        }
-
-        double lm_end = now_ms();
-        res->lm_time_ms = lm_end - lm_start;
-        total_lm_time += res->lm_time_ms;
-
-        fprintf(stderr, "  Semantic tokens: %d, LM time: %.2f ms\n", semantic_token_count, res->lm_time_ms);
-
-        if (semantic_token_count == 0) {
-            fprintf(stderr, "  Warning: no semantic tokens generated\n");
-            continue;
-        }
-
-        /* Flow + Decoder inference with timing */
+        /* Flow V3: text → mel */
         double flow_start = now_ms();
 
-        memset(audio_buf, 0, MAX_AUDIO * sizeof(float));
-        int n_samples = sonata_flow_generate_audio(flow, semantic_tokens, semantic_token_count,
-                                                    audio_buf, MAX_AUDIO);
+        memset(mel_buf, 0, MAX_MEL_FRAMES * MEL_DIM * sizeof(float));
+        int n_frames = sonata_flow_v3_generate(flow,
+                                                res->text, text_len,
+                                                NULL, 0,  /* no phoneme override */
+                                                0,        /* auto target frames */
+                                                mel_buf, MAX_MEL_FRAMES);
 
         double flow_end = now_ms();
         res->flow_time_ms = flow_end - flow_start;
         total_flow_time += res->flow_time_ms;
+        res->n_mel_frames = n_frames;
 
-        if (n_samples <= 0) {
-            fprintf(stderr, "  Error: flow generation failed\n");
+        if (n_frames <= 0) {
+            fprintf(stderr, "  Error: flow generation failed (returned %d)\n", n_frames);
             continue;
         }
-        fprintf(stderr, "  Audio samples: %d, Flow time: %.2f ms\n", n_samples, res->flow_time_ms);
+        fprintf(stderr, "  Mel frames: %d, Flow time: %.2f ms\n", n_frames, res->flow_time_ms);
+
+        /* Vocoder: mel → audio */
+        double voc_start = now_ms();
+
+        memset(audio_buf, 0, MAX_AUDIO * sizeof(float));
+        int n_samples = sonata_vocoder_generate(vocoder,
+                                                 mel_buf, n_frames, MEL_DIM,
+                                                 audio_buf, MAX_AUDIO);
+
+        double voc_end = now_ms();
+        res->vocoder_time_ms = voc_end - voc_start;
+        total_vocoder_time += res->vocoder_time_ms;
+
+        if (n_samples <= 0) {
+            fprintf(stderr, "  Error: vocoder generation failed\n");
+            continue;
+        }
+        fprintf(stderr, "  Audio samples: %d, Vocoder time: %.2f ms\n", n_samples, res->vocoder_time_ms);
 
         /* Write WAV */
-        snprintf(res->wav_path, sizeof(res->wav_path), "%s/eval_%04d.wav", out_dir, idx);
         write_wav(res->wav_path, audio_buf, n_samples, SAMPLE_RATE);
         fprintf(stderr, "  WAV: %s\n", res->wav_path);
 
@@ -441,7 +369,6 @@ int main(int argc, char *argv[]) {
 
         /* Optional: round-trip WER via STT */
         if (stt) {
-            /* Resample to 16k for STT */
             int resampled_n = 0;
             float *resampled = resample_24k_to_16k(audio_buf, n_samples, &resampled_n);
             if (resampled) {
@@ -485,7 +412,6 @@ int main(int argc, char *argv[]) {
 
                 double sim_sum = 0;
                 int sim_count = 0;
-                /* Compare each subsequent WAV against the first */
                 for (int k = 1; k < (int)N_TEST_SENTENCES; k++) {
                     char cmp_path[512];
                     snprintf(cmp_path, sizeof(cmp_path), "%s/eval_%04d.wav", out_dir, k);
@@ -531,7 +457,7 @@ int main(int argc, char *argv[]) {
 
     fprintf(report_f, "{\n");
     fprintf(report_f, "  \"timestamp\": \"2026-03-07\",\n");
-    fprintf(report_f, "  \"system\": \"Sonata TTS (Rust LM + Flow + C ConvDecoder)\",\n");
+    fprintf(report_f, "  \"system\": \"Sonata TTS V3 (Flow V3 + Vocoder, Metal)\",\n");
     fprintf(report_f, "  \"model_path\": \"models/sonata/\",\n");
     fprintf(report_f, "  \"sentences\": [\n");
 
@@ -545,7 +471,7 @@ int main(int argc, char *argv[]) {
         fprintf(report_f, "      \"index\": %d,\n", res->idx);
         fprintf(report_f, "      \"text\": %s,\n", text_json);
         fprintf(report_f, "      \"wav_path\": %s,\n", path_json);
-        fprintf(report_f, "      \"n_tokens\": %d,\n", res->n_tokens);
+        fprintf(report_f, "      \"n_mel_frames\": %d,\n", res->n_mel_frames);
         fprintf(report_f, "      \"audio_stats\": {\n");
         fprintf(report_f, "        \"rms\": %.6f,\n", res->stats.rms);
         fprintf(report_f, "        \"peak\": %.6f,\n", res->stats.peak);
@@ -555,8 +481,8 @@ int main(int argc, char *argv[]) {
         fprintf(report_f, "        \"is_silence\": %d\n", res->stats.is_silence);
         fprintf(report_f, "      },\n");
         fprintf(report_f, "      \"timings_ms\": {\n");
-        fprintf(report_f, "        \"lm_inference\": %.2f,\n", res->lm_time_ms);
-        fprintf(report_f, "        \"flow_inference\": %.2f\n", res->flow_time_ms);
+        fprintf(report_f, "        \"flow_inference\": %.2f,\n", res->flow_time_ms);
+        fprintf(report_f, "        \"vocoder_inference\": %.2f\n", res->vocoder_time_ms);
         fprintf(report_f, "      },\n");
         fprintf(report_f, "      \"prosody_mos\": %.2f,\n", res->prosody_mos);
 
@@ -578,11 +504,11 @@ int main(int argc, char *argv[]) {
     fprintf(report_f, "  \"aggregate\": {\n");
     fprintf(report_f, "    \"mean_rtf\": %.4f,\n",
             total_audio_duration > 0.0 ?
-            (total_lm_time + total_flow_time) / 1000.0 / total_audio_duration : 0.0);
-    fprintf(report_f, "    \"mean_lm_time_ms\": %.2f,\n",
-            total_lm_time / (double)N_TEST_SENTENCES);
+            (total_flow_time + total_vocoder_time) / 1000.0 / total_audio_duration : 0.0);
     fprintf(report_f, "    \"mean_flow_time_ms\": %.2f,\n",
             total_flow_time / (double)N_TEST_SENTENCES);
+    fprintf(report_f, "    \"mean_vocoder_time_ms\": %.2f,\n",
+            total_vocoder_time / (double)N_TEST_SENTENCES);
     fprintf(report_f, "    \"mean_prosody_mos\": %.2f,\n",
             total_prosody_mos / (double)N_TEST_SENTENCES);
     fprintf(report_f, "    \"mean_speaker_consistency\": %.4f,\n", mean_speaker_consistency);
@@ -597,7 +523,7 @@ int main(int argc, char *argv[]) {
 
     fprintf(report_f, "  },\n");
 
-    /* SOTA targets for comparison */
+    /* SOTA targets */
     fprintf(report_f, "  \"sota_targets\": {\n");
     fprintf(report_f, "    \"prosody_mos\": 4.5,\n");
     fprintf(report_f, "    \"mean_wer\": 0.03,\n");
@@ -609,10 +535,13 @@ int main(int argc, char *argv[]) {
 
     fprintf(stderr, "\nReport written to: %s\n", report_path);
 
-    /* Summary to stderr */
+    /* Summary */
     fprintf(stderr, "\n═══ Summary ═══\n");
-    fprintf(stderr, "Mean LM time: %.2f ms\n", total_lm_time / (double)N_TEST_SENTENCES);
     fprintf(stderr, "Mean Flow time: %.2f ms\n", total_flow_time / (double)N_TEST_SENTENCES);
+    fprintf(stderr, "Mean Vocoder time: %.2f ms\n", total_vocoder_time / (double)N_TEST_SENTENCES);
+    fprintf(stderr, "Mean RTF: %.4f\n",
+            total_audio_duration > 0.0 ?
+            (total_flow_time + total_vocoder_time) / 1000.0 / total_audio_duration : 0.0);
     fprintf(stderr, "Mean Prosody MOS: %.2f\n", total_prosody_mos / (double)N_TEST_SENTENCES);
     if (wer_count > 0) {
         fprintf(stderr, "Mean WER: %.4f (%d evaluated)\n", total_wer / wer_count, wer_count);
@@ -620,13 +549,12 @@ int main(int argc, char *argv[]) {
 
     /* Cleanup */
     free(results);
+    free(mel_buf);
     free(audio_buf);
-    free(tokens_buf);
 
     if (stt) conformer_stt_destroy(stt);
-    sonata_flow_destroy(flow);
-    sonata_lm_destroy(lm);
-    spm_destroy(tokenizer);
+    sonata_vocoder_destroy(vocoder);
+    sonata_flow_v3_destroy(flow);
 
     fprintf(stderr, "\nEvaluation complete.\n");
     return 0;

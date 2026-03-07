@@ -734,18 +734,17 @@ test-sonata-quality: tests/test_sonata_quality.c \
 	./$(BUILD)/test-sonata-quality
 
 eval-generate: tests/eval_sonata_baseline.c \
-               $(BUILD)/libspm_tokenizer.dylib $(BUILD)/libconformer_stt.dylib \
+               $(BUILD)/libconformer_stt.dylib \
                $(BUILD)/libctc_beam_decoder.dylib $(BUILD)/libtdt_decoder.dylib \
                $(BUILD)/libmel_spectrogram.dylib \
-               $(SONATA_LM_DYLIB) $(SONATA_FLOW_DYLIB) | $(BUILD)
+               $(SONATA_FLOW_DYLIB) | $(BUILD)
 	@mkdir -p eval/generated eval/reports
 	$(CC) $(CFLAGS) -DACCELERATE_NEW_LAPACK -Isrc -framework Accelerate \
-	  -L$(BUILD) -lspm_tokenizer -lconformer_stt -lctc_beam_decoder -lmel_spectrogram -ltdt_decoder \
-	  -Lsrc/sonata_lm/target/release -Lsrc/sonata_flow/target/release \
+	  -L$(BUILD) -lconformer_stt -lctc_beam_decoder -lmel_spectrogram -ltdt_decoder \
+	  -Lsrc/sonata_flow/target/release \
 	  -Wl,-rpath,$(CURDIR)/$(BUILD) \
-	  -Wl,-rpath,$(CURDIR)/src/sonata_lm/target/release \
 	  -Wl,-rpath,$(CURDIR)/src/sonata_flow/target/release \
-	  -lsonata_lm -lsonata_flow -lm \
+	  -lsonata_flow -lm \
 	  src/quality/wer.c src/quality/audio_quality.c \
 	  -o $(BUILD)/eval-sonata-baseline tests/eval_sonata_baseline.c
 	$(BUILD)/eval-sonata-baseline
