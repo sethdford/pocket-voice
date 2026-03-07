@@ -1235,9 +1235,11 @@ extern int   sonata_flow_interpolate_speakers(void *engine, const float *emb_a,
 /* Sonata Flow v2 externs declared above near line ~812 */
 
 #define SONATA_BUF_CAPACITY (24000 * 30)
+#ifndef SONATA_N_FFT
 #define SONATA_N_FFT 1024
 #define SONATA_HOP 480
 #define SONATA_N_BINS (SONATA_N_FFT / 2 + 1)
+#endif
 #define SONATA_MAX_FRAMES 2000
 #define SONATA_FIRST_CHUNK_DEFAULT 8  /* configurable via --sonata-first-chunk */
 #define SONATA_CHUNK_SIZE 50

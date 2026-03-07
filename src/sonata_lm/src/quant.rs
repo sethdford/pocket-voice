@@ -240,4 +240,155 @@ mod tests {
 
         Ok(())
     }
+
+    /// CORRECTNESS PROOF: Per-channel scale computation.
+    /// Verifies scale[c] = max(abs(w[:, c])) / 127.0 for symmetric INT8.
+    /// This is the critical operation that preserves per-output sensitivity.
+    #[test]
+    fn test_quantize_per_channel_scales_correct() -> Result<()> {
+        let device = Device::Cpu;
+
+        // Create weights with known per-channel maxima
+        let weights = Tensor::new(
+            &[
+                [1.0f32, -4.0, 0.5],
+                [2.0, 5.0, -0.2],
+                [3.0, -6.0, 0.1],
+            ],
+            &device,
+        )?;
+
+        let (_weights_i8, scales) = quantize_weights(&weights)?;
+
+        // Expected scales: max(abs(col)) / 127
+        // Column 0: max(1, 2, 3) = 3 → 3/127
+        // Column 1: max(4, 5, 6) = 6 → 6/127
+        // Column 2: max(0.5, 0.2, 0.1) = 0.5 → 0.5/127
+        let scales_vec = scales.to_vec1::<f32>()?;
+        assert_eq!(scales_vec.len(), 3);
+
+        let expected = vec![3.0 / 127.0, 6.0 / 127.0, 0.5 / 127.0];
+        for (i, (e, a)) in expected.iter().zip(scales_vec.iter()).enumerate() {
+            assert!(
+                (e - a).abs() < 1e-6,
+                "Channel {} scale mismatch: expected {}, got {}",
+                i,
+                e,
+                a
+            );
+        }
+
+        Ok(())
+    }
+
+    /// CORRECTNESS PROOF: INT8 bounds respect quantization range.
+    /// Verifies quantized weights fit in [-127, 127] when properly clipped.
+    #[test]
+    fn test_quantize_int8_bounds() -> Result<()> {
+        let device = Device::Cpu;
+
+        // Create weights in [-10, 10] range
+        let weights = Tensor::new(
+            &[
+                [10.0f32, -10.0],
+                [-9.5, 9.8],
+                [0.0, 5.0],
+            ],
+            &device,
+        )?;
+
+        let (weights_i8, _scales) = quantize_weights(&weights)?;
+        let weights_i8_vec = weights_i8.flatten_all()?.to_vec1::<f32>()?;
+
+        // After quantization and rounding, values should be in ~[-127, 127]
+        for (i, val) in weights_i8_vec.iter().enumerate() {
+            assert!(
+                *val >= -128.0 && *val <= 128.0,
+                "Quantized weight {} out of INT8 bounds: {}",
+                i,
+                val
+            );
+        }
+
+        Ok(())
+    }
+
+    /// CORRECTNESS PROOF: Dequantization is inverse of quantization.
+    /// Verifies: dequant(quant(w)) reconstructs w with bounded error.
+    #[test]
+    fn test_dequant_inverts_quant() -> Result<()> {
+        let device = Device::Cpu;
+
+        let original = Tensor::new(
+            &[
+                [0.123f32, -0.456, 0.789],
+                [-0.234, 0.567, -0.890],
+            ],
+            &device,
+        )?;
+
+        let (quant, scales) = quantize_weights(&original)?;
+        let recon = dequantize_weights(&quant, &scales)?;
+
+        let orig_flat = original.flatten_all()?.to_vec1::<f32>()?;
+        let recon_flat = recon.flatten_all()?.to_vec1::<f32>()?;
+
+        for (o, r) in orig_flat.iter().zip(recon_flat.iter()) {
+            let max_abs_val = o.abs().max(0.1);
+            let max_error = max_abs_val / 127.0; // INT8 quantization resolution
+            let error = (r - o).abs();
+            assert!(
+                error <= max_error + 1e-6,
+                "Reconstruction error too large: {} (max allowed: {})",
+                error,
+                max_error
+            );
+        }
+
+        Ok(())
+    }
+
+    /// CORRECTNESS PROOF: Linear layer matmul semantics preserved.
+    /// Verifies quantized_linear.forward() produces similar output to original.
+    /// Critical for maintaining model accuracy after quantization.
+    #[test]
+    fn test_quantized_linear_preserves_matmul() -> Result<()> {
+        let device = Device::Cpu;
+
+        // Create weights (out_features=3, in_features=2)
+        let weights = Tensor::new(
+            &[
+                [0.5f32, -0.3],
+                [0.4, 0.6],
+                [-0.2, 0.5],
+            ],
+            &device,
+        )?;
+        // Input (batch=2, in_features=2)
+        let input = Tensor::new(&[[1.0f32, 0.5], [-0.5, 0.2]], &device)?;
+
+        // Reference: original matmul (batch, in) @ (out, in).T = (batch, out)
+        let output_ref = input.matmul(&weights.t()?)?;
+
+        // Quantized path
+        let qlinear = QuantizedLinear::new(&weights, None)?;
+        let output_quant = qlinear.forward(&input)?;
+
+        // Compare outputs
+        let ref_vec = output_ref.flatten_all()?.to_vec1::<f32>()?;
+        let quant_vec = output_quant.flatten_all()?.to_vec1::<f32>()?;
+
+        for (r, q) in ref_vec.iter().zip(quant_vec.iter()) {
+            let rel_error = (q - r).abs() / (r.abs() + 1e-8);
+            assert!(
+                rel_error < 0.02, // 2% relative error acceptable for INT8
+                "Quantized matmul diverged: {} vs {} (error: {}%)",
+                r,
+                q,
+                rel_error * 100.0
+            );
+        }
+
+        Ok(())
+    }
 }

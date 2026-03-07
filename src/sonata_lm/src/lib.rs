@@ -177,6 +177,13 @@ fn apply_rope_seq(
 ) -> Result<(Tensor, Tensor)> {
     let (_, _, _, hd) = q.dims4()?;
     let half = hd / 2;
+    let max_pos = cos.dim(0)?;
+    if pos + seq_len > max_pos {
+        return Err(candle_core::Error::Msg(format!(
+            "RoPE position overflow: pos({}) + seq_len({}) > max_seq_len({})",
+            pos, seq_len, max_pos
+        )));
+    }
     let cos_s = cos.i(pos..pos + seq_len)?.unsqueeze(0)?.unsqueeze(0)?;
     let sin_s = sin.i(pos..pos + seq_len)?.unsqueeze(0)?.unsqueeze(0)?;
 
@@ -480,6 +487,19 @@ impl DecoderBlock {
         kc: &mut Tensor, vc: &mut Tensor,
     ) -> Result<Tensor> {
         let h = self.attn.forward(&self.attn_norm.forward(x)?, cos, sin, pos, kc, vc)?;
+        let x = (x + h)?;
+        let h = self.cross_attn.forward(&self.cross_norm.forward(&x)?, text_enc)?;
+        let x = (x + h)?;
+        let h = self.ffn.forward(&self.ffn_norm.forward(&x)?)?;
+        x + h
+    }
+
+    fn forward_seq(
+        &self, x: &Tensor, text_enc: &Tensor,
+        cos: &Tensor, sin: &Tensor, pos: usize, seq_len: usize,
+        kc: &mut Tensor, vc: &mut Tensor, mask: &Tensor,
+    ) -> Result<Tensor> {
+        let h = self.attn.forward_seq(&self.attn_norm.forward(x)?, cos, sin, pos, seq_len, kc, vc, mask)?;
         let x = (x + h)?;
         let h = self.cross_attn.forward(&self.cross_norm.forward(&x)?, text_enc)?;
         let x = (x + h)?;
@@ -879,6 +899,15 @@ impl SonataLM {
         kv_caches: &mut [(Tensor, Tensor)],
         mask_cache: &mut CausalMaskCache,
     ) -> Result<Tensor> {
+        self.forward_seq_with_context(sem_toks, start_pos, kv_caches, mask_cache, None)
+    }
+
+    fn forward_seq_with_context(
+        &self, sem_toks: &[u32], start_pos: usize,
+        kv_caches: &mut [(Tensor, Tensor)],
+        mask_cache: &mut CausalMaskCache,
+        text_encoding: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let device = self.rope_cos.device();
         let seq_len = sem_toks.len();
         let sem_t = Tensor::from_vec(sem_toks.to_vec(), (1, seq_len), device)?;
@@ -889,9 +918,18 @@ impl SonataLM {
         let total_len = start_pos + seq_len;
         let mask = mask_cache.get(seq_len, total_len, device, x.dtype())?;
 
-        for (i, layer) in self.layers.iter().enumerate() {
-            let (kc, vc) = &mut kv_caches[i];
-            x = layer.forward_seq(&x, &self.rope_cos, &self.rope_sin, start_pos, seq_len, kc, vc, &mask)?;
+        if self.use_cross_attention {
+            let text_enc = text_encoding.ok_or_else(||
+                candle_core::Error::Msg("cross-attention forward_seq requires text_encoding".into()))?;
+            for (i, layer) in self.decoder_layers.iter().enumerate() {
+                let (kc, vc) = &mut kv_caches[i];
+                x = layer.forward_seq(&x, text_enc, &self.rope_cos, &self.rope_sin, start_pos, seq_len, kc, vc, &mask)?;
+            }
+        } else {
+            for (i, layer) in self.layers.iter().enumerate() {
+                let (kc, vc) = &mut kv_caches[i];
+                x = layer.forward_seq(&x, &self.rope_cos, &self.rope_sin, start_pos, seq_len, kc, vc, &mask)?;
+            }
         }
 
         let x = self.output_norm.forward(&x)?;
@@ -1261,10 +1299,20 @@ impl LmEngine {
     fn load(
         weights_path: &str, config_path: Option<&str>,
     ) -> std::result::Result<Self, Box<dyn std::error::Error>> {
+        // Validate paths: reject path traversal attempts
+        if weights_path.contains("..") {
+            return Err("weights_path contains path traversal".into());
+        }
+        if let Some(cp) = config_path {
+            if cp.contains("..") {
+                return Err("config_path contains path traversal".into());
+            }
+        }
         let device = if candle_core::utils::metal_is_available() {
             Device::new_metal(0)?
         } else {
-            eprintln!("[sonata_lm] Metal not available, using CPU");
+            eprintln!("[sonata_lm] WARNING: Metal GPU not available — CPU fallback will be 100-300x slower!");
+            eprintln!("[sonata_lm] WARNING: Real-time TTS pipeline WILL NOT meet latency targets on CPU.");
             Device::Cpu
         };
 
@@ -1454,6 +1502,14 @@ impl LmEngine {
         } else {
             self.text_pos + self.step_count
         };
+
+        // Guard against exceeding max_seq_len (RoPE cache bounds)
+        if pos >= self.model.cfg.max_seq_len {
+            eprintln!("[sonata_lm] position {} exceeds max_seq_len {}, stopping",
+                pos, self.model.cfg.max_seq_len);
+            self.done = true;
+            return Ok(None);
+        }
 
         let logits = self.model.forward(
             sem_tok, pos, &mut self.kv_caches,
@@ -1741,8 +1797,8 @@ impl LmEngine {
         }
 
         let drafter = match self.gru_drafter {
-            Some(ref d) if !self.model.use_cross_attention => d,
-            _ => {
+            Some(ref d) => d,
+            None => {
                 let tok = self.step()?;
                 return Ok(tok.into_iter().collect());
             }
@@ -1750,6 +1806,11 @@ impl LmEngine {
 
         let sem_tok = *self.semantic_tokens.last().unwrap_or(&1);
         let pos = self.text_pos + self.step_count;
+
+        if pos >= self.model.cfg.max_seq_len {
+            self.done = true;
+            return Ok(Vec::new());
+        }
 
         // Step 1: Run main model to get hidden state + logits for first token
         let (logits, hidden) = self.model.forward_hidden(
@@ -1796,9 +1857,9 @@ impl LmEngine {
         verify_toks.push(first_token);
         verify_toks.extend_from_slice(&draft_tokens);
 
-        let tree_logits = self.model.forward_seq(
+        let tree_logits = self.model.forward_seq_with_context(
             &verify_toks, base_pos - 1, &mut self.kv_caches,
-            &mut self.mask_cache,
+            &mut self.mask_cache, self.text_encoding.as_ref(),
         )?;
         let tree_logits = tree_logits.squeeze(0)?; // (seq_len, vocab)
 
@@ -1873,6 +1934,11 @@ impl LmEngine {
 
         let sem_tok = *self.semantic_tokens.last().unwrap_or(&1);
         let pos = self.text_pos + self.step_count;
+
+        if pos >= self.model.cfg.max_seq_len {
+            self.done = true;
+            return Ok(Vec::new());
+        }
 
         // Step 1: Run main model to get hidden state + logits for first token
         let (logits, hidden) = self.model.forward_hidden(
@@ -2038,7 +2104,7 @@ impl LmEngine {
         if self.rnn_drafter.is_some() && !self.model.use_cross_attention {
             return self.tree_speculative_step();
         }
-        if self.gru_drafter.is_some() && !self.model.use_cross_attention {
+        if self.gru_drafter.is_some() {
             return self.gru_speculative_step();
         }
 
@@ -2238,7 +2304,8 @@ pub extern "C" fn sonata_lm_destroy(engine: *mut c_void) {
 pub extern "C" fn sonata_lm_set_text(
     engine: *mut c_void, text_ids: *const u32, n: c_int,
 ) -> c_int {
-    if engine.is_null() || text_ids.is_null() || n <= 0 { return -1; }
+    const MAX_TEXT_LEN: c_int = 16384; // 16K tokens max
+    if engine.is_null() || text_ids.is_null() || n <= 0 || n > MAX_TEXT_LEN { return -1; }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let eng = unsafe { &mut *(engine as *mut LmEngine) };
         let ids = unsafe { std::slice::from_raw_parts(text_ids, n as usize) };
@@ -2260,7 +2327,8 @@ pub extern "C" fn sonata_lm_set_text(
 pub extern "C" fn sonata_lm_append_text(
     engine: *mut c_void, text_ids: *const u32, n: c_int,
 ) -> c_int {
-    if engine.is_null() || text_ids.is_null() || n <= 0 { return -1; }
+    const MAX_TEXT_LEN: c_int = 16384;
+    if engine.is_null() || text_ids.is_null() || n <= 0 || n > MAX_TEXT_LEN { return -1; }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let eng = unsafe { &mut *(engine as *mut LmEngine) };
         let ids = unsafe { std::slice::from_raw_parts(text_ids, n as usize) };
@@ -2432,12 +2500,14 @@ pub extern "C" fn sonata_lm_set_prosody(
     engine: *mut c_void, features: *const c_float, n: c_int,
 ) -> c_int {
     if engine.is_null() { return -1; }
+    const MAX_PROSODY_FRAMES: c_int = 32768; // ~10 min at 50Hz
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let eng = unsafe { &mut *(engine as *mut LmEngine) };
         if n <= 0 || features.is_null() {
             eng.prosody_features = None;
             return 0;
         }
+        if n > MAX_PROSODY_FRAMES { return -1; }
         let mut pf = Vec::with_capacity(n as usize);
         for i in 0..n as usize {
             let mut frame = [0.0f32; PROSODY_DIM];
@@ -2907,5 +2977,387 @@ pub extern "C" fn sonata_lm_get_acoustic_buffer(
             eprintln!("[sonata_lm] panic in get_acoustic_buffer: {}", panic_message(e));
             -1
         }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TEST MODULES
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests_drafter_edge_cases {
+    use candle_core::{DType, Device, Result, Tensor};
+    use crate::drafter::{DrafterConfig, GruDrafter};
+    use candle_nn::VarBuilder;
+
+    #[test]
+    fn test_drafter_draft_zero_steps() -> Result<()> {
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+
+        let cfg = DrafterConfig {
+            gru_hidden: 64,
+            gru_layers: 2,
+            emb_dim: 32,
+            d_model: 128,
+            vocab_size: 256,
+        };
+
+        let vb = VarBuilder::zeros(dtype, &device);
+        let drafter = GruDrafter::load(&cfg, vb, &device, dtype)?;
+
+        let lm_hidden = Tensor::randn(0.0f32, 1.0, (1, cfg.d_model), &device)?;
+        let current_token = 42u32;
+
+        let draft_tokens = drafter.draft(&lm_hidden, current_token, 0)?;
+
+        assert_eq!(draft_tokens.len(), 0, "zero steps should produce empty draft");
+        Ok(())
+    }
+
+    #[test]
+    fn test_drafter_draft_2d_hidden_state() -> Result<()> {
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+
+        let cfg = DrafterConfig {
+            gru_hidden: 64,
+            gru_layers: 2,
+            emb_dim: 32,
+            d_model: 128,
+            vocab_size: 256,
+        };
+
+        let vb = VarBuilder::zeros(dtype, &device);
+        let drafter = GruDrafter::load(&cfg, vb, &device, dtype)?;
+
+        let lm_hidden = Tensor::randn(0.0f32, 1.0, (1, cfg.d_model), &device)?;
+        let current_token = 42u32;
+
+        let draft_tokens = drafter.draft(&lm_hidden, current_token, 3)?;
+
+        assert_eq!(draft_tokens.len(), 3, "should produce 3 draft tokens");
+        for token in draft_tokens {
+            assert!(
+                token < cfg.vocab_size as u32,
+                "token {} should be within vocab range [0, {})",
+                token,
+                cfg.vocab_size
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_drafter_draft_3d_hidden_state_squeeze() -> Result<()> {
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+
+        let cfg = DrafterConfig {
+            gru_hidden: 64,
+            gru_layers: 2,
+            emb_dim: 32,
+            d_model: 128,
+            vocab_size: 256,
+        };
+
+        let vb = VarBuilder::zeros(dtype, &device);
+        let drafter = GruDrafter::load(&cfg, vb, &device, dtype)?;
+
+        let lm_hidden = Tensor::randn(0.0f32, 1.0, (1, 1, cfg.d_model), &device)?;
+        let current_token = 42u32;
+
+        let draft_tokens = drafter.draft(&lm_hidden, current_token, 3)?;
+
+        assert_eq!(draft_tokens.len(), 3, "should produce 3 draft tokens from 3D input");
+        for token in draft_tokens {
+            assert!(
+                token < cfg.vocab_size as u32,
+                "token should be within vocab range"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_drafter_draft_wrong_hidden_dim() -> Result<()> {
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+
+        let cfg = DrafterConfig {
+            gru_hidden: 64,
+            gru_layers: 2,
+            emb_dim: 32,
+            d_model: 128,
+            vocab_size: 256,
+        };
+
+        let vb = VarBuilder::zeros(dtype, &device);
+        let drafter = GruDrafter::load(&cfg, vb, &device, dtype)?;
+
+        let lm_hidden = Tensor::randn(0.0f32, 1.0, (1, 256), &device)?;
+        let current_token = 42u32;
+
+        let result = drafter.draft(&lm_hidden, current_token, 3);
+
+        assert!(
+            result.is_err(),
+            "draft with wrong d_model dimension should error"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_drafter_draft_max_vocab_token() -> Result<()> {
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+
+        let cfg = DrafterConfig {
+            gru_hidden: 64,
+            gru_layers: 2,
+            emb_dim: 32,
+            d_model: 128,
+            vocab_size: 256,
+        };
+
+        let vb = VarBuilder::zeros(dtype, &device);
+        let drafter = GruDrafter::load(&cfg, vb, &device, dtype)?;
+
+        let lm_hidden = Tensor::randn(0.0f32, 1.0, (1, cfg.d_model), &device)?;
+        let current_token = (cfg.vocab_size - 1) as u32;
+
+        let draft_tokens = drafter.draft(&lm_hidden, current_token, 5)?;
+
+        assert_eq!(draft_tokens.len(), 5);
+        for token in draft_tokens {
+            assert!(
+                token < cfg.vocab_size as u32,
+                "all drafted tokens should be valid"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_drafter_draft_many_steps() -> Result<()> {
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+
+        let cfg = DrafterConfig {
+            gru_hidden: 64,
+            gru_layers: 2,
+            emb_dim: 32,
+            d_model: 128,
+            vocab_size: 256,
+        };
+
+        let vb = VarBuilder::zeros(dtype, &device);
+        let drafter = GruDrafter::load(&cfg, vb, &device, dtype)?;
+
+        let lm_hidden = Tensor::randn(0.0f32, 1.0, (1, cfg.d_model), &device)?;
+        let current_token = 50u32;
+
+        let draft_tokens = drafter.draft(&lm_hidden, current_token, 20)?;
+
+        assert_eq!(draft_tokens.len(), 20);
+        for (i, token) in draft_tokens.iter().enumerate() {
+            assert!(
+                *token < cfg.vocab_size as u32,
+                "step {}: token {} out of vocab",
+                i,
+                token
+            );
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests_quant_edge_cases {
+    use candle_core::{DType, Device, Result, Tensor};
+    use crate::quant::{quantize_weights, dequantize_weights, QuantizedLinear};
+
+    #[test]
+    fn test_quantize_all_zeros() -> Result<()> {
+        let device = Device::Cpu;
+        let weights = Tensor::zeros((4, 8), DType::F32, &device)?;
+
+        let (_weights_i8, scales) = quantize_weights(&weights)?;
+
+        let scales_vec = scales.to_vec1::<f32>()?;
+        for scale in scales_vec {
+            assert!(
+                scale >= 1e-8,
+                "scale {} should be at least 1e-8 to avoid division by zero",
+                scale
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_quantize_large_values() -> Result<()> {
+        let device = Device::Cpu;
+        let weights = Tensor::new(
+            &[
+                [1000.0f32, 2000.0, -3000.0],
+                [4000.0, -5000.0, 6000.0],
+            ],
+            &device,
+        )?;
+
+        let (weights_i8, scales) = quantize_weights(&weights)?;
+
+        let weights_i8_vec = weights_i8.flatten_all()?.to_vec1::<f32>()?;
+        for val in weights_i8_vec {
+            assert!(
+                val.is_finite(),
+                "quantized weight {} should be finite",
+                val
+            );
+        }
+
+        let scales_vec = scales.to_vec1::<f32>()?;
+        for scale in scales_vec {
+            assert!(scale.is_finite(), "scale should be finite");
+            assert!(scale > 0.0, "scale should be positive");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_quantize_very_small_values() -> Result<()> {
+        let device = Device::Cpu;
+        let weights = Tensor::new(
+            &[
+                [1e-6f32, 1e-7, 1e-8],
+                [1e-9, 1e-10, 1e-11],
+            ],
+            &device,
+        )?;
+
+        let (weights_i8, scales) = quantize_weights(&weights)?;
+
+        assert_eq!(weights_i8.dims(), vec![2, 3]);
+        assert_eq!(scales.dims(), vec![3]);
+
+        let scales_vec = scales.to_vec1::<f32>()?;
+        assert_eq!(scales_vec.len(), 3);
+        for scale in scales_vec {
+            assert!(scale >= 1e-8, "scale should be clamped to minimum");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_roundtrip_quantization_error_bounds() -> Result<()> {
+        let device = Device::Cpu;
+
+        let original = Tensor::new(
+            &[
+                [1.234f32, -5.678, 9.999],
+                [-2.345, 3.456, -7.890],
+                [0.123, 8.765, -4.321],
+            ],
+            &device,
+        )?;
+
+        let (quant, scales) = quantize_weights(&original)?;
+        let recon = dequantize_weights(&quant, &scales)?;
+
+        let orig_vec = original.flatten_all()?.to_vec1::<f32>()?;
+        let recon_vec = recon.flatten_all()?.to_vec1::<f32>()?;
+
+        for (orig, rec) in orig_vec.iter().zip(recon_vec.iter()) {
+            let max_abs_orig = orig.abs();
+            // INT8 per-channel quantization: error bound is max_value / 127
+            // Allow 2% relative error for small values and appropriate absolute error
+            let max_error = max_abs_orig.max(1e-6) * (1.0 / 127.0) + 0.01;
+
+            let error = (rec - orig).abs();
+            assert!(
+                error <= max_error,
+                "reconstruction error {} exceeds bound {}: orig={}, rec={}",
+                error,
+                max_error,
+                orig,
+                rec
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_quantized_linear_no_bias() -> Result<()> {
+        let device = Device::Cpu;
+
+        let weights = Tensor::randn(0.0f32, 1.0, (32, 16), &device)?;
+        let input = Tensor::randn(0.0f32, 1.0, (4, 16), &device)?;
+
+        let qlinear = QuantizedLinear::new(&weights, None)?;
+        let output = qlinear.forward(&input)?;
+
+        assert_eq!(output.dims(), vec![4, 32]);
+
+        let output_vec = output.flatten_all()?.to_vec1::<f32>()?;
+        for val in output_vec {
+            assert!(val.is_finite(), "output should be finite");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_quantized_linear_with_bias() -> Result<()> {
+        let device = Device::Cpu;
+
+        let weights = Tensor::randn(0.0f32, 1.0, (32, 16), &device)?;
+        let bias = Tensor::randn(0.0f32, 1.0, (32,), &device)?;
+        let input = Tensor::randn(0.0f32, 1.0, (4, 16), &device)?;
+
+        let qlinear = QuantizedLinear::new(&weights, Some(&bias))?;
+        let output = qlinear.forward(&input)?;
+
+        assert_eq!(output.dims(), vec![4, 32]);
+
+        let output_vec = output.flatten_all()?.to_vec1::<f32>()?;
+        for val in output_vec {
+            assert!(val.is_finite(), "output with bias should be finite");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_quantize_deterministic() -> Result<()> {
+        let device = Device::Cpu;
+        let weights = Tensor::randn(0.0, 1.0, (16, 32), &device)?;
+
+        let (quant1, scales1) = quantize_weights(&weights)?;
+        let (quant2, scales2) = quantize_weights(&weights)?;
+
+        let quant1_vec = quant1.flatten_all()?.to_vec1::<f32>()?;
+        let quant2_vec = quant2.flatten_all()?.to_vec1::<f32>()?;
+
+        for (v1, v2) in quant1_vec.iter().zip(quant2_vec.iter()) {
+            assert_eq!(v1, v2, "quantization should be deterministic");
+        }
+
+        let scales1_vec = scales1.to_vec1::<f32>()?;
+        let scales2_vec = scales2.to_vec1::<f32>()?;
+
+        for (s1, s2) in scales1_vec.iter().zip(scales2_vec.iter()) {
+            assert!((s1 - s2).abs() < 1e-10, "scales should be deterministic");
+        }
+
+        Ok(())
     }
 }

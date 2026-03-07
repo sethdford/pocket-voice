@@ -177,9 +177,14 @@ class SemanticTokenDataset(Dataset):
         self.samples = []
         data_path = Path(data_dir)
         for f in sorted(data_path.glob("*.pt")):
-            sample = torch.load(f, weights_only=True)
-            if "text_tokens" in sample and "semantic_tokens" in sample:
-                self.samples.append(sample)
+            data = torch.load(f, weights_only=True)
+            # Handle both shard format (list of dicts) and single-sample format
+            if isinstance(data, list):
+                for sample in data:
+                    if isinstance(sample, dict) and "text_tokens" in sample and "semantic_tokens" in sample:
+                        self.samples.append(sample)
+            elif isinstance(data, dict) and "text_tokens" in data and "semantic_tokens" in data:
+                self.samples.append(data)
         for f in sorted(data_path.glob("*.json")):
             with open(f) as fp:
                 sample = json.load(fp)
@@ -221,7 +226,8 @@ def extract_hidden_states(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run base model and extract hidden states + logits (no gradient)."""
     base_model.eval()
-    with torch.no_grad():
+    use_amp = device.type == "cuda"
+    with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.float16):
         B, T_audio = semantic_tokens.shape
 
         if base_model.use_cross_attention:
@@ -238,8 +244,9 @@ def extract_hidden_states(
         causal_mask = torch.tril(
             torch.ones(T_total, T_total, device=device, dtype=torch.bool)
         )
+        text_enc_for_layers = text_enc if base_model.use_cross_attention else None
         for layer in base_model.layers:
-            x = layer(x, None, freqs, mask=causal_mask)
+            x = layer(x, text_enc_for_layers, freqs, mask=causal_mask)
 
         if not base_model.use_cross_attention:
             T_text = text_tokens.shape[1]
@@ -252,7 +259,7 @@ def extract_hidden_states(
 
 
 def train_drafter(args):
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"[train_drafter] Device: {device}")
 
     # Load base model (frozen)
@@ -271,7 +278,7 @@ def train_drafter(args):
     # Create drafter
     drafter = GruDrafter(
         d_model=cfg.d_model,
-        vocab_size=total_vocab,
+        vocab_size=cfg.semantic_vocab_size,
         gru_hidden=args.gru_hidden,
         gru_layers=args.gru_layers,
         emb_dim=args.emb_dim,
@@ -317,47 +324,49 @@ def train_drafter(args):
                 base_model, text_tokens, sem_tokens, device,
             )
 
-            # Drafter forward: predict next max_steps tokens at each position
-            draft_logits = drafter(hidden, sem_tokens, max_steps=max_steps)
-            # draft_logits: (B, T, max_steps, V)
+            # Drafter forward with AMP for memory efficiency
+            use_amp = device.type == "cuda"
+            with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.float16):
+                draft_logits = drafter(hidden, sem_tokens, max_steps=max_steps)
+                # draft_logits: (B, T, max_steps, V)
 
-            B, T, _, V = draft_logits.shape
-            loss = torch.tensor(0.0, device=device)
+                B, T, _, V = draft_logits.shape
+                loss = torch.tensor(0.0, device=device)
 
-            for step in range(max_steps):
-                # Target: token at position t + step + 1
-                shift = step + 1
-                if T <= shift:
-                    continue
+                for step in range(max_steps):
+                    # Target: token at position t + step + 1
+                    shift = step + 1
+                    if T <= shift:
+                        continue
 
-                step_logits = draft_logits[:, :T-shift, step, :]  # (B, T-shift, V)
-                target_tokens = sem_tokens[:, shift:T]             # (B, T-shift)
+                    step_logits = draft_logits[:, :T-shift, step, :]  # (B, T-shift, V)
+                    target_tokens = sem_tokens[:, shift:T]             # (B, T-shift)
 
-                # Cross-entropy loss on ground truth
-                ce_loss = F.cross_entropy(
-                    step_logits.reshape(-1, V),
-                    target_tokens.reshape(-1),
-                    ignore_index=0,
-                )
+                    # Cross-entropy loss on ground truth
+                    ce_loss = F.cross_entropy(
+                        step_logits.reshape(-1, V),
+                        target_tokens.reshape(-1),
+                        ignore_index=0,
+                    )
 
-                # Knowledge distillation: KL div from base model logits
-                # The base model logits at position t predict token at t+1
-                # For step s, we want LM logits at position t+s-1 (shifted)
-                if shift <= 1:
-                    lm_step_logits = lm_logits[:, :T-shift, :]
-                else:
-                    lm_step_logits = lm_logits[:, shift-1:T-1, :]
+                    # Knowledge distillation: KL div from base model logits
+                    if shift <= 1:
+                        lm_step_logits = lm_logits[:, :T-shift, :]
+                    else:
+                        lm_step_logits = lm_logits[:, shift-1:T-1, :]
 
-                kd_loss = F.kl_div(
-                    F.log_softmax(step_logits / kd_temp, dim=-1),
-                    F.softmax(lm_step_logits / kd_temp, dim=-1),
-                    reduction="batchmean",
-                ) * (kd_temp ** 2)
+                    kd_loss = F.kl_div(
+                        F.log_softmax(step_logits / kd_temp, dim=-1),
+                        F.softmax(lm_step_logits / kd_temp, dim=-1),
+                        reduction="batchmean",
+                    ) * (kd_temp ** 2)
 
-                # Weighted combination with decay for deeper predictions
-                decay = 0.8 ** step
-                step_loss = decay * (ce_weight * ce_loss + kd_weight * kd_loss)
-                loss = loss + step_loss
+                    decay = 0.8 ** step
+                    step_loss = decay * (ce_weight * ce_loss + kd_weight * kd_loss)
+                    loss = loss + step_loss
+
+            # Free large tensors before backward
+            del draft_logits, hidden, lm_logits
 
             optimizer.zero_grad()
             loss.backward()
@@ -367,6 +376,9 @@ def train_drafter(args):
 
             total_loss += loss.item()
             n_batches += 1
+
+            if n_batches <= 3 or n_batches % 100 == 0:
+                print(f"  step {n_batches}: loss={loss.item():.4f}", flush=True)
 
         avg_loss = total_loss / max(n_batches, 1)
         print(f"[train_drafter] Epoch {epoch+1}/{args.epochs} — loss: {avg_loss:.4f}")

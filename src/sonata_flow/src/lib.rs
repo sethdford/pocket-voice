@@ -1218,6 +1218,11 @@ pub extern "C" fn sonata_flow_create(
         return std::ptr::null_mut();
     }
     let flow_weights = unsafe { CStr::from_ptr(flow_weights).to_str().unwrap_or("") };
+    // Reject path traversal
+    if flow_weights.contains("..") {
+        eprintln!("[sonata_flow] Create error: path traversal in weights path");
+        return std::ptr::null_mut();
+    }
     let flow_config_path = unsafe { CStr::from_ptr(flow_config).to_str().unwrap_or("") };
 
     let has_decoder = !decoder_weights.is_null() && !decoder_config.is_null();
@@ -1481,14 +1486,19 @@ pub extern "C" fn sonata_flow_generate_streaming_chunk(
     out_magnitude: *mut c_float,
     out_phase: *mut c_float,
 ) -> c_int {
+    const MAX_FRAMES: c_int = 16384; // ~5 min at 50Hz
     if engine.is_null() || semantic_tokens.is_null() || n_frames <= 0
+        || n_frames > MAX_FRAMES || chunk_offset < 0
         || out_magnitude.is_null() || out_phase.is_null() { return 0; }
+    // Guard against integer overflow: offset + n_frames must fit in usize
+    let total_len_check = (chunk_offset as i64) + (n_frames as i64);
+    if total_len_check > MAX_FRAMES as i64 { return 0; }
     let eng = unsafe { &mut *(engine as *mut SonataFlowEngine) };
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         (|| -> Result<usize> {
             let n_f = n_frames as usize;
-            let offset = chunk_offset.max(0) as usize;
+            let offset = chunk_offset as usize;
             let total_len = offset + n_f;
 
             let tokens: Vec<u32> = (0..total_len)
@@ -1628,7 +1638,9 @@ pub extern "C" fn sonata_flow_generate(
     out_magnitude: *mut c_float,
     out_phase: *mut c_float,
 ) -> c_int {
+    const MAX_FRAMES: c_int = 16384;
     if engine.is_null() || semantic_tokens.is_null() || n_frames <= 0
+        || n_frames > MAX_FRAMES
         || out_magnitude.is_null() || out_phase.is_null() { return 0; }
     let eng = unsafe { &mut *(engine as *mut SonataFlowEngine) };
 
@@ -1802,7 +1814,9 @@ pub extern "C" fn sonata_flow_generate_audio(
     out_audio: *mut c_float,
     max_samples: c_int,
 ) -> c_int {
+    const MAX_FRAMES: c_int = 16384;
     if engine.is_null() || semantic_tokens.is_null() || n_frames <= 0
+        || n_frames > MAX_FRAMES
         || out_audio.is_null() || max_samples <= 0 { return 0; }
     let eng = unsafe { &mut *(engine as *mut SonataFlowEngine) };
 
@@ -1967,7 +1981,8 @@ pub extern "C" fn sonata_flow_set_solver(engine: *mut c_void, use_heun: c_int) -
 pub extern "C" fn sonata_flow_set_speaker_embedding(
     engine: *mut c_void, embedding: *const c_float, dim: c_int,
 ) -> c_int {
-    if engine.is_null() || embedding.is_null() || dim <= 0 { return -1; }
+    const MAX_EMB_DIM: c_int = 4096;
+    if engine.is_null() || embedding.is_null() || dim <= 0 || dim > MAX_EMB_DIM { return -1; }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let eng = unsafe { &mut *(engine as *mut SonataFlowEngine) };
         let data: Vec<f32> = (0..dim as usize)
@@ -2002,7 +2017,8 @@ pub extern "C" fn sonata_flow_interpolate_speakers(
     emb_a: *const c_float, emb_b: *const c_float,
     dim: c_int, alpha: c_float,
 ) -> c_int {
-    if engine.is_null() || emb_a.is_null() || emb_b.is_null() || dim <= 0 { return -1; }
+    const MAX_EMB_DIM: c_int = 4096;
+    if engine.is_null() || emb_a.is_null() || emb_b.is_null() || dim <= 0 || dim > MAX_EMB_DIM { return -1; }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let eng = unsafe { &mut *(engine as *mut SonataFlowEngine) };
         let d = dim as usize;
@@ -2059,7 +2075,8 @@ pub extern "C" fn sonata_flow_set_emotion_steering(
     layer_end: c_int,
     scale: c_float,
 ) -> c_int {
-    if engine.is_null() || direction.is_null() || dim <= 0 { return -1; }
+    const MAX_EMB_DIM: c_int = 4096;
+    if engine.is_null() || direction.is_null() || dim <= 0 || dim > MAX_EMB_DIM { return -1; }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let eng = unsafe { &mut *(engine as *mut SonataFlowEngine) };
         let data: Vec<f32> = (0..dim as usize).map(|i| unsafe { *direction.add(i) }).collect();
@@ -2158,7 +2175,8 @@ pub extern "C" fn sonata_flow_set_durations(
 pub extern "C" fn sonata_flow_set_prosody_embedding(
     engine: *mut c_void, embedding: *const c_float, dim: c_int,
 ) -> c_int {
-    if engine.is_null() || embedding.is_null() || dim <= 0 { return -1; }
+    const MAX_EMB_DIM: c_int = 4096;
+    if engine.is_null() || embedding.is_null() || dim <= 0 || dim > MAX_EMB_DIM { return -1; }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let eng = unsafe { &mut *(engine as *mut SonataFlowEngine) };
         let data: Vec<f32> = (0..dim as usize).map(|i| unsafe { *embedding.add(i) }).collect();
@@ -3977,7 +3995,8 @@ pub extern "C" fn sonata_flow_v3_stream_start(
     phoneme_ids: *const c_int,
     n_ids: c_int,
 ) -> c_int {
-    if engine.is_null() || phoneme_ids.is_null() || n_ids <= 0 {
+    const MAX_IDS: c_int = 16384;
+    if engine.is_null() || phoneme_ids.is_null() || n_ids <= 0 || n_ids > MAX_IDS {
         return -1;
     }
     let eng = unsafe { &mut *(engine as *mut SonataFlowV3Engine) };
@@ -4159,7 +4178,12 @@ pub extern "C" fn sonata_flow_v3_generate(
     out_mel: *mut c_float,
     max_frames: c_int,
 ) -> c_int {
-    if engine.is_null() || out_mel.is_null() || max_frames <= 0 {
+    const MAX_TEXT: c_int = 16384;
+    const MAX_MEL: c_int = 32768;
+    if engine.is_null() || out_mel.is_null() || max_frames <= 0 || max_frames > MAX_MEL {
+        return -1;
+    }
+    if text_len > MAX_TEXT || phoneme_len > MAX_TEXT {
         return -1;
     }
     let eng = unsafe { &mut *(engine as *mut SonataFlowV3Engine) };
@@ -4177,7 +4201,8 @@ pub extern "C" fn sonata_flow_v3_generate(
                 unsafe {
                     let ptr = text_ptr as *const u8;
                     let len = text_len as usize;
-                    std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len))
+                    std::str::from_utf8(std::slice::from_raw_parts(ptr, len))
+                        .unwrap_or("")
                 }
             };
             text_str.bytes().map(|b| (b as u32) % char_vocab as u32).collect()
@@ -4264,13 +4289,15 @@ fn vocoder_get_padding(kernel: usize, dilation: usize) -> usize {
     (kernel * dilation - dilation) / 2
 }
 
-/// SnakeAlpha: x + (1/(alpha+eps)) * sin(alpha*x)^2. Alpha shape (1, channels, 1).
-fn snake_alpha_forward(x: &Tensor, alpha: &Tensor) -> Result<Tensor> {
+/// SnakeAlpha: x + (1/(alpha+eps)) * sin(alpha*x)^2.
+/// log_alpha shape (1, channels, 1) — alpha = exp(log_alpha) for stable training.
+fn snake_alpha_forward(x: &Tensor, log_alpha: &Tensor) -> Result<Tensor> {
+    let alpha = log_alpha.exp()?;
     let eps = 1e-9f32;
     let eps_t = Tensor::new(eps, x.device())?.to_dtype(alpha.dtype())?.broadcast_as(alpha.shape())?;
-    let alpha_safe = (alpha + &eps_t)?;
+    let alpha_safe = (&alpha + &eps_t)?;
     let inv_alpha = alpha_safe.recip()?;
-    let ax = x.broadcast_mul(alpha)?;
+    let ax = x.broadcast_mul(&alpha)?;
     let sin_ax = ax.sin()?;
     let sin_sq = (&sin_ax * &sin_ax)?;
     let term = sin_sq.broadcast_mul(&inv_alpha)?;
@@ -4334,7 +4361,7 @@ impl AMPBlock {
                 };
 
                 let act_vb = vb.pp(format!("acts.{}.{}", j, d_idx));
-                let alpha = act_vb.get((1, ch, 1), "alpha")?;
+                let alpha = act_vb.get((1, ch, 1), "log_alpha")?;
                 branch.push((conv_layer, alpha));
             }
             layers.push(branch);
@@ -4359,17 +4386,20 @@ impl AMPBlock {
             }
             out = (out + h)?;
         }
-        out.affine(1.0 / self.n_blocks as f64, 0.0)
+        // Residual connection: prevents variance explosion through stacked blocks
+        (x + out.affine(1.0 / self.n_blocks as f64, 0.0)?)
     }
 }
 
-/// One upsample stage: ConvTranspose1d + AMPBlock.
+/// One upsample stage: SnakeAlpha activation → ConvTranspose1d → AMPBlock.
 struct VocoderUpsampleStage {
+    up_act_log_alpha: Tensor,
     upsample_weight: Tensor,
     upsample_bias: Tensor,
     amp_block: AMPBlock,
     stride: usize,
     kernel: usize,
+    in_ch: usize,
     out_ch: usize,
 }
 
@@ -4384,6 +4414,9 @@ impl VocoderUpsampleStage {
         stage_idx: usize,
         vb: VarBuilder,
     ) -> Result<Self> {
+        let up_act_vb = vb.pp(format!("up_acts.{}", stage_idx));
+        let up_act_log_alpha = up_act_vb.get((1, in_ch, 1), "log_alpha")?;
+
         let ups_vb = vb.pp(format!("upsamples.{}", stage_idx));
         let upsample_weight = ups_vb.get((in_ch, out_ch, kernel), "weight")?;
         let upsample_bias = ups_vb.get(out_ch, "bias")?;
@@ -4392,16 +4425,19 @@ impl VocoderUpsampleStage {
         let amp_block = AMPBlock::load(out_ch, resblock_kernels, resblock_dilations, amp_vb)?;
 
         Ok(Self {
+            up_act_log_alpha,
             upsample_weight,
             upsample_bias,
             amp_block,
             stride,
             kernel,
+            in_ch,
             out_ch,
         })
     }
 
     fn convert_to_f32(&mut self) -> Result<()> {
+        self.up_act_log_alpha = self.up_act_log_alpha.to_dtype(DType::F32)?;
         self.upsample_weight = self.upsample_weight.to_dtype(DType::F32)?;
         self.upsample_bias = self.upsample_bias.to_dtype(DType::F32)?;
         self.amp_block.convert_to_f32()?;
@@ -4409,6 +4445,7 @@ impl VocoderUpsampleStage {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let x = snake_alpha_forward(x, &self.up_act_log_alpha)?;
         let pad = (self.kernel as i64 - self.stride as i64).max(0) as usize / 2;
         let mut x = x.conv_transpose1d(&self.upsample_weight, pad, 0, self.stride, 1, 1)?;
         x = x.broadcast_add(&self.upsample_bias.reshape((1, self.out_ch, 1))?)?;
@@ -4454,7 +4491,7 @@ impl VocoderGenerator {
         }
 
         let final_ch = ch / (1 << n_stages);
-        let output_act_alpha = g_vb.get((1, final_ch, 1), "output_act.alpha")?;
+        let output_act_alpha = g_vb.get((1, final_ch, 1), "output_act.log_alpha")?;
         let output_conv_weight = g_vb.get((1, final_ch, 7), "output_conv.weight")?;
         let output_conv_bias = g_vb.get(1, "output_conv.bias")?;
 
@@ -4583,8 +4620,11 @@ pub extern "C" fn sonata_vocoder_generate(
     out_audio: *mut c_float,
     max_samples: c_int,
 ) -> c_int {
+    const MAX_MEL_FRAMES: c_int = 32768;
+    const MAX_MEL_DIM: c_int = 1024;
     if engine.is_null() || mel_data.is_null() || out_audio.is_null()
-        || max_samples <= 0 || n_frames <= 0 || mel_dim <= 0
+        || max_samples <= 0 || n_frames <= 0 || n_frames > MAX_MEL_FRAMES
+        || mel_dim <= 0 || mel_dim > MAX_MEL_DIM
     {
         return -1;
     }

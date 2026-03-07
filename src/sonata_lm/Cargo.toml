@@ -2,6 +2,7 @@
 name = "sonata-lm"
 version = "0.1.0"
 edition = "2021"
+autobenches = false
 
 [lib]
 crate-type = ["cdylib"]
@@ -15,6 +16,18 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 rand = { workspace = true }
 hf-hub = { workspace = true }
+
+[[bin]]
+name = "lm_throughput"
+path = "benches/lm_throughput.rs"
+
+[[bin]]
+name = "flow_latency"
+path = "benches/flow_latency.rs"
+
+[[bin]]
+name = "e2e_pipeline"
+path = "benches/e2e_pipeline.rs"
 
 [features]
 default = ["metal"]

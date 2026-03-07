@@ -1018,14 +1018,6 @@ test-assumptions: tests/test_assumptions.c | $(BUILD)
 	  -o $(BUILD)/test-assumptions tests/test_assumptions.c
 	./$(BUILD)/test-assumptions
 
-bench-audit: tests/bench_audit.c $(BUILD)/libmel_spectrogram.dylib $(BUILD)/libsonata_istft.dylib $(BUILD)/libmetal_dispatch.dylib | $(BUILD)
-	$(CC) $(CFLAGS) -DACCELERATE_NEW_LAPACK -Isrc -framework Accelerate \
-	  -L$(BUILD) -lmel_spectrogram -lsonata_istft -lmetal_dispatch -lmetal_loader \
-	  -framework Metal -framework Foundation \
-	  -Wl,-rpath,$(CURDIR)/$(BUILD) -lm \
-	  -o $(BUILD)/bench-audit tests/bench_audit.c
-	./$(BUILD)/bench-audit
-
 test-opus-codec: tests/test_opus_codec.c $(BUILD)/libpocket_opus.dylib | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc $(OPUS_CFLAGS) \
 	  -L$(BUILD) -lpocket_opus $(OPUS_LDFLAGS) -lopus \

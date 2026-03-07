@@ -162,10 +162,18 @@ def train(args):
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
         opt_g.load_state_dict(ckpt["opt_g"])
-        opt_d.load_state_dict(ckpt["opt_d"])
+        if not args.reset_d_optimizer:
+            opt_d.load_state_dict(ckpt["opt_d"])
+        else:
+            print("  Discriminator optimizer reset (--reset-d-optimizer)")
         step = ckpt.get("step", 0)
         start_epoch = ckpt.get("epoch", 0)
         print(f"Resumed from {args.resume} at step {step}, epoch {start_epoch}")
+
+    # Mel warmup is relative to current step (so it works after resume)
+    mel_warmup_end = step + args.mel_warmup_steps
+    print(f"  Mel-only warmup until step {mel_warmup_end} "
+          f"(D lr ratio: {args.d_lr_ratio})")
 
     for epoch in range(start_epoch, args.epochs):
         model.train()
@@ -179,22 +187,30 @@ def train(args):
             for pg in opt_g.param_groups:
                 pg["lr"] = lr
             for pg in opt_d.param_groups:
-                pg["lr"] = lr
+                pg["lr"] = lr * args.d_lr_ratio
 
-            # Discriminator step (R1 penalty every 16 steps, weight=0.1)
-            r1_w = 0.1 if step % 16 == 0 else 0.0
-            with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                d_result = model.training_step_d(mel, audio, r1_weight=r1_w)
-            if not torch.isfinite(d_result["d_loss"]):
-                print(f"  [WARN] step {step}: NaN/Inf D loss, skipping")
-                step += 1
-                continue
-            d_loss_scaled = d_result["d_loss"] / args.grad_accum
-            d_loss_scaled.backward()
+            in_mel_warmup = step < mel_warmup_end
 
-            # Generator step
+            # Discriminator step — skip during mel-only warmup
+            if not in_mel_warmup:
+                r1_w = 0.1 if step % 16 == 0 else 0.0
+                with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+                    d_result = model.training_step_d(mel, audio, r1_weight=r1_w)
+                if not torch.isfinite(d_result["d_loss"]):
+                    print(f"  [WARN] step {step}: NaN/Inf D loss, skipping")
+                    step += 1
+                    continue
+                d_loss_scaled = d_result["d_loss"] / args.grad_accum
+                d_loss_scaled.backward()
+            else:
+                d_result = {"d_loss": torch.tensor(0.0), "r1": 0.0}
+
+            # Generator step — mel-only during warmup
             with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                g_result = model.training_step_g(mel, audio)
+                if in_mel_warmup:
+                    g_result = model.training_step_g_mel_only(mel, audio)
+                else:
+                    g_result = model.training_step_g(mel, audio)
             if not torch.isfinite(g_result["g_loss"]):
                 print(f"  [WARN] step {step}: NaN/Inf G loss, skipping")
                 step += 1
@@ -204,36 +220,40 @@ def train(args):
 
             # Gradient accumulation: only step every N batches
             if (batch_idx + 1) % args.grad_accum == 0:
-                torch.nn.utils.clip_grad_norm_(
-                    list(model.mpd.parameters()) + list(model.msd.parameters()) +
-                    list(model.mrstft.parameters()), 1.0)
-                opt_d.step()
-                opt_d.zero_grad()
+                if not in_mel_warmup:
+                    torch.nn.utils.clip_grad_norm_(
+                        list(model.mpd.parameters()) + list(model.msd.parameters()) +
+                        list(model.mrstft.parameters()), 1.0)
+                    opt_d.step()
+                    opt_d.zero_grad()
 
                 torch.nn.utils.clip_grad_norm_(model.generator.parameters(), 1.0)
                 opt_g.step()
                 opt_g.zero_grad()
 
             epoch_g_loss += g_result["g_loss"].item()
-            epoch_d_loss += d_result["d_loss"].item()
+            d_loss_val = d_result["d_loss"].item() if hasattr(d_result["d_loss"], "item") else d_result["d_loss"]
+            epoch_d_loss += d_loss_val
             step += 1
 
-            if step <= 3:
-                print(f"  [warmup] step {step}: G={g_result['g_loss'].item():.4f} "
-                      f"D={d_result['d_loss'].item():.4f}", flush=True)
+            if step <= 3 or (in_mel_warmup and step % 100 == 0):
+                phase = "[mel-warmup]" if in_mel_warmup else "[warmup]"
+                print(f"  {phase} step {step}: G={g_result['g_loss'].item():.4f} "
+                      f"mel={g_result['mel_loss']:.4f}", flush=True)
 
             if step % args.log_interval == 0:
                 elapsed = time.time() - t0
                 sps = args.log_interval / elapsed
+                d_val = d_result["d_loss"].item() if hasattr(d_result["d_loss"], "item") else d_result["d_loss"]
                 print(f"  step {step}: G={g_result['g_loss'].item():.4f} "
                       f"(adv={g_result['adv_loss']:.4f} fm={g_result['fm_loss']:.4f} "
                       f"mel={g_result['mel_loss']:.4f}) "
-                      f"D={d_result['d_loss'].item():.4f} lr={lr:.2e} "
+                      f"D={d_val:.4f} lr={lr:.2e} "
                       f"| {sps:.1f} steps/s")
                 tlog.log(step=step, g_loss=g_result["g_loss"].item(),
                          adv_loss=g_result["adv_loss"], fm_loss=g_result["fm_loss"],
                          mel_loss=g_result["mel_loss"],
-                         d_loss=d_result["d_loss"].item(), lr=lr,
+                         d_loss=d_val, lr=lr,
                          steps_per_sec=sps)
                 t0 = time.time()
 
@@ -306,5 +326,11 @@ if __name__ == "__main__":
     parser.add_argument("--save-steps", type=int, default=5000,
                         help="Save checkpoint every N steps (0 to disable)")
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--mel-warmup-steps", type=int, default=5000,
+                        help="Mel-only warmup steps (no adversarial loss)")
+    parser.add_argument("--d-lr-ratio", type=float, default=0.5,
+                        help="Discriminator LR = G LR * this ratio (prevents D collapse)")
+    parser.add_argument("--reset-d-optimizer", action="store_true",
+                        help="Reset discriminator optimizer state on resume")
     args = parser.parse_args()
     train(args)

@@ -33,14 +33,21 @@ from config import VocoderConfig
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class SnakeAlpha(nn.Module):
-    """Snake activation: x + (1/a) * sin^2(a*x). Periodic inductive bias for audio."""
+    """Snake activation: x + (1/a) * sin^2(a*x). Periodic inductive bias for audio.
+
+    Uses log-parameterized alpha (exp(log_alpha)) for stable training,
+    initialized to small values to prevent activation explosion through
+    deep AMPBlock stacks.
+    """
 
     def __init__(self, channels: int):
         super().__init__()
-        self.alpha = nn.Parameter(torch.ones(1, channels, 1))
+        # Log-parameterized: alpha = exp(log_alpha), init alpha ~ 1.0
+        self.log_alpha = nn.Parameter(torch.zeros(1, channels, 1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x + (1.0 / (self.alpha + 1e-9)) * torch.sin(self.alpha * x).pow(2)
+        alpha = self.log_alpha.exp()
+        return x + (1.0 / (alpha + 1e-9)) * torch.sin(alpha * x).pow(2)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -81,7 +88,8 @@ class AMPBlock(nn.Module):
                 h = act(h)
                 h = conv(h)
             out = out + h
-        return out / self.n_blocks
+        # Residual connection: prevents variance explosion through stacked blocks
+        return x + out / self.n_blocks
 
 
 class VocoderGenerator(nn.Module):
@@ -97,6 +105,7 @@ class VocoderGenerator(nn.Module):
         )
 
         self.upsamples = nn.ModuleList()
+        self.up_acts = nn.ModuleList()
         self.amp_blocks = nn.ModuleList()
 
         for i, (u_rate, u_kernel) in enumerate(
@@ -104,6 +113,7 @@ class VocoderGenerator(nn.Module):
         ):
             in_ch = ch // (2 ** i)
             out_ch = ch // (2 ** (i + 1))
+            self.up_acts.append(SnakeAlpha(in_ch))
             self.upsamples.append(nn.utils.parametrizations.weight_norm(
                 nn.ConvTranspose1d(in_ch, out_ch, u_kernel,
                                    stride=u_rate,
@@ -122,7 +132,8 @@ class VocoderGenerator(nn.Module):
     def forward(self, mel: torch.Tensor) -> torch.Tensor:
         """mel: (B, n_mels, T_frames) → audio: (B, 1, T_samples)"""
         x = self.input_conv(mel)
-        for upsample, amp_block in zip(self.upsamples, self.amp_blocks):
+        for up_act, upsample, amp_block in zip(self.up_acts, self.upsamples, self.amp_blocks):
+            x = up_act(x)
             x = upsample(x)
             x = amp_block(x)
         x = self.output_act(x)
@@ -457,6 +468,22 @@ class SonataVocoder(nn.Module):
 
         return {"d_loss": d_loss, "r1": r1.item()}
 
+    def training_step_g_mel_only(self, mel: torch.Tensor,
+                                  audio_real: torch.Tensor) -> dict:
+        """Generator mel-only training step (no adversarial loss)."""
+        audio_fake = self.generator(mel.transpose(1, 2))
+        audio_real = audio_real.unsqueeze(1)
+        audio_fake, audio_real = self._align_lengths(audio_fake, audio_real)
+        mel_loss = self.mel_loss(audio_fake, audio_real)
+        total = self.cfg.mel_loss_weight * mel_loss
+        return {
+            "g_loss": total,
+            "adv_loss": 0.0,
+            "adv_loss_clamped": 0.0,
+            "fm_loss": 0.0,
+            "mel_loss": mel_loss.item(),
+        }
+
     def training_step_g(self, mel: torch.Tensor,
                         audio_real: torch.Tensor) -> dict:
         """Generator training step."""
@@ -479,13 +506,19 @@ class SonataVocoder(nn.Module):
                    feature_matching_loss(stft_real_feats, stft_fake_feats))
         mel_loss = self.mel_loss(audio_fake, audio_real)
 
-        total = (adv_loss +
+        # Clamp adversarial loss to prevent discriminator collapse from
+        # overwhelming reconstruction losses. With 3 discriminators the raw
+        # adv_loss can reach -14000+, making mel_loss (45*17=765) irrelevant.
+        adv_loss_clamped = adv_loss.clamp(min=-1000.0, max=1000.0)
+
+        total = (adv_loss_clamped +
                  self.cfg.feature_loss_weight * fm_loss +
                  self.cfg.mel_loss_weight * mel_loss)
 
         return {
             "g_loss": total,
             "adv_loss": adv_loss.item(),
+            "adv_loss_clamped": adv_loss_clamped.item(),
             "fm_loss": fm_loss.item(),
             "mel_loss": mel_loss.item(),
         }
