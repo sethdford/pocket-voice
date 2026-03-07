@@ -39,6 +39,7 @@ ZONES=(
 
 # Jobs to monitor — add/remove as needed
 JOBS=(
+    drafter
     distill_v3
     vocoder
     codec_12hz

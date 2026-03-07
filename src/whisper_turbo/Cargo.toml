@@ -1,0 +1,29 @@
+[package]
+name = "whisper-turbo"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+name = "whisper_turbo"
+
+[dependencies]
+anyhow = "1.0"
+candle-core = "0.9"
+candle-nn = "0.9"
+candle-transformers = "0.9"
+safetensors = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokenizers = "0.15"
+
+[features]
+default = ["metal"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+strip = true

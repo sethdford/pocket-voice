@@ -45,7 +45,7 @@ struct LmConfig {
     #[serde(default)]                       use_prosody: bool,
     #[serde(default)]                       use_acoustic_head: bool,
     #[serde(default = "default_acoustic_dim")] acoustic_dim: usize,
-    #[serde(default)]                       quantize: bool,
+    #[serde(default)]                       #[allow(dead_code)] quantize: bool,
 }
 
 const PROSODY_DIM: usize = 3; // (log_pitch, energy, speaking_rate)
@@ -135,6 +135,7 @@ impl candle_nn::Module for Layer {
         self.forward(x)
     }
 }
+
 
 // ─── RoPE ────────────────────────────────────────────────────────────────────
 
@@ -413,11 +414,16 @@ struct CrossAttention {
 impl CrossAttention {
     fn load(cfg: &LmConfig, vb: VarBuilder) -> Result<Self> {
         let head_dim = cfg.head_dim();
+        let wq = linear_no_bias(cfg.d_model, cfg.n_heads * head_dim, vb.pp("wq"))?;
+        let wk = linear_no_bias(cfg.d_model, cfg.n_kv_heads * head_dim, vb.pp("wk"))?;
+        let wv = linear_no_bias(cfg.d_model, cfg.n_kv_heads * head_dim, vb.pp("wv"))?;
+        let wo = linear_no_bias(cfg.n_heads * head_dim, cfg.d_model, vb.pp("wo"))?;
+
         Ok(Self {
-            wq: linear_no_bias(cfg.d_model, cfg.n_heads * head_dim, vb.pp("wq"))?,
-            wk: linear_no_bias(cfg.d_model, cfg.n_kv_heads * head_dim, vb.pp("wk"))?,
-            wv: linear_no_bias(cfg.d_model, cfg.n_kv_heads * head_dim, vb.pp("wv"))?,
-            wo: linear_no_bias(cfg.n_heads * head_dim, cfg.d_model, vb.pp("wo"))?,
+            wq: Layer::new_linear(wq),
+            wk: Layer::new_linear(wk),
+            wv: Layer::new_linear(wv),
+            wo: Layer::new_linear(wo),
             n_heads: cfg.n_heads,
             n_kv_heads: cfg.n_kv_heads,
             head_dim,
@@ -486,10 +492,10 @@ impl DecoderBlock {
 
 struct TextEncoderBlock {
     attn_norm: RmsNorm,
-    attn_q: Linear,
-    attn_k: Linear,
-    attn_v: Linear,
-    attn_o: Linear,
+    attn_q: Layer,
+    attn_k: Layer,
+    attn_v: Layer,
+    attn_o: Layer,
     n_heads: usize,
     head_dim: usize,
     ffn_norm: RmsNorm,
@@ -499,12 +505,17 @@ struct TextEncoderBlock {
 impl TextEncoderBlock {
     fn load(cfg: &LmConfig, vb: VarBuilder) -> Result<Self> {
         let head_dim = cfg.head_dim();
+        let attn_q = linear_no_bias(cfg.d_model, cfg.d_model, vb.pp("attn.in_proj_weight_q"))?;
+        let attn_k = linear_no_bias(cfg.d_model, cfg.d_model, vb.pp("attn.in_proj_weight_k"))?;
+        let attn_v = linear_no_bias(cfg.d_model, cfg.d_model, vb.pp("attn.in_proj_weight_v"))?;
+        let attn_o = linear_no_bias(cfg.d_model, cfg.d_model, vb.pp("attn.out_proj"))?;
+
         Ok(Self {
             attn_norm: rms_norm(cfg.d_model, cfg.norm_eps, vb.pp("attn_norm"))?,
-            attn_q: linear_no_bias(cfg.d_model, cfg.d_model, vb.pp("attn.in_proj_weight_q"))?,
-            attn_k: linear_no_bias(cfg.d_model, cfg.d_model, vb.pp("attn.in_proj_weight_k"))?,
-            attn_v: linear_no_bias(cfg.d_model, cfg.d_model, vb.pp("attn.in_proj_weight_v"))?,
-            attn_o: linear_no_bias(cfg.d_model, cfg.d_model, vb.pp("attn.out_proj"))?,
+            attn_q: Layer::new_linear(attn_q),
+            attn_k: Layer::new_linear(attn_k),
+            attn_v: Layer::new_linear(attn_v),
+            attn_o: Layer::new_linear(attn_o),
             n_heads: cfg.n_heads,
             head_dim,
             ffn_norm: rms_norm(cfg.d_model, cfg.norm_eps, vb.pp("ffn_norm"))?,
@@ -532,15 +543,18 @@ impl TextEncoderBlock {
 // ─── Sonata Semantic LM ─────────────────────────────────────────────────────
 
 struct ProsodyProjection {
-    linear1: Linear,
-    linear2: Linear,
+    linear1: Layer,
+    linear2: Layer,
 }
 
 impl ProsodyProjection {
     fn load(d_model: usize, vb: VarBuilder) -> Result<Self> {
         let linear1 = linear_no_bias(PROSODY_DIM, d_model, vb.pp("0"))?;
         let linear2 = linear_no_bias(d_model, d_model, vb.pp("2"))?;
-        Ok(Self { linear1, linear2 })
+        Ok(Self {
+            linear1: Layer::new_linear(linear1),
+            linear2: Layer::new_linear(linear2),
+        })
     }
 
     fn forward(&self, prosody: &Tensor) -> Result<Tensor> {
@@ -562,8 +576,8 @@ struct SonataLM {
     text_pos_emb: Option<Embedding>,
     use_cross_attention: bool,
     output_norm: RmsNorm,
-    semantic_head: Linear,
-    acoustic_head: Option<Linear>,  // Projects d_model(1024) -> acoustic_dim(512)
+    semantic_head: Layer,
+    acoustic_head: Option<Layer>,  // Projects d_model(1024) -> acoustic_dim(512)
     rope_cos: Tensor,
     rope_sin: Tensor,
     cfg: LmConfig,
@@ -646,7 +660,7 @@ impl SonataLM {
             match linear_no_bias(cfg.d_model, cfg.acoustic_dim, vb.pp("acoustic_head")) {
                 Ok(head) => {
                     eprintln!("[sonata_lm] Acoustic head loaded ({} -> {})", cfg.d_model, cfg.acoustic_dim);
-                    Some(head)
+                    Some(Layer::new_linear(head))
                 }
                 Err(_) => {
                     eprintln!("[sonata_lm] use_acoustic_head=true but weights not found, disabled");
@@ -668,7 +682,7 @@ impl SonataLM {
             text_pos_emb,
             use_cross_attention,
             output_norm: rms_norm(cfg.d_model, cfg.norm_eps, vb.pp("output_norm"))?,
-            semantic_head: linear_no_bias(cfg.d_model, cfg.semantic_vocab_size, vb.pp("semantic_head"))?,
+            semantic_head: Layer::new_linear(linear_no_bias(cfg.d_model, cfg.semantic_vocab_size, vb.pp("semantic_head"))?),
             acoustic_head,
             rope_cos, rope_sin,
             cfg: cfg.clone(),
@@ -920,21 +934,28 @@ impl Default for RnnDraftConfig {
 /// GRU cell: z = σ(Wz·x + Uz·h), r = σ(Wr·x + Ur·h), h' = tanh(Wh·x + Uh·(r⊙h))
 /// h_new = (1-z)⊙h + z⊙h'
 struct GruCell {
-    w_z: Linear, u_z: Linear,
-    w_r: Linear, u_r: Linear,
-    w_h: Linear, u_h: Linear,
+    w_z: Layer, u_z: Layer,
+    w_r: Layer, u_r: Layer,
+    w_h: Layer, u_h: Layer,
     hidden_dim: usize,
 }
 
 impl GruCell {
     fn load(input_dim: usize, hidden_dim: usize, vb: VarBuilder) -> Result<Self> {
+        let w_z = linear_no_bias(input_dim, hidden_dim, vb.pp("w_z"))?;
+        let u_z = linear_no_bias(hidden_dim, hidden_dim, vb.pp("u_z"))?;
+        let w_r = linear_no_bias(input_dim, hidden_dim, vb.pp("w_r"))?;
+        let u_r = linear_no_bias(hidden_dim, hidden_dim, vb.pp("u_r"))?;
+        let w_h = linear_no_bias(input_dim, hidden_dim, vb.pp("w_h"))?;
+        let u_h = linear_no_bias(hidden_dim, hidden_dim, vb.pp("u_h"))?;
+
         Ok(Self {
-            w_z: linear_no_bias(input_dim, hidden_dim, vb.pp("w_z"))?,
-            u_z: linear_no_bias(hidden_dim, hidden_dim, vb.pp("u_z"))?,
-            w_r: linear_no_bias(input_dim, hidden_dim, vb.pp("w_r"))?,
-            u_r: linear_no_bias(hidden_dim, hidden_dim, vb.pp("u_r"))?,
-            w_h: linear_no_bias(input_dim, hidden_dim, vb.pp("w_h"))?,
-            u_h: linear_no_bias(hidden_dim, hidden_dim, vb.pp("u_h"))?,
+            w_z: Layer::new_linear(w_z),
+            u_z: Layer::new_linear(u_z),
+            w_r: Layer::new_linear(w_r),
+            u_r: Layer::new_linear(u_r),
+            w_h: Layer::new_linear(w_h),
+            u_h: Layer::new_linear(u_h),
             hidden_dim,
         })
     }
@@ -1052,13 +1073,13 @@ impl TreeCandidates {
 /// a tree of candidate tokens.
 struct RnnDrafter {
     /// Projects main LM hidden (d_model) to GRU initial state (gru_hidden)
-    hidden_proj: Linear,
+    hidden_proj: Layer,
     /// Token embedding for draft input (vocab_size → emb_dim)
     token_emb: Embedding,
     /// Stacked GRU layers
     gru_layers: Vec<GruCell>,
     /// Output projection to vocabulary logits
-    output_head: Linear,
+    output_head: Layer,
     cfg: RnnDraftConfig,
 }
 
@@ -1077,7 +1098,13 @@ impl RnnDrafter {
 
         let output_head = linear_no_bias(cfg.gru_hidden, cfg.vocab_size, vb.pp("output_head"))?;
 
-        Ok(Self { hidden_proj, token_emb, gru_layers, output_head, cfg: cfg.clone() })
+        Ok(Self {
+            hidden_proj: Layer::new_linear(hidden_proj),
+            token_emb,
+            gru_layers,
+            output_head: Layer::new_linear(output_head),
+            cfg: cfg.clone(),
+        })
     }
 
     /// Generate tree of candidate tokens from the main model's hidden state.

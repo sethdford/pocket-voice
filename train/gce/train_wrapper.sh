@@ -254,14 +254,24 @@ while [ $RETRY -lt $MAX_RETRIES ]; do
             if [ ! -d "$DATA_TOKENS_DIR" ] || [ -z "$(ls -A "$DATA_TOKENS_DIR" 2>/dev/null)" ]; then
                 echo "  Data tokens not found, extracting from LM..."
 
-                # Find LM checkpoint (required)
-                LM_CKPT=$(find_latest_checkpoint "$CKPT_DIR/lm_v4" "sonata_lm_best.pt")
+                # Find LM checkpoint (required) — try local first, then GCS
+                LM_CKPT=$(find_latest_checkpoint "$CKPT_DIR/lm" "sonata_lm_best.pt")
                 if [ -z "$LM_CKPT" ]; then
-                    LM_CKPT=$(find_latest_checkpoint "$CKPT_DIR/lm_v4" "sonata_lm_step_*.pt")
+                    LM_CKPT=$(find_latest_checkpoint "$CKPT_DIR/lm" "sonata_lm_step_*.pt")
                 fi
+
+                # If not found locally, try downloading from GCS
                 if [ -z "$LM_CKPT" ]; then
-                    echo "ERROR: No LM checkpoint found in $CKPT_DIR/lm_v4"
-                    exit 1
+                    echo "  LM checkpoint not found locally, checking GCS..."
+                    mkdir -p "$CKPT_DIR/lm"
+                    # Try to download sonata_lm_final.pt from GCS
+                    if gsutil -m cp "$BUCKET/checkpoints/lm/sonata_lm_final.pt" "$CKPT_DIR/lm/" 2>/dev/null; then
+                        LM_CKPT="$CKPT_DIR/lm/sonata_lm_final.pt"
+                        echo "  Downloaded LM checkpoint from GCS"
+                    else
+                        echo "ERROR: No LM checkpoint found locally or in GCS ($BUCKET/checkpoints/lm/)"
+                        exit 1
+                    fi
                 fi
                 echo "  Using LM checkpoint: $LM_CKPT"
 
@@ -285,10 +295,16 @@ while [ $RETRY -lt $MAX_RETRIES ]; do
             GCS_CKPT_DIR="$BUCKET/checkpoints/drafter"
             mkdir -p "$JOB_CKPT_DIR"
 
-            # Find LM checkpoint for freezing
-            LM_CKPT=$(find_latest_checkpoint "$CKPT_DIR/lm_v4" "sonata_lm_best.pt")
+            # Find LM checkpoint for freezing (already found above, should exist now)
+            LM_CKPT=$(find_latest_checkpoint "$CKPT_DIR/lm" "sonata_lm_best.pt")
             if [ -z "$LM_CKPT" ]; then
-                echo "ERROR: No LM checkpoint found (needed to freeze base model)"
+                LM_CKPT=$(find_latest_checkpoint "$CKPT_DIR/lm" "sonata_lm_step_*.pt")
+            fi
+            if [ -z "$LM_CKPT" ]; then
+                LM_CKPT="$CKPT_DIR/lm/sonata_lm_final.pt"
+            fi
+            if [ ! -f "$LM_CKPT" ]; then
+                echo "ERROR: LM checkpoint not found at $LM_CKPT (needed to freeze base model)"
                 exit 1
             fi
 
