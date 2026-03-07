@@ -25,6 +25,7 @@ mod drafter;
 use drafter::GruDrafter;
 
 mod quant;
+use quant::QuantizedLinear;
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -96,6 +97,43 @@ impl Default for LmConfig {
 impl LmConfig {
     fn head_dim(&self) -> usize { self.d_model / self.n_heads }
     fn n_rep(&self) -> usize { self.n_heads / self.n_kv_heads }
+}
+
+// ─── Quantized Layer Wrapper ─────────────────────────────────────────────────
+//
+// Unified interface for Linear (FP32/FP16) or QuantizedLinear (INT8) layers.
+// Quantization happens post-load: extract weights from Linear, wrap in QuantizedLinear.
+
+pub(crate) enum Layer {
+    Linear(Linear),
+    Quantized(QuantizedLinear),
+}
+
+impl Layer {
+    /// Create a Layer from a candle Linear (no quantization).
+    pub(crate) fn new_linear(linear: Linear) -> Self {
+        Layer::Linear(linear)
+    }
+
+    /// Create a Layer from weights and optional bias, applying INT8 quantization.
+    pub(crate) fn new_quantized(weights: &Tensor, bias: Option<&Tensor>) -> Result<Self> {
+        let qlinear = QuantizedLinear::new(weights, bias)?;
+        Ok(Layer::Quantized(qlinear))
+    }
+
+    /// Forward pass: dispatch to Linear or QuantizedLinear.
+    pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Layer::Linear(linear) => linear.forward(x),
+            Layer::Quantized(qlinear) => qlinear.forward(x),
+        }
+    }
+}
+
+impl candle_nn::Module for Layer {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward(x)
+    }
 }
 
 // ─── RoPE ────────────────────────────────────────────────────────────────────
@@ -195,7 +233,7 @@ fn repeat_kv(x: &Tensor, n_rep: usize) -> Result<Tensor> {
 // ─── Attention ───────────────────────────────────────────────────────────────
 
 struct GQAttention {
-    wq: Linear, wk: Linear, wv: Linear, wo: Linear,
+    wq: Layer, wk: Layer, wv: Layer, wo: Layer,
     n_heads: usize, n_kv_heads: usize, head_dim: usize, n_rep: usize,
 }
 
@@ -203,11 +241,16 @@ impl GQAttention {
     fn load(cfg: &LmConfig, vb: VarBuilder) -> Result<Self> {
         let d = cfg.d_model;
         let hd = cfg.head_dim();
+        let wq = linear_no_bias(d, cfg.n_heads * hd, vb.pp("wq"))?;
+        let wk = linear_no_bias(d, cfg.n_kv_heads * hd, vb.pp("wk"))?;
+        let wv = linear_no_bias(d, cfg.n_kv_heads * hd, vb.pp("wv"))?;
+        let wo = linear_no_bias(cfg.n_heads * hd, d, vb.pp("wo"))?;
+
         Ok(Self {
-            wq: linear_no_bias(d, cfg.n_heads * hd, vb.pp("wq"))?,
-            wk: linear_no_bias(d, cfg.n_kv_heads * hd, vb.pp("wk"))?,
-            wv: linear_no_bias(d, cfg.n_kv_heads * hd, vb.pp("wv"))?,
-            wo: linear_no_bias(cfg.n_heads * hd, d, vb.pp("wo"))?,
+            wq: Layer::new_linear(wq),
+            wk: Layer::new_linear(wk),
+            wv: Layer::new_linear(wv),
+            wo: Layer::new_linear(wo),
             n_heads: cfg.n_heads, n_kv_heads: cfg.n_kv_heads,
             head_dim: hd, n_rep: cfg.n_rep(),
         })
@@ -297,14 +340,18 @@ impl GQAttention {
 
 // ─── SwiGLU FFN ──────────────────────────────────────────────────────────────
 
-struct SwiGluFfn { w_gate: Linear, w_up: Linear, w_down: Linear }
+struct SwiGluFfn { w_gate: Layer, w_up: Layer, w_down: Layer }
 
 impl SwiGluFfn {
     fn load(cfg: &LmConfig, vb: VarBuilder) -> Result<Self> {
+        let w_gate = linear_no_bias(cfg.d_model, cfg.d_ff, vb.pp("w_gate"))?;
+        let w_up = linear_no_bias(cfg.d_model, cfg.d_ff, vb.pp("w_up"))?;
+        let w_down = linear_no_bias(cfg.d_ff, cfg.d_model, vb.pp("w_down"))?;
+
         Ok(Self {
-            w_gate: linear_no_bias(cfg.d_model, cfg.d_ff, vb.pp("w_gate"))?,
-            w_up: linear_no_bias(cfg.d_model, cfg.d_ff, vb.pp("w_up"))?,
-            w_down: linear_no_bias(cfg.d_ff, cfg.d_model, vb.pp("w_down"))?,
+            w_gate: Layer::new_linear(w_gate),
+            w_up: Layer::new_linear(w_up),
+            w_down: Layer::new_linear(w_down),
         })
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -353,10 +400,10 @@ impl TransformerBlock {
 // ─── Cross-Attention ─────────────────────────────────────────────────────────
 
 struct CrossAttention {
-    wq: Linear,
-    wk: Linear,
-    wv: Linear,
-    wo: Linear,
+    wq: Layer,
+    wk: Layer,
+    wv: Layer,
+    wo: Layer,
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,

@@ -2,7 +2,7 @@
 # launch.sh — Create a preemptible L4 VM and start training
 set -euo pipefail
 
-JOB="${1:?Usage: ./launch.sh <flow_v3|vocoder|speaker_encoder|codec_12hz|distill_v3> [--on-demand] [--gpu=l4|a100]}"
+JOB="${1:?Usage: ./launch.sh <flow_v3|vocoder|speaker_encoder|codec_12hz|distill_v3|drafter> [--on-demand] [--gpu=l4|a100]}"
 ON_DEMAND=false
 NEXT_JOB=""
 GPU_TYPE="l4"
@@ -15,8 +15,8 @@ for arg in "${@:2}"; do
 done
 
 case "$JOB" in
-    flow_v3|vocoder|speaker_encoder|codec_12hz|distill_v3) ;;
-    *) echo "ERROR: Unknown job '$JOB'. Use: flow_v3, vocoder, speaker_encoder, codec_12hz, distill_v3"; exit 1 ;;
+    flow_v3|vocoder|speaker_encoder|codec_12hz|distill_v3|drafter) ;;
+    *) echo "ERROR: Unknown job '$JOB'. Use: flow_v3, vocoder, speaker_encoder, codec_12hz, distill_v3, drafter"; exit 1 ;;
 esac
 
 # ─── Configuration ────────────────────────────────────────────────────────────
