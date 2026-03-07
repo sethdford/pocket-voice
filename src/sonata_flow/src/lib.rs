@@ -3176,26 +3176,26 @@ impl FlowV3DurationPredictor {
     }
 
     fn forward(&self, text_enc: &Tensor) -> Result<Tensor> {
+        // PyTorch order: conv → transpose → norm → relu
         let x = text_enc.transpose(1, 2)?;
-        // Conv1d with kernel=3, padding=1 (same-padding) — don't double-pad
         let x = x.conv1d(&self.conv1_weight, 1, 1, 1, 1)?;
         let x = x.broadcast_add(&self.conv1_bias.reshape((1, self.d_model, 1))?)?;
-        let x = x.relu()?;
         let x = x.transpose(1, 2)?;
         let mean = x.mean_keepdim(D::Minus1)?;
         let var = x.broadcast_sub(&mean)?.sqr()?.mean_keepdim(D::Minus1)?;
         let x = x.broadcast_sub(&mean)?.broadcast_div(&(var + 1e-5)?.sqrt()?)?;
         let x = x.broadcast_mul(&self.norm1_weight)?.broadcast_add(&self.norm1_bias)?;
+        let x = x.relu()?;
 
         let x = x.transpose(1, 2)?;
         let x = x.conv1d(&self.conv2_weight, 1, 1, 1, 1)?;
         let x = x.broadcast_add(&self.conv2_bias.reshape((1, self.d_model, 1))?)?;
-        let x = x.relu()?;
         let x = x.transpose(1, 2)?;
         let mean = x.mean_keepdim(D::Minus1)?;
         let var = x.broadcast_sub(&mean)?.sqr()?.mean_keepdim(D::Minus1)?;
         let x = x.broadcast_sub(&mean)?.broadcast_div(&(var + 1e-5)?.sqrt()?)?;
         let x = x.broadcast_mul(&self.norm2_weight)?.broadcast_add(&self.norm2_bias)?;
+        let x = x.relu()?;
 
         let out = self.proj.forward(&x)?;
         Ok(out.squeeze(D::Minus1)?)
@@ -3557,6 +3557,7 @@ impl SonataFlowV3Model {
         let (b, t_text) = char_ids.dims2()?;
         let device = char_ids.device();
         let profile = std::env::var("SONATA_PROFILE").ok().as_deref() == Some("1");
+        let debug = std::env::var("SONATA_DEBUG").ok().as_deref() == Some("1");
 
         let (text_enc, text_enc_ms) = if profile {
             let t0 = std::time::Instant::now();
@@ -3565,6 +3566,13 @@ impl SonataFlowV3Model {
         } else {
             (self.interleaved_enc.encode_text(char_ids)?, 0.0)
         };
+
+        if debug {
+            let te_f32 = text_enc.to_dtype(DType::F32)?;
+            if let Ok(v) = te_f32.i((0, 0..3, 0..5))?.to_vec2::<f32>() {
+                eprintln!("[DBG] text_enc[0,:3,:5]: {:?}", v);
+            }
+        }
 
         let (log_dur, dur_pred_ms) = if profile {
             let t0 = std::time::Instant::now();
@@ -3576,6 +3584,9 @@ impl SonataFlowV3Model {
         let mut dur = log_dur.exp()?.clamp(1.0e-6, 1e6)?.to_dtype(DType::F32)?;
         let nonpad = char_ids.ne(0u32)?.to_dtype(DType::F32)?;
         dur = dur.broadcast_mul(&nonpad)?;
+        if debug {
+            if let Ok(v) = dur.to_vec2::<f32>() { eprintln!("[DBG] durations: {:?}", v[0]); }
+        }
         let mut dur_int: Vec<Vec<u32>> = Vec::with_capacity(b);
         for bi in 0..b {
             let mut row = Vec::with_capacity(t_text);
@@ -3665,6 +3676,14 @@ impl SonataFlowV3Model {
             let total_ms = text_enc_ms + dur_pred_ms + ode_ms;
             eprintln!("[sonata_flow_v3] Profiling: text_enc={:.1}ms dur_pred={:.1}ms ode={:.1}ms total={:.1}ms",
                       text_enc_ms, dur_pred_ms, ode_ms, total_ms);
+        }
+        if debug {
+            let x_f32 = x.to_dtype(DType::F32)?;
+            if let Ok(mean) = x_f32.mean_all()?.to_scalar::<f32>() {
+                let min = x_f32.flatten_all()?.min(0)?.to_scalar::<f32>().unwrap_or(0.0);
+                let max = x_f32.flatten_all()?.max(0)?.to_scalar::<f32>().unwrap_or(0.0);
+                eprintln!("[DBG] mel output: mean={:.3}, min={:.3}, max={:.3}, shape={:?}", mean, min, max, x.shape());
+            }
         }
         // Extract per-phoneme durations (use adjusted dur_int for consistency with expand)
         let durations: Vec<f32> = (0..t_text)
