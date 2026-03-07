@@ -24,6 +24,8 @@ use std::ptr;
 mod drafter;
 use drafter::GruDrafter;
 
+mod quant;
+
 // ─── Config ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -42,6 +44,7 @@ struct LmConfig {
     #[serde(default)]                       use_prosody: bool,
     #[serde(default)]                       use_acoustic_head: bool,
     #[serde(default = "default_acoustic_dim")] acoustic_dim: usize,
+    #[serde(default)]                       quantize: bool,
 }
 
 const PROSODY_DIM: usize = 3; // (log_pitch, energy, speaking_rate)
@@ -85,7 +88,7 @@ impl Default for LmConfig {
             d_ff: 2560, max_seq_len: 4096, text_vocab_size: 32000,
             semantic_vocab_size: 4096, n_special_tokens: 4,
             rope_theta: 10000.0, norm_eps: 1e-5, use_prosody: false,
-            use_acoustic_head: false, acoustic_dim: 512,
+            use_acoustic_head: false, acoustic_dim: 512, quantize: false,
         }
     }
 }
@@ -1217,6 +1220,7 @@ impl LmEngine {
                 use_prosody: raw.get("use_prosody").and_then(|v| v.as_bool()).unwrap_or(false),
                 use_acoustic_head: raw.get("use_acoustic_head").and_then(|v| v.as_bool()).unwrap_or(false),
                 acoustic_dim: raw.get("acoustic_dim").and_then(|v| v.as_u64()).unwrap_or(512) as usize,
+                quantize: raw.get("quantize").and_then(|v| v.as_bool()).unwrap_or(false),
             }
         } else {
             LmConfig::default()
