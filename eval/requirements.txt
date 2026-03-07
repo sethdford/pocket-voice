@@ -1,0 +1,11 @@
+# TTS evaluation dependencies
+soundfile>=0.12
+numpy>=1.24
+torch>=2.0
+librosa>=0.10
+pesq>=0.0.4
+pystoi>=0.4
+jiwer>=3.0
+resampy>=0.4
+openai-whisper>=20231117
+speechbrain>=1.0

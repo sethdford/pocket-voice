@@ -1,0 +1,13 @@
+# Generated audio (large, reproducible)
+generated/
+reference/
+
+# Reports (except baselines committed intentionally)
+reports/*.json
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Model downloads
+pretrained_models/
