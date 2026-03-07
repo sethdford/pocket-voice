@@ -79,7 +79,7 @@ static char *json_escape(const char *src) {
     if (!src) return strdup("\"\"");
 
     int len = strlen(src);
-    char *dst = (char *)malloc(len * 2 + 3);
+    char *dst = (char *)malloc(len * 6 + 3);
     if (!dst) return strdup("\"\"");
 
     char *p = dst;
@@ -347,6 +347,7 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "\nProcessing %d test sentences...\n", (int)N_TEST_SENTENCES);
 
     double total_lm_time = 0.0, total_flow_time = 0.0;
+    double total_audio_duration = 0.0;
     float total_prosody_mos = 0.0;
     float total_wer = 0.0;
     int wer_count = 0;
@@ -429,6 +430,7 @@ int main(int argc, char *argv[]) {
 
         /* Compute audio stats */
         res->stats = compute_stats(audio_buf, n_samples, SAMPLE_RATE);
+        total_audio_duration += res->stats.duration_s;
         fprintf(stderr, "  Stats: RMS=%.4f, peak=%.4f, duration=%.2fs\n",
                 res->stats.rms, res->stats.peak, res->stats.duration_s);
 
@@ -575,8 +577,8 @@ int main(int argc, char *argv[]) {
     /* Aggregate metrics */
     fprintf(report_f, "  \"aggregate\": {\n");
     fprintf(report_f, "    \"mean_rtf\": %.4f,\n",
-            (total_lm_time + total_flow_time) / 1000.0 /
-            (double)N_TEST_SENTENCES);
+            total_audio_duration > 0.0 ?
+            (total_lm_time + total_flow_time) / 1000.0 / total_audio_duration : 0.0);
     fprintf(report_f, "    \"mean_lm_time_ms\": %.2f,\n",
             total_lm_time / (double)N_TEST_SENTENCES);
     fprintf(report_f, "    \"mean_flow_time_ms\": %.2f,\n",

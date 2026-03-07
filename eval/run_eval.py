@@ -190,16 +190,15 @@ def evaluate_generated(
 def merge_c_metrics(py_report: EvalReport, c_report: dict) -> EvalReport:
     """Merge C-native metrics into Python report."""
     # Extract C metrics if available
-    c_metrics = c_report.get("metrics", {})
+    c_metrics = c_report.get("aggregate", {})
 
     # Add C metrics to the report as a sub-object
     py_report.c_metrics = c_metrics
 
     # If C report has RTF or TTFA, add to SOTA baselines
-    if "mean_rtf_c" in c_metrics:
-        SOTA_BASELINES["rtf"]["sonata"] = c_metrics["mean_rtf_c"]
-    if "mean_ttfa_ms" in c_metrics:
-        SOTA_BASELINES["ttfa_ms"]["sonata"] = c_metrics["mean_ttfa_ms"]
+    if "mean_rtf" in c_metrics:
+        SOTA_BASELINES["rtf"]["sonata"] = c_metrics["mean_rtf"]
+    # TTFA (time-to-first-audio) not yet computed by C harness
 
     return py_report
 
@@ -289,7 +288,7 @@ def main():
     c_report = load_c_report(args.c_report)
     c_texts = []
     if c_report:
-        c_texts = [r.get("text", "") for r in c_report.get("results", [])]
+        c_texts = [r.get("text", "") for r in c_report.get("sentences", [])]
         print(f"Loaded C report with {len(c_texts)} samples")
 
     # Evaluate each WAV

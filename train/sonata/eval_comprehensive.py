@@ -372,19 +372,25 @@ def compute_f0_metrics(ref: np.ndarray, deg: np.ndarray, sr: int) -> Tuple[float
     return rmse, max(0.0, corr)
 
 
+_ecapa_classifier = None
+
+
 def compute_speaker_similarity(ref: np.ndarray, deg: np.ndarray, sr: int) -> float:
     """ECAPA-TDNN cosine similarity, or MFCC fallback."""
+    global _ecapa_classifier
     try:
         from speechbrain.inference.speaker import EncoderClassifier
         if sr != 16000:
             ref = resample_audio(ref, sr, 16000)
             deg = resample_audio(deg, sr, 16000)
             sr = 16000
-        classifier = EncoderClassifier.from_hparams(
-            source="speechbrain/spkrec-ecapa-voxceleb",
-            savedir="pretrained_models/spkrec-ecapa-voxceleb",
-            run_opts={"device": "cpu"},
-        )
+        if _ecapa_classifier is None:
+            _ecapa_classifier = EncoderClassifier.from_hparams(
+                source="speechbrain/spkrec-ecapa-voxceleb",
+                savedir="pretrained_models/spkrec-ecapa-voxceleb",
+                run_opts={"device": "cpu"},
+            )
+        classifier = _ecapa_classifier
         deg_trunc = deg[:len(ref)]
         emb_ref = classifier.encode_batch(torch.from_numpy(ref).float().unsqueeze(0)).squeeze()
         emb_deg = classifier.encode_batch(torch.from_numpy(deg_trunc).float().unsqueeze(0)).squeeze()
@@ -446,12 +452,17 @@ def compute_utmos(audio: np.ndarray, sr: int) -> float:
         return -1.0
 
 
+_whisper_model = None
+
+
 def transcribe_whisper(audio_path: str, sr: int = 16000) -> Optional[str]:
     """Transcribe audio via Whisper. Returns text or None."""
+    global _whisper_model
     try:
         import whisper
-        model = whisper.load_model("base")
-        result = model.transcribe(audio_path, fp16=False, language="en")
+        if _whisper_model is None:
+            _whisper_model = whisper.load_model("base")
+        result = _whisper_model.transcribe(audio_path, fp16=False, language="en")
         return (result.get("text") or "").strip()
     except Exception:
         return None
