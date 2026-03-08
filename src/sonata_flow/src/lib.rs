@@ -2622,7 +2622,7 @@ impl SonataFlowV2Model {
             if sway_s.abs() > 1e-6 {
                 t_val = sway_timestep(t_val, sway_s);
             }
-            let t = Tensor::from_vec(vec![t_val as f32; b], b, device)?.to_dtype(dtype)?;
+            let t = Tensor::from_vec(vec![t_val as f32; b], (b, 1), device)?.to_dtype(dtype)?;
 
             let v1 = if use_cfg {
                 let v_cond = self.predict_velocity(&x, &t, char_ids, &ref_mel, speaker_id, emotion_id, prosody_features, false)?;
@@ -2639,7 +2639,7 @@ impl SonataFlowV2Model {
                     t2_val = sway_timestep(t2_val, sway_s);
                 }
                 let x_euler = (&x + v1.affine(dt, 0.0)?)?;
-                let t2 = Tensor::from_vec(vec![t2_val as f32; b], b, device)?.to_dtype(dtype)?;
+                let t2 = Tensor::from_vec(vec![t2_val as f32; b], (b, 1), device)?.to_dtype(dtype)?;
                 let v2 = if use_cfg {
                     let v_cond = self.predict_velocity(&x_euler, &t2, char_ids, &ref_mel, speaker_id, emotion_id, prosody_features, false)?;
                     let v_uncond = self.predict_velocity(&x_euler, &t2, char_ids, &ref_mel, None, None, None, true)?;
@@ -3545,7 +3545,7 @@ impl SonataFlowV3Model {
             if use_heun && i + 1 < n_steps {
                 let t2_val = t_schedule[i + 1];
                 let x_euler = (&x + v1.affine(dt, 0.0)?)?;
-                let t2 = Tensor::from_vec(vec![t2_val as f32; b], b, device)?.to_dtype(dtype)?;
+                let t2 = Tensor::from_vec(vec![t2_val as f32; b], (b, 1), device)?.to_dtype(dtype)?;
                 let cache_ref = caches.as_ref().map(|c| c.as_slice());
                 let (v2, nc2) = if use_cfg {
                     let (v_cond, nc) = self.predict_velocity_streaming(
@@ -3672,7 +3672,7 @@ impl SonataFlowV3Model {
                     t_schedule[i + 1]
                 };
                 let x_euler = (&x + v1.affine(dt, 0.0)?)?;
-                let t2 = Tensor::from_vec(vec![t2_val as f32; b], b, device)?.to_dtype(dtype)?;
+                let t2 = Tensor::from_vec(vec![t2_val as f32; b], (b, 1), device)?.to_dtype(dtype)?;
                 let v2 = if use_cfg {
                     let v_cond = self.predict_velocity(&x_euler, &t2, &text_cond, speaker_id, false,
                                                       ref_mel, emotion_id)?;
