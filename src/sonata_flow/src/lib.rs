@@ -2144,6 +2144,7 @@ pub extern "C" fn sonata_flow_set_emotion_steering(
                     layer_mask,
                     scale,
                 });
+                #[cfg(debug_assertions)]
                 eprintln!("[sonata_flow] Emotion steering set (layers {}-{}, scale={:.2})",
                           ls, le, scale);
                 0
@@ -2234,6 +2235,7 @@ pub extern "C" fn sonata_flow_set_prosody_embedding(
         {
             Ok(t) => {
                 eng.prosody_embedding_override = Some(t);
+                #[cfg(debug_assertions)]
                 eprintln!("[sonata_flow] Prosody embedding set ({}-dim)", dim);
                 0
             }
@@ -2763,6 +2765,7 @@ pub extern "C" fn sonata_flow_v2_create(
             let _ = model.sample(&warmup_chars, 25, None, 2, 1.0, false, 0.0, dtype, None, None, None)?;
             eprintln!("[sonata_flow_v2] Warmup: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
 
+            #[cfg(debug_assertions)]
             eprintln!("[sonata_flow_v2] Loaded ({}L, mel_dim={}, steps={})",
                       config.n_layers, config.mel_dim, config.n_steps_inference);
 
@@ -3646,6 +3649,7 @@ impl SonataFlowV3Model {
         if debug {
             let te_f32 = text_enc.to_dtype(DType::F32)?;
             if let Ok(v) = te_f32.i((0, 0..3, 0..5))?.to_vec2::<f32>() {
+                #[cfg(debug_assertions)]
                 eprintln!("[DBG] text_enc[0,:3,:5]: {:?}", v);
             }
         }
@@ -3661,7 +3665,10 @@ impl SonataFlowV3Model {
         let nonpad = char_ids.ne(0u32)?.to_dtype(DType::F32)?;
         dur = dur.broadcast_mul(&nonpad)?;
         if debug {
-            if let Ok(v) = dur.to_vec2::<f32>() { eprintln!("[DBG] durations: {:?}", v[0]); }
+            if let Ok(v) = dur.to_vec2::<f32>() {
+                #[cfg(debug_assertions)]
+                eprintln!("[DBG] durations: {:?}", v[0]);
+            }
         }
         let mut dur_int: Vec<Vec<u32>> = Vec::with_capacity(b);
         for bi in 0..b {
@@ -3758,6 +3765,7 @@ impl SonataFlowV3Model {
             if let Ok(mean) = x_f32.mean_all()?.to_scalar::<f32>() {
                 let min = x_f32.flatten_all()?.min(0)?.to_scalar::<f32>().unwrap_or(0.0);
                 let max = x_f32.flatten_all()?.max(0)?.to_scalar::<f32>().unwrap_or(0.0);
+                #[cfg(debug_assertions)]
                 eprintln!("[DBG] mel output: mean={:.3}, min={:.3}, max={:.3}, shape={:?}", mean, min, max, x.shape());
             }
         }
@@ -3923,6 +3931,7 @@ pub extern "C" fn sonata_flow_v3_create(
                 (config.n_steps_inference, false)
             };
 
+            #[cfg(debug_assertions)]
             eprintln!("[sonata_flow_v3] Loaded ({}L, mel_dim={}, steps={}, distilled={})",
                       config.n_layers, config.mel_dim, n_steps, is_distilled);
 
