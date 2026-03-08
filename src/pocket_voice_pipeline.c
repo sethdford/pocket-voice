@@ -66,6 +66,33 @@
 #include "streaming_tts.h"
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * Pipeline Latency Tracing Macros (zero-overhead when disabled)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Uncomment to enable latency tracing. When disabled, all macros compile to no-ops. */
+/* #define SONATA_ENABLE_TRACING 1 */
+
+#ifdef SONATA_ENABLE_TRACING
+
+static inline uint64_t sonata_time_ns(void) {
+    static mach_timebase_info_data_t tb;
+    if (tb.denom == 0) mach_timebase_info(&tb);
+    return mach_absolute_time() * tb.numer / tb.denom;
+}
+
+#define SONATA_RECORD_TIMING(engine, field) do { \
+    SonataEngine *e = (SonataEngine *)(engine); \
+    if (e) e->last_timings.field = sonata_time_ns(); \
+} while (0)
+
+#else
+
+#define sonata_time_ns()  ((uint64_t)0)
+#define SONATA_RECORD_TIMING(engine, field)  /* no-op */
+
+#endif
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * FFI declarations for the three native libraries
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -1502,6 +1529,22 @@ static int flow_worker_has_pending(FlowWorker *fw) {
     return pending;
 }
 
+/* ─── Pipeline Latency Instrumentation ──────────────────────────────────
+ * Disabled by default. Enable with: #define SONATA_ENABLE_TRACING 1
+ * When disabled, zero-overhead via inlining.
+ * ────────────────────────────────────────────────────────────────────── */
+
+typedef struct {
+    uint64_t stt_start_ns;        /* STT audio input timestamp */
+    uint64_t stt_end_ns;          /* STT text output timestamp */
+    uint64_t llm_start_ns;        /* LLM first text input */
+    uint64_t llm_first_token_ns;  /* LLM first semantic token generated */
+    uint64_t llm_end_ns;          /* LLM sequence finished */
+    uint64_t tts_start_ns;        /* TTS first semantic token input */
+    uint64_t tts_first_audio_ns;  /* TTS first audio sample output */
+    uint64_t tts_end_ns;          /* TTS all audio generated */
+} PipelineTimings;
+
 typedef struct {
     void           *lm_engine;
     void           *storm_engine;    /* SoundStorm parallel decoder (alternative to LM) */
@@ -1536,6 +1579,8 @@ typedef struct {
     SpeakerEncoder *speaker_encoder;            /* ECAPA-TDNN encoder for zero-shot voice cloning */
     float          *cached_speaker_embedding;   /* Cached 256D embedding from reference audio */
     int             has_speaker_embedding;      /* 1 if cached_speaker_embedding is valid */
+    /* Latency tracing (guarded by SONATA_ENABLE_TRACING) */
+    PipelineTimings last_timings;               /* Timestamps from most recent generation */
 } SonataEngine;
 
 static SonataEngine *sonata_engine_create(
@@ -1821,6 +1866,9 @@ static void sonata_try_collect_parallel(SonataEngine *e) {
 static void sonata_flush_chunk(SonataEngine *e) {
     if (e->n_semantic_tokens <= 0) return;
     int n = e->n_semantic_tokens;
+    int chunk_start_buf = e->buf_write;  /* Track audio output position for TTFA */
+
+    SONATA_RECORD_TIMING(e, tts_start_ns);
 
     /* First-chunk-fast: use FAST mode for first chunk, then revert to configured quality */
     if (e->tts_first_chunk_fast && e->is_first_chunk && e->flow_engine) {
@@ -1937,6 +1985,14 @@ static void sonata_flush_chunk(SonataEngine *e) {
             }
         }
     }
+
+    /* Record first audio frame timing if audio was generated */
+    if (e->buf_write > chunk_start_buf) {
+        SONATA_RECORD_TIMING(e, tts_first_audio_ns);
+    }
+
+    SONATA_RECORD_TIMING(e, tts_end_ns);
+
     e->n_semantic_tokens = 0;
     if (e->is_first_chunk) {
         e->is_first_chunk = 0;
@@ -1988,9 +2044,20 @@ static int sonata_step(void *engine) {
         }
     } else {
         int semantic_token = 0;
+        /* Record first token timing */
+        if (e->n_semantic_tokens == 0) {
+            SONATA_RECORD_TIMING(e, llm_start_ns);
+        }
+
         int status = sonata_lm_step(e->lm_engine, &semantic_token);
 
+        /* Record first token arrival */
+        if (e->n_semantic_tokens == 0 && status >= 0) {
+            SONATA_RECORD_TIMING(e, llm_first_token_ns);
+        }
+
         if (status == 1 || status == -1) {
+            SONATA_RECORD_TIMING(e, llm_end_ns);
             sonata_flush_chunk(e);
             sonata_collect_parallel(e);
             e->done = 1;
@@ -2104,6 +2171,28 @@ static int sonata_reset_engine(void *engine) {
     e->text_finalized = 0;
     memset(e->phase_accum, 0, sizeof(e->phase_accum));
     return 0;
+}
+
+/**
+ * sonata_get_last_timings — Retrieve latency measurements from most recent generation.
+ *
+ * @param engine    SonataEngine pointer (void*)
+ * @return          PipelineTimings struct with nanosecond timestamps, or NULL on error
+ *
+ * The returned struct contains wall-clock nanosecond timestamps (via mach_absolute_time)
+ * for key pipeline events. Only valid when SONATA_ENABLE_TRACING is enabled at compile time.
+ *
+ * Timestamp fields:
+ *   - stt_start_ns / stt_end_ns:               STT transcription window
+ *   - llm_start_ns / llm_first_token_ns / llm_end_ns: LM generation window + first token
+ *   - tts_start_ns / tts_first_audio_ns / tts_end_ns: TTS generation window + first audio
+ *
+ * This enables E2E latency profiling without runtime overhead when tracing is disabled.
+ */
+static PipelineTimings* sonata_get_last_timings(void *engine) {
+    SonataEngine *e = (SonataEngine *)engine;
+    if (!e) return NULL;
+    return &e->last_timings;
 }
 
 /**

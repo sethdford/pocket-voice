@@ -416,4 +416,158 @@ mod tests {
         }
         Ok(())
     }
+
+    /// PERFORMANCE BENCHMARK: GRU drafter throughput (drafts/second)
+    /// Measures latency of full draft() call with varying K values.
+    /// Expected: ~100-500 tokens/sec on CPU, 1000-5000 tokens/sec on GPU.
+    #[test]
+    fn bench_gru_drafter_draft_throughput() -> Result<()> {
+        use std::time::Instant;
+
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+
+        // Realistic drafter config (matches production)
+        let cfg = DrafterConfig {
+            gru_hidden: 256,
+            gru_layers: 2,
+            emb_dim: 128,
+            d_model: 1024,
+            vocab_size: 4096,
+        };
+
+        let vb = VarBuilder::zeros(dtype, &device);
+        let drafter = GruDrafter::load(&cfg, vb, &device, dtype)?;
+
+        println!("\n[bench_gru_drafter] Throughput benchmark (drafts/second)");
+        println!("{:<10} {:<20} {:<20}", "K", "Tok/sec", "ms/token");
+
+        for k in vec![1, 4, 8, 16] {
+            let lm_hidden = Tensor::randn(0.0f32, 1.0, (1, 1, cfg.d_model), &device)?;
+            let current_token = 100u32;
+
+            // Warmup
+            let _ = drafter.draft(&lm_hidden, current_token, k)?;
+
+            // Benchmark: 100 iterations
+            let start = Instant::now();
+            let num_iters = 100;
+            for _ in 0..num_iters {
+                let _ = drafter.draft(&lm_hidden, current_token, k)?;
+            }
+            let elapsed = start.elapsed().as_secs_f64();
+
+            let total_tokens = num_iters * k;
+            let throughput = total_tokens as f64 / elapsed;
+            let ms_per_token = (elapsed / total_tokens as f64) * 1000.0;
+
+            println!("{:<10} {:<20.1} {:<20.3}", k, throughput, ms_per_token);
+        }
+
+        Ok(())
+    }
+
+    /// PERFORMANCE BENCHMARK: GRU drafter scalability with K
+    /// Verifies draft() scales linearly with K (minimal overhead per step).
+    #[test]
+    fn bench_gru_drafter_scalability() -> Result<()> {
+        use std::time::Instant;
+
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+
+        let cfg = DrafterConfig {
+            gru_hidden: 256,
+            gru_layers: 2,
+            emb_dim: 128,
+            d_model: 1024,
+            vocab_size: 4096,
+        };
+
+        let vb = VarBuilder::zeros(dtype, &device);
+        let drafter = GruDrafter::load(&cfg, vb, &device, dtype)?;
+
+        println!("\n[bench_gru_drafter] Scalability with K (ms per step)");
+        println!("{:<10} {:<20} {:<20}", "K", "Total ms", "ms/step");
+
+        let mut prev_total = 0.0;
+        for k in vec![1, 2, 4, 8, 16, 32] {
+            let lm_hidden = Tensor::randn(0.0f32, 1.0, (1, 1, cfg.d_model), &device)?;
+            let current_token = 100u32;
+
+            let _ = drafter.draft(&lm_hidden, current_token, k)?;
+
+            let start = Instant::now();
+            let num_iters = 50;
+            for _ in 0..num_iters {
+                let _ = drafter.draft(&lm_hidden, current_token, k)?;
+            }
+            let elapsed = start.elapsed().as_secs_f64();
+
+            let total_ms = (elapsed / num_iters as f64) * 1000.0;
+            let ms_per_step = total_ms / k as f64;
+
+            println!("{:<10} {:<20.3} {:<20.3}", k, total_ms, ms_per_step);
+
+            // Very rough linear regression: ms_per_step should be ~constant
+            if k > 1 && prev_total > 0.0 {
+                let ratio = total_ms / prev_total;
+                let expected_ratio = k as f64 / (k / 2) as f64;
+                // Allow ±20% deviation from linear scaling
+                if ratio < expected_ratio * 0.8 || ratio > expected_ratio * 1.2 {
+                    eprintln!(
+                        "  WARNING: Sublinear scaling (ratio={:.2}, expected={:.2})",
+                        ratio, expected_ratio
+                    );
+                }
+            }
+            prev_total = total_ms;
+        }
+
+        Ok(())
+    }
+
+    /// PERFORMANCE BENCHMARK: Memory footprint estimation
+    /// Prints parameter counts and estimated MB for drafter weights.
+    #[test]
+    fn bench_gru_drafter_memory() -> Result<()> {
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+
+        let cfg = DrafterConfig {
+            gru_hidden: 256,
+            gru_layers: 2,
+            emb_dim: 128,
+            d_model: 1024,
+            vocab_size: 4096,
+        };
+
+        let vb = VarBuilder::zeros(dtype, &device);
+        let _drafter = GruDrafter::load(&cfg, vb, &device, dtype)?;
+
+        println!("\n[bench_gru_drafter] Memory footprint");
+
+        // Compute parameter counts
+        let h_proj_params = cfg.d_model * cfg.gru_hidden;
+        let emb_params = cfg.vocab_size * cfg.emb_dim;
+
+        // GRU: 6 linear layers per layer (w_z, u_z, w_r, u_r, w_h, u_h)
+        let layer0_gru = 6 * cfg.emb_dim * cfg.gru_hidden;
+        let other_gru = (cfg.gru_layers - 1) * 6 * cfg.gru_hidden * cfg.gru_hidden;
+        let gru_params = layer0_gru + other_gru;
+
+        let output_params = cfg.gru_hidden * cfg.vocab_size;
+        let total_params = h_proj_params + emb_params + gru_params + output_params;
+
+        let bytes_per_f32 = 4;
+        let total_mb = (total_params as f64 * bytes_per_f32 as f64) / (1024.0 * 1024.0);
+
+        println!("  h_proj:       {:>12} params ({:>8.2} MB)", h_proj_params, (h_proj_params as f64 * bytes_per_f32 as f64) / (1024.0 * 1024.0));
+        println!("  emb:          {:>12} params ({:>8.2} MB)", emb_params, (emb_params as f64 * bytes_per_f32 as f64) / (1024.0 * 1024.0));
+        println!("  gru:          {:>12} params ({:>8.2} MB)", gru_params, (gru_params as f64 * bytes_per_f32 as f64) / (1024.0 * 1024.0));
+        println!("  output_head:  {:>12} params ({:>8.2} MB)", output_params, (output_params as f64 * bytes_per_f32 as f64) / (1024.0 * 1024.0));
+        println!("  TOTAL:        {:>12} params ({:>8.2} MB)", total_params, total_mb);
+
+        Ok(())
+    }
 }

@@ -1,0 +1,61 @@
+# Standard TTS Evaluation Sentences
+#
+# Collection of phonetically balanced, diverse test sentences for TTS quality validation.
+# Includes Harvard sentences, conversational phrases, numbers, and edge cases.
+#
+
+# ─── Harvard Sentences (Phonetically Balanced Intelligibility Benchmarks) ───
+The quick brown fox jumps over the lazy dog.
+Pack my box with five dozen liquor jugs.
+The jay, pig, fox, zebra and my wolves quack.
+How vexingly quick daft zebras jump.
+The five boxing wizards jump quickly.
+
+# ─── Phonetically Diverse Phrases ───
+I need to schedule a meeting for tomorrow at two PM.
+Can you repeat that again please?
+That sounds absolutely wonderful!
+We should discuss the quarterly results.
+Thank you very much for your help.
+
+# ─── Natural Conversational Patterns ───
+How are you doing today?
+The weather is beautiful today, isn't it?
+Let's meet at the coffee shop around noon.
+I'm sorry, I didn't catch that correctly.
+What time does the train leave station?
+
+# ─── Numbers & Abbreviations (Edge Cases) ───
+One, two, three... ready or not here I come!
+Call me at 555-1234 or email test at example.com.
+That costs $99.99 for 15% off.
+See you at 3:30 PM today.
+Dr. Smith, Ph.D., is here.
+
+# ─── Questions & Exclamations ───
+Do you think we can finish this project on time?
+I can't believe how amazing this sounds!
+Would you like to grab coffee next week?
+That's incredible! I had no idea.
+When are you available for a quick call?
+
+# ─── Technical/Formal Register ───
+Please configure the server with the appropriate authentication credentials.
+The algorithm demonstrates improved efficiency in distributed computing environments.
+According to recent market analysis, quarterly growth exceeded projections.
+Our team recommends a phased implementation approach for maximum stability.
+The system requires quarterly maintenance to ensure optimal performance.
+
+# ─── Prosody Challenges (Emphasis, Rate Variation) ───
+I think you're absolutely right about that decision.
+Really? You actually did that yourself?
+This is super important, so please pay attention.
+Well, it all depends on what you mean by that.
+Actually, I've been meaning to tell you something.
+
+# ─── Multi-Clause Sentences ───
+Although I understand your concern, I believe the current approach is optimal.
+Before you make a decision, consider these factors carefully.
+If you need help with anything, don't hesitate to reach out to me.
+When the project is complete, we should celebrate our achievement together.
+Because of these issues, we recommend moving forward with caution.

@@ -1,0 +1,31 @@
+# Voice cloning and SIM-O benchmark dependencies
+# Install with: pip install -r tools/requirements.txt
+
+# Audio I/O
+soundfile>=0.12.1
+librosa>=0.10.0
+resampy>=0.4.2
+torchaudio>=2.0.0
+
+# ML models
+torch>=2.0.0
+speechbrain>=0.5.13
+resemblyzer>=0.1.1
+
+# Speech processing
+speechmos>=0.0.4
+jiwer>=3.0.0
+
+# Codec quality metrics
+pesq>=0.0.3
+pystoi>=0.3.3
+
+# Optional: For Whisper ASR integration
+openai-whisper>=20230314
+
+# Optional: For safetensors (CAM encoder)
+safetensors>=0.4.0
+
+# Utilities
+numpy>=1.24.0
+scipy>=1.9.0

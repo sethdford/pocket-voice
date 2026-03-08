@@ -845,6 +845,29 @@ bench-sonata: tests/bench_sonata.c $(BUILD)/libsonata_istft.dylib $(BUILD)/libsp
 	  -o $(BUILD)/bench-sonata tests/bench_sonata.c
 	./$(BUILD)/bench-sonata
 
+bench-e2e-latency: tools/bench_e2e_latency.c $(BUILD)/libsonata_istft.dylib $(BUILD)/libspm_tokenizer.dylib $(BUILD)/libconformer_stt.dylib $(SONATA_LM_DYLIB) $(SONATA_FLOW_DYLIB) | $(BUILD)
+	$(CC) $(CFLAGS) -DACCELERATE_NEW_LAPACK -Isrc -framework Accelerate \
+	  -L$(BUILD) -lsonata_istft -lspm_tokenizer -lconformer_stt \
+	  -Lsrc/sonata_lm/target/release -Lsrc/sonata_flow/target/release \
+	  -Wl,-rpath,$(CURDIR)/$(BUILD) \
+	  -Wl,-rpath,$(CURDIR)/src/sonata_lm/target/release \
+	  -Wl,-rpath,$(CURDIR)/src/sonata_flow/target/release \
+	  -lsonata_lm -lsonata_flow -lm \
+	  -o $(BUILD)/bench-e2e-latency tools/bench_e2e_latency.c
+	@echo "E2E latency benchmark built: ./$(BUILD)/bench-e2e-latency"
+	@echo "Usage: ./$(BUILD)/bench-e2e-latency [optionally set model environment variables]"
+
+bench-speculative: tools/bench_speculative.c $(SONATA_LM_DYLIB) | $(BUILD)
+	mkdir -p bench_output
+	$(CC) $(CFLAGS) -Isrc \
+	  -Lsrc/sonata_lm/target/release \
+	  -Wl,-rpath,$(CURDIR)/src/sonata_lm/target/release \
+	  -lsonata_lm -lm \
+	  -o $(BUILD)/bench-speculative tools/bench_speculative.c
+	@echo "Speculative decoding benchmark built: ./$(BUILD)/bench-speculative"
+	@echo "Usage: ./$(BUILD)/bench-speculative [model_path] [drafter_path] [num_iters]"
+	@echo "Example: ./$(BUILD)/bench-speculative models/sonata_v3/sonata_lm.safetensors rnn_drafter.safetensors 10"
+
 # ─── Test Coverage Campaign Targets ───────────────────────────────────────
 
 test-sonata-storm: tests/test_sonata_storm.c $(SONATA_STORM_DYLIB) | $(BUILD)
@@ -1188,7 +1211,7 @@ test-speaker-encoder: tests/test_speaker_encoder.c $(BUILD)/libspeaker_encoder.d
 	  -o $(BUILD)/test-speaker-encoder tests/test_speaker_encoder.c
 	./$(BUILD)/test-speaker-encoder
 
-.PHONY: test test-eou test-semantic-eou test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-roundtrip test-llm-prosody test-websocket test-optimizations test-sonata test-sonata-quality test-sonata-stt test-sonata-v3 test-beam-search bench-sonata bench-quality bench-live bench-industry test-apple-perf test-quality-improvements test-real-models test-native-vad bench-vad test-speech-detector test-fused-eou-parallel test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-sonata-storm test-audio-emotion test-audio-mixer test-sonata-flow-ffi test-flow-quality-modes test-sonata-flow-distilled test-sonata-lm-ffi test-sonata-lm-dual-head test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-neural-backchannel test-intent-router test-response-cache test-speculative-gen test-streaming-tts test-streaming-llm test-full-duplex test-sonata-refiner test-tdt-decoder test-web-remote test-opus-codec test-audio-converter test-spatial-audio test-metal-loader test-metal-dispatch test-bnns-convnext test-coverage-gaps test-correctness-audit test-integration-audit test-security-audit test-assumptions bench-audit bench test-research-stt test-research-eou test-research-istft test-research-metal test-audio-watermark test-deep-filter test-codec-12hz test-gru-drafter test-speaker-encoder test-voice-cloning-e2e test-flow-streaming test-flow-distilled-loading test-speaker-encoder-integration eval eval-python eval-full eval-generate
+.PHONY: test test-eou test-semantic-eou test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-roundtrip test-llm-prosody test-websocket test-optimizations test-sonata test-sonata-quality test-sonata-stt test-sonata-v3 test-beam-search bench-sonata bench-e2e-latency bench-speculative bench-quality bench-live bench-industry test-apple-perf test-quality-improvements test-real-models test-native-vad bench-vad test-speech-detector test-fused-eou-parallel test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-sonata-storm test-audio-emotion test-audio-mixer test-sonata-flow-ffi test-flow-quality-modes test-sonata-flow-distilled test-sonata-lm-ffi test-sonata-lm-dual-head test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-neural-backchannel test-intent-router test-response-cache test-speculative-gen test-streaming-tts test-streaming-llm test-full-duplex test-sonata-refiner test-tdt-decoder test-web-remote test-opus-codec test-audio-converter test-spatial-audio test-metal-loader test-metal-dispatch test-bnns-convnext test-coverage-gaps test-correctness-audit test-integration-audit test-security-audit test-assumptions bench-audit bench test-research-stt test-research-eou test-research-istft test-research-metal test-audio-watermark test-deep-filter test-codec-12hz test-gru-drafter test-speaker-encoder test-voice-cloning-e2e test-flow-streaming test-flow-distilled-loading test-speaker-encoder-integration eval eval-python eval-full eval-generate
 
 bench: libs sonata
 	@bash scripts/benchmark.sh --all
