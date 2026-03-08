@@ -309,8 +309,26 @@ def train_drafter(args):
     kd_temp = args.kd_temperature
 
     best_loss = float("inf")
+    global_step = 0
+    save_steps = args.save_steps
+    ckpt_dir = os.path.dirname(args.output) or "."
+    os.makedirs(ckpt_dir, exist_ok=True)
 
-    for epoch in range(args.epochs):
+    # Resume from step checkpoint if available
+    resume_ckpt = os.path.join(ckpt_dir, "drafter_latest.pt")
+    start_epoch = 0
+    if os.path.exists(resume_ckpt):
+        print(f"[train_drafter] Resuming from {resume_ckpt}")
+        ckpt = torch.load(resume_ckpt, map_location=device)
+        drafter.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        start_epoch = ckpt.get("epoch", 0)
+        global_step = ckpt.get("global_step", 0)
+        best_loss = ckpt.get("best_loss", float("inf"))
+        print(f"[train_drafter] Resumed at epoch {start_epoch}, step {global_step}, best_loss={best_loss:.4f}")
+
+    for epoch in range(start_epoch, args.epochs):
         drafter.train()
         total_loss = 0.0
         n_batches = 0
@@ -376,9 +394,23 @@ def train_drafter(args):
 
             total_loss += loss.item()
             n_batches += 1
+            global_step += 1
 
             if n_batches <= 3 or n_batches % 100 == 0:
-                print(f"  step {n_batches}: loss={loss.item():.4f}", flush=True)
+                print(f"  step {global_step}: loss={loss.item():.4f}", flush=True)
+
+            # Step-interval checkpoint (preemption-safe)
+            if save_steps > 0 and global_step % save_steps == 0:
+                ckpt_state = {
+                    "model": drafter.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "best_loss": best_loss,
+                }
+                torch.save(ckpt_state, resume_ckpt)
+                print(f"[train_drafter] Checkpoint saved at step {global_step}", flush=True)
 
         avg_loss = total_loss / max(n_batches, 1)
         print(f"[train_drafter] Epoch {epoch+1}/{args.epochs} — loss: {avg_loss:.4f}")
@@ -387,6 +419,18 @@ def train_drafter(args):
             best_loss = avg_loss
             save_drafter(drafter, args.output, args)
             print(f"[train_drafter] Saved best model (loss={best_loss:.4f})")
+
+        # End-of-epoch checkpoint
+        ckpt_state = {
+            "model": drafter.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "epoch": epoch + 1,
+            "global_step": global_step,
+            "best_loss": best_loss,
+        }
+        torch.save(ckpt_state, resume_ckpt)
+        print(f"[train_drafter] Epoch checkpoint saved (step {global_step})")
 
     print(f"[train_drafter] Training complete. Best loss: {best_loss:.4f}")
     print(f"[train_drafter] Model saved to: {args.output}")
@@ -449,6 +493,8 @@ if __name__ == "__main__":
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--max_len", type=int, default=512)
+    parser.add_argument("--save_steps", type=int, default=5000,
+                        help="Save checkpoint every N steps (0 to disable)")
     parser.add_argument("--kd_weight", type=float, default=0.7,
                         help="Knowledge distillation weight (vs cross-entropy)")
     parser.add_argument("--kd_temperature", type=float, default=2.0,
