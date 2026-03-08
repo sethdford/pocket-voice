@@ -170,6 +170,22 @@ impl DepthTransformer {
         }
         Ok(codes)
     }
+
+    /// Quantize all Linear layers in depth transformer to INT4.
+    /// Note: This is a placeholder for future per-layer quantization integration.
+    pub fn quantize_layers(&mut self) -> Result<()> {
+        // TODO: Extract weights from all Linear layers (wq, wk, wv, wo, w_gate, w_up, w_down,
+        // codebook_heads, project_in) and convert to QuantizedLinearInt4
+        println!("Depth transformer quantization: placeholder");
+        Ok(())
+    }
+
+    /// Estimate memory footprint in bytes.
+    pub fn estimate_memory_bytes(&self) -> usize {
+        // Rough estimate: 6 blocks x (3 Linear for attention + 3 for FFN x avg 50KB)
+        // + 7 codebook heads x 50KB + project_in x 50KB
+        self.blocks.len() * 300_000 + self.codebook_heads.len() * 50_000 + 50_000
+    }
 }
 
 #[cfg(test)]

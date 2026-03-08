@@ -248,6 +248,41 @@ while [ $RETRY -lt $MAX_RETRIES ]; do
             TRAIN_PID=$!
             ;;
 
+        codec_rvq)
+            JOB_CKPT_DIR="$CKPT_DIR/codec_rvq"
+            GCS_CKPT_DIR="$BUCKET/checkpoints/codec_rvq"
+            mkdir -p "$JOB_CKPT_DIR"
+
+            RESUME=$(find_latest_checkpoint "$JOB_CKPT_DIR" "codec_rvq_step_*.pt")
+            if [ -z "$RESUME" ]; then
+                RESUME=$(find_latest_checkpoint "$JOB_CKPT_DIR" "codec_rvq_latest.pt")
+            fi
+
+            RESUME_FLAG=""
+            if [ -n "$RESUME" ]; then
+                echo "  Resuming from: $RESUME"
+                RESUME_FLAG="--resume $RESUME"
+            else
+                echo "  Starting from scratch"
+            fi
+
+            python3 -u train_codec_rvq.py \
+                --manifest "$DATA_DIR/libritts_r_full_manifest.jsonl" \
+                --output-dir "$JOB_CKPT_DIR" \
+                --device "$DEVICE" \
+                --steps 200000 \
+                --batch-size 16 \
+                --grad-accum 2 \
+                --amp \
+                --n-codebooks 8 \
+                --codebook-size 2048 \
+                --distill-weight 0.5 \
+                --save-every 5000 \
+                --num-workers 4 \
+                $RESUME_FLAG &
+            TRAIN_PID=$!
+            ;;
+
         drafter)
             # Extract semantic token data for ReDrafter if not already done
             DATA_TOKENS_DIR="$DATA_DIR/drafter_tokens"
@@ -328,7 +363,7 @@ while [ $RETRY -lt $MAX_RETRIES ]; do
             ;;
 
         *)
-            echo "ERROR: Unknown job '$JOB'. Use: flow_v3, vocoder, speaker_encoder, codec_12hz, distill_v3, semantic_eou, drafter"
+            echo "ERROR: Unknown job '$JOB'. Use: flow_v3, vocoder, speaker_encoder, codec_12hz, codec_rvq, distill_v3, semantic_eou, drafter"
             exit 1
             ;;
     esac
@@ -388,7 +423,7 @@ while [ $RETRY -lt $MAX_RETRIES ]; do
             http://metadata.google.internal/computeMetadata/v1/instance/attributes/next-job 2>/dev/null || true)
         if [ -n "$NEXT_JOB" ]; then
             # Validate next job against allowed job names
-            if [[ "$NEXT_JOB" =~ ^(flow_v3|vocoder|speaker_encoder|codec_12hz|distill_v3|semantic_eou|drafter)$ ]]; then
+            if [[ "$NEXT_JOB" =~ ^(flow_v3|vocoder|speaker_encoder|codec_12hz|codec_rvq|distill_v3|semantic_eou|drafter)$ ]]; then
                 echo "[$(date)] Chaining to next job: $NEXT_JOB"
                 exec "$0" "$NEXT_JOB" "$BUCKET"
             else

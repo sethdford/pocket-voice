@@ -190,6 +190,21 @@ impl TemporalTransformer {
         }
         self.norm.forward(&h)
     }
+
+    /// Quantize all Linear layers in temporal transformer to INT4.
+    /// Note: This is a placeholder for future per-layer quantization integration.
+    pub fn quantize_layers(&mut self) -> Result<()> {
+        // TODO: Extract weights from all Linear layers (wq, wk, wv, wo, w_gate, w_up, w_down)
+        // and convert to QuantizedLinearInt4
+        println!("Temporal transformer quantization: placeholder");
+        Ok(())
+    }
+
+    /// Estimate memory footprint in bytes.
+    pub fn estimate_memory_bytes(&self) -> usize {
+        // Rough estimate: 12 blocks x (4 Linear layers x avg 100KB per layer)
+        self.blocks.len() * 400_000
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────

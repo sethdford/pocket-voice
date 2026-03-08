@@ -42,6 +42,7 @@ JOBS=(
     drafter
     distill_v3
     vocoder
+    codec_rvq
     codec_12hz
 )
 
