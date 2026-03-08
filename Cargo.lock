@@ -2432,6 +2432,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sonata-talker"
+version = "0.1.0"
+dependencies = [
+ "candle-core",
+ "candle-nn",
+ "rand 0.8.5",
+ "safetensors 0.4.5",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "sonata-tts"
 version = "0.2.0"
 dependencies = [

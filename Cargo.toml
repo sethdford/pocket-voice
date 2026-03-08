@@ -15,6 +15,7 @@ members = [
     "src/sonata_flow",
     "src/sonata_speaker",
     "src/sonata_storm",
+    "src/sonata_talker",
 ]
 
 [workspace.dependencies]
