@@ -24,6 +24,10 @@ const FLOW_QUALITY_FAST: i32 = 0;      // 4 steps, Euler only
 const FLOW_QUALITY_BALANCED: i32 = 1;  // 6 steps, Euler only
 const FLOW_QUALITY_HIGH: i32 = 2;      // 8 steps, Heun
 
+// ─── FFI Bounds Constants ────────────────────────────────────────────────────
+const MAX_FRAMES: usize = 16384;       // ~5 min at 50Hz
+const MAX_SEMANTIC_VOCAB: u32 = 4096;  // Semantic token value limit
+
 fn panic_message(e: Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = e.downcast_ref::<&str>() {
         s.to_string()
@@ -1230,9 +1234,18 @@ pub extern "C" fn sonata_flow_create(
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         (|| -> Result<SonataFlowEngine> {
         #[cfg(feature = "metal")]
-        let device = Device::new_metal(0)?;
+        let device = match Device::new_metal(0) {
+            Ok(dev) => dev,
+            Err(_) => {
+                eprintln!("WARNING: Metal GPU unavailable, falling back to CPU. Inference will be 100-300x slower.");
+                Device::Cpu
+            }
+        };
         #[cfg(not(feature = "metal"))]
-        let device = Device::Cpu;
+        let device = {
+            eprintln!("WARNING: Metal GPU not compiled in (feature=\"metal\" disabled), using CPU. Inference will be 100-300x slower.");
+            Device::Cpu
+        };
 
         let dtype = DType::F16;
 
@@ -1486,9 +1499,8 @@ pub extern "C" fn sonata_flow_generate_streaming_chunk(
     out_magnitude: *mut c_float,
     out_phase: *mut c_float,
 ) -> c_int {
-    const MAX_FRAMES: c_int = 16384; // ~5 min at 50Hz
     if engine.is_null() || semantic_tokens.is_null() || n_frames <= 0
-        || n_frames > MAX_FRAMES || chunk_offset < 0
+        || n_frames > MAX_FRAMES as c_int || chunk_offset < 0
         || out_magnitude.is_null() || out_phase.is_null() { return 0; }
     // Guard against integer overflow: offset + n_frames must fit in usize
     let total_len_check = (chunk_offset as i64) + (n_frames as i64);
@@ -1499,11 +1511,30 @@ pub extern "C" fn sonata_flow_generate_streaming_chunk(
         (|| -> Result<usize> {
             let n_f = n_frames as usize;
             let offset = chunk_offset as usize;
-            let total_len = offset + n_f;
+            // Use checked arithmetic for bounds safety
+            let total_len = offset.checked_add(n_f).ok_or_else(||
+                candle_core::Error::Msg("Integer overflow: offset + n_frames".to_string()))?;
+
+            if total_len > MAX_FRAMES {
+                return Err(candle_core::Error::Msg(
+                    format!("Total frame count {} exceeds maximum {}", total_len, MAX_FRAMES)
+                ));
+            }
 
             let tokens: Vec<u32> = (0..total_len)
                 .map(|i| unsafe { *semantic_tokens.add(i) as u32 })
                 .collect();
+
+            // Validate semantic token values are within vocabulary bounds
+            for (i, &token) in tokens.iter().enumerate() {
+                if token >= MAX_SEMANTIC_VOCAB {
+                    return Err(candle_core::Error::Msg(
+                        format!("Semantic token {} at position {} exceeds vocabulary bound {}",
+                                token, i, MAX_SEMANTIC_VOCAB)
+                    ));
+                }
+            }
+
             let sem = Tensor::from_vec(tokens.clone(), (1, total_len), &eng.device)?;
 
             let steps = if offset == 0 && eng.is_first_chunk {
@@ -1638,9 +1669,8 @@ pub extern "C" fn sonata_flow_generate(
     out_magnitude: *mut c_float,
     out_phase: *mut c_float,
 ) -> c_int {
-    const MAX_FRAMES: c_int = 16384;
     if engine.is_null() || semantic_tokens.is_null() || n_frames <= 0
-        || n_frames > MAX_FRAMES
+        || n_frames > MAX_FRAMES as c_int
         || out_magnitude.is_null() || out_phase.is_null() { return 0; }
     let eng = unsafe { &mut *(engine as *mut SonataFlowEngine) };
 
@@ -1648,6 +1678,16 @@ pub extern "C" fn sonata_flow_generate(
         let tokens: Vec<u32> = (0..n_frames as usize)
             .map(|i| unsafe { *semantic_tokens.add(i) as u32 })
             .collect();
+
+        // Validate semantic token values are within vocabulary bounds
+        for (i, &token) in tokens.iter().enumerate() {
+            if token >= MAX_SEMANTIC_VOCAB {
+                return Err(candle_core::Error::Msg(
+                    format!("Semantic token {} at position {} exceeds vocabulary bound {}",
+                            token, i, MAX_SEMANTIC_VOCAB)
+                ));
+            }
+        }
 
         let sem = Tensor::from_vec(tokens.clone(), (1, n_frames as usize), &eng.device)?;
         let spk_override = eng.speaker_embedding_override.as_ref();
@@ -1814,9 +1854,8 @@ pub extern "C" fn sonata_flow_generate_audio(
     out_audio: *mut c_float,
     max_samples: c_int,
 ) -> c_int {
-    const MAX_FRAMES: c_int = 16384;
     if engine.is_null() || semantic_tokens.is_null() || n_frames <= 0
-        || n_frames > MAX_FRAMES
+        || n_frames > MAX_FRAMES as c_int
         || out_audio.is_null() || max_samples <= 0 { return 0; }
     let eng = unsafe { &mut *(engine as *mut SonataFlowEngine) };
 
@@ -1829,6 +1868,16 @@ pub extern "C" fn sonata_flow_generate_audio(
         let tokens: Vec<u32> = (0..n_frames as usize)
             .map(|i| unsafe { *semantic_tokens.add(i) as u32 })
             .collect();
+
+        // Validate semantic token values are within vocabulary bounds
+        for (i, &token) in tokens.iter().enumerate() {
+            if token >= MAX_SEMANTIC_VOCAB {
+                return Err(candle_core::Error::Msg(
+                    format!("Semantic token {} at position {} exceeds vocabulary bound {}",
+                            token, i, MAX_SEMANTIC_VOCAB)
+                ));
+            }
+        }
 
         let sem = Tensor::from_vec(tokens.clone(), (1, n_frames as usize), &eng.device)?;
         let spk_override = eng.speaker_embedding_override.as_ref();
@@ -2685,9 +2734,18 @@ pub extern "C" fn sonata_flow_v2_create(
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         (|| -> Result<SonataFlowV2Engine> {
             #[cfg(feature = "metal")]
-            let device = Device::new_metal(0)?;
+            let device = match Device::new_metal(0) {
+                Ok(dev) => dev,
+                Err(_) => {
+                    eprintln!("WARNING: Metal GPU unavailable, falling back to CPU. Inference will be 100-300x slower.");
+                    Device::Cpu
+                }
+            };
             #[cfg(not(feature = "metal"))]
-            let device = Device::Cpu;
+            let device = {
+                eprintln!("WARNING: Metal GPU not compiled in (feature=\"metal\" disabled), using CPU. Inference will be 100-300x slower.");
+                Device::Cpu
+            };
 
             let dtype = DType::F16;
             let config_content = std::fs::read_to_string(config_str)
@@ -3822,9 +3880,18 @@ pub extern "C" fn sonata_flow_v3_create(
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         (|| -> Result<SonataFlowV3Engine> {
             #[cfg(feature = "metal")]
-            let device = Device::new_metal(0)?;
+            let device = match Device::new_metal(0) {
+                Ok(dev) => dev,
+                Err(_) => {
+                    eprintln!("WARNING: Metal GPU unavailable, falling back to CPU. Inference will be 100-300x slower.");
+                    Device::Cpu
+                }
+            };
             #[cfg(not(feature = "metal"))]
-            let device = Device::Cpu;
+            let device = {
+                eprintln!("WARNING: Metal GPU not compiled in (feature=\"metal\" disabled), using CPU. Inference will be 100-300x slower.");
+                Device::Cpu
+            };
 
             // Use F32 for correctness — F16 dtype mixing causes issues in ODE sampling
             let dtype = DType::F32;
@@ -4557,9 +4624,18 @@ pub extern "C" fn sonata_vocoder_create(weights_path: *const c_char, config_path
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         (|| -> Result<SonataVocoderEngine> {
         #[cfg(feature = "metal")]
-        let device = Device::new_metal(0)?;
+        let device = match Device::new_metal(0) {
+            Ok(dev) => dev,
+            Err(_) => {
+                eprintln!("WARNING: Metal GPU unavailable, falling back to CPU. Inference will be 100-300x slower.");
+                Device::Cpu
+            }
+        };
         #[cfg(not(feature = "metal"))]
-        let device = Device::Cpu;
+        let device = {
+            eprintln!("WARNING: Metal GPU not compiled in (feature=\"metal\" disabled), using CPU. Inference will be 100-300x slower.");
+            Device::Cpu
+        };
 
         let config_content = std::fs::read_to_string(config_str)
             .map_err(|e| candle_core::Error::Msg(format!("Config read: {}", e)))?;

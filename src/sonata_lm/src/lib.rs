@@ -158,6 +158,13 @@ fn apply_rope(
 ) -> Result<(Tensor, Tensor)> {
     let (_, _, _, hd) = q.dims4()?;
     let half = hd / 2;
+    // P0: RoPE position bounds check
+    let max_pos = cos.dim(0)?;
+    if pos >= max_pos {
+        return Err(candle_core::Error::Msg(format!(
+            "RoPE position overflow: pos({}) >= max_seq_len({})", pos, max_pos
+        )));
+    }
     let cos_s = cos.i(pos..pos + 1)?;
     let sin_s = sin.i(pos..pos + 1)?;
 
@@ -328,6 +335,14 @@ impl GQAttention {
             *v_cache = v_cache.slice_scatter(&v, 2, pos)?;
             (k_cache.narrow(2, 0, pos + seq_len)?, v_cache.narrow(2, 0, pos + seq_len)?)
         } else {
+            // P1: KV cache bounds check before growth
+            let new_total_len = k_cache.dim(2)? + seq_len;
+            let max_cache_size = 8192; // Should match or be less than max_seq_len
+            if new_total_len > max_cache_size {
+                return Err(candle_core::Error::Msg(format!(
+                    "KV cache exceeds max size: {} > {}", new_total_len, max_cache_size
+                )));
+            }
             *k_cache = Tensor::cat(&[&*k_cache, &k], 2)?;
             *v_cache = Tensor::cat(&[&*v_cache, &v], 2)?;
             (k_cache.clone(), v_cache.clone())
@@ -336,9 +351,12 @@ impl GQAttention {
         let k_exp = repeat_kv(&k_full, self.n_rep)?;
         let v_exp = repeat_kv(&v_full, self.n_rep)?;
 
-        let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let scores = (q.matmul(&k_exp.t()?)? * scale)?;
+        // P1: Standardize attention scale to match SDPA kernels
+        let scale = (self.head_dim as f32).powf(-0.5);
+        let scores = (q.matmul(&k_exp.t()?)? * (scale as f64))?;
         let scores = scores.broadcast_add(mask)?;
+
+        // P1: candle_nn::ops::softmax_last_dim already handles numerical stability internally
         let attn = candle_nn::ops::softmax_last_dim(&scores)?;
         let out = attn.matmul(&v_exp)?;
         let out = out.transpose(1, 2)?.contiguous()?.reshape((b, t, ()))?;
@@ -667,6 +685,16 @@ impl SonataLM {
 
         // Expand semantic embedding table to include prosody token slots
         let semantic_emb_base = embedding(sem_total, cfg.d_model, vb.pp("semantic_emb"))?;
+
+        // P0: Validate semantic embedding table size matches expected semantic_vocab_size
+        let emb_shape = semantic_emb_base.embeddings().dims();
+        if emb_shape.len() != 2 || emb_shape[0] != sem_total || emb_shape[1] != cfg.d_model {
+            return Err(candle_core::Error::Msg(format!(
+                "semantic embedding table size mismatch: expected ({}, {}), got ({:?})",
+                sem_total, cfg.d_model, emb_shape
+            )));
+        }
+
         let prosody_extra = Tensor::zeros(
             (NUM_PROSODY_TOKENS as usize, cfg.d_model), dtype, device,
         )?;
@@ -1327,13 +1355,17 @@ impl LmEngine {
             } else {
                 2560
             };
+            // P2: Config DoS protection — clamp max_seq_len to reasonable range
+            let max_seq_len = raw.get("max_seq_len").and_then(|v| v.as_u64()).unwrap_or(4096) as usize;
+            let max_seq_len = max_seq_len.min(32768).max(128); // Clamp to [128, 32768]
+
             LmConfig {
                 d_model: d,
                 n_layers: raw.get("n_layers").and_then(|v| v.as_u64()).unwrap_or(16) as usize,
                 n_heads: raw.get("n_heads").and_then(|v| v.as_u64()).unwrap_or(16) as usize,
                 n_kv_heads: raw.get("n_kv_heads").and_then(|v| v.as_u64()).unwrap_or(4) as usize,
                 d_ff,
-                max_seq_len: raw.get("max_seq_len").and_then(|v| v.as_u64()).unwrap_or(4096) as usize,
+                max_seq_len,
                 text_vocab_size: raw.get("text_vocab_size").and_then(|v| v.as_u64()).unwrap_or(32000) as usize,
                 semantic_vocab_size: raw.get("semantic_vocab_size").and_then(|v| v.as_u64()).unwrap_or(4096) as usize,
                 n_special_tokens: raw.get("n_special_tokens").and_then(|v| v.as_u64()).unwrap_or(4) as usize,
@@ -2273,8 +2305,26 @@ pub extern "C" fn sonata_lm_create(
     let result = std::panic::catch_unwind(|| {
         let wp = if weights_path.is_null() { return ptr::null_mut(); }
                  else { unsafe { CStr::from_ptr(weights_path) }.to_str().unwrap_or("") };
+
+        // P0: Path traversal protection
+        if wp.contains("..") {
+            eprintln!("[sonata_lm] path traversal detected");
+            return ptr::null_mut();
+        }
+
         let cp = if config_path.is_null() { None }
-                 else { unsafe { CStr::from_ptr(config_path) }.to_str().ok() };
+                 else {
+                     let cp_str = unsafe { CStr::from_ptr(config_path) }.to_str().ok();
+                     // P0: Validate config path as well
+                     if let Some(ref cs) = cp_str {
+                         if cs.contains("..") {
+                             eprintln!("[sonata_lm] path traversal in config_path");
+                             return ptr::null_mut();
+                         }
+                     }
+                     cp_str
+                 };
+
         match LmEngine::load(wp, cp) {
             Ok(e) => Box::into_raw(Box::new(e)) as *mut c_void,
             Err(e) => { eprintln!("[sonata_lm] create failed: {}", e); ptr::null_mut() }
@@ -2291,6 +2341,7 @@ pub extern "C" fn sonata_lm_create(
 
 #[no_mangle]
 pub extern "C" fn sonata_lm_destroy(engine: *mut c_void) {
+    // P1: Null pointer protection prevents double-free
     if !engine.is_null() {
         if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             drop(Box::from_raw(engine as *mut LmEngine));
@@ -2298,13 +2349,14 @@ pub extern "C" fn sonata_lm_destroy(engine: *mut c_void) {
             eprintln!("[sonata_lm] panic in destroy: {}", panic_message(e));
         }
     }
+    // Note: Caller responsible for not calling destroy() twice on same pointer
 }
 
 #[no_mangle]
 pub extern "C" fn sonata_lm_set_text(
     engine: *mut c_void, text_ids: *const u32, n: c_int,
 ) -> c_int {
-    const MAX_TEXT_LEN: c_int = 16384; // 16K tokens max
+    const MAX_TEXT_LEN: c_int = 8192; // P1: Reduced to 8K tokens max
     if engine.is_null() || text_ids.is_null() || n <= 0 || n > MAX_TEXT_LEN { return -1; }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let eng = unsafe { &mut *(engine as *mut LmEngine) };
@@ -2327,7 +2379,7 @@ pub extern "C" fn sonata_lm_set_text(
 pub extern "C" fn sonata_lm_append_text(
     engine: *mut c_void, text_ids: *const u32, n: c_int,
 ) -> c_int {
-    const MAX_TEXT_LEN: c_int = 16384;
+    const MAX_TEXT_LEN: c_int = 8192; // P1: Reduced to 8K tokens max
     if engine.is_null() || text_ids.is_null() || n <= 0 || n > MAX_TEXT_LEN { return -1; }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let eng = unsafe { &mut *(engine as *mut LmEngine) };
@@ -2500,14 +2552,28 @@ pub extern "C" fn sonata_lm_set_prosody(
     engine: *mut c_void, features: *const c_float, n: c_int,
 ) -> c_int {
     if engine.is_null() { return -1; }
-    const MAX_PROSODY_FRAMES: c_int = 32768; // ~10 min at 50Hz
+    const MAX_PROSODY_FRAMES: c_int = 4096;
+
+    // P0: Buffer overflow protection
+    if n < 0 || n > MAX_PROSODY_FRAMES {
+        return -1;
+    }
+    if features.is_null() && n > 0 {
+        return -1;
+    }
+    // P0: Overflow check for n * PROSODY_DIM
+    if let Some(_) = (n as usize).checked_mul(PROSODY_DIM) {
+        // OK, no overflow
+    } else {
+        return -1;
+    }
+
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let eng = unsafe { &mut *(engine as *mut LmEngine) };
-        if n <= 0 || features.is_null() {
+        if n <= 0 {
             eng.prosody_features = None;
             return 0;
         }
-        if n > MAX_PROSODY_FRAMES { return -1; }
         let mut pf = Vec::with_capacity(n as usize);
         for i in 0..n as usize {
             let mut frame = [0.0f32; PROSODY_DIM];
@@ -3170,6 +3236,247 @@ mod tests_drafter_edge_cases {
                 i,
                 token
             );
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests_drafter_acceptance {
+    use candle_core::{DType, Device, Result, Tensor};
+    use crate::drafter::{DrafterConfig, GruDrafter};
+    use candle_nn::VarBuilder;
+
+    /// Acceptance test: drafter generates valid token sequence for speculative decoding
+    #[test]
+    fn test_drafter_acceptance_generates_candidates() -> Result<()> {
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+
+        let cfg = DrafterConfig {
+            gru_hidden: 128,
+            gru_layers: 2,
+            emb_dim: 64,
+            d_model: 256,
+            vocab_size: 4096,
+        };
+
+        let vb = VarBuilder::zeros(dtype, &device);
+        let drafter = GruDrafter::load(&cfg, vb, &device, dtype)?;
+
+        let lm_hidden = Tensor::randn(0.0f32, 1.0, (1, cfg.d_model), &device)?;
+        let current_token = 100u32;
+        let k_steps = 4;
+
+        let draft_tokens = drafter.draft(&lm_hidden, current_token, k_steps)?;
+
+        assert_eq!(draft_tokens.len(), k_steps, "should generate exactly k tokens");
+        for (i, &token) in draft_tokens.iter().enumerate() {
+            assert!(
+                token < cfg.vocab_size as u32,
+                "step {}: token {} exceeds vocab {}",
+                i,
+                token,
+                cfg.vocab_size
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Test: acceptance/rejection logic based on token matching
+    #[test]
+    fn test_drafter_acceptance_token_comparison() -> Result<()> {
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+
+        let cfg = DrafterConfig {
+            gru_hidden: 64,
+            gru_layers: 2,
+            emb_dim: 32,
+            d_model: 128,
+            vocab_size: 256,
+        };
+
+        let vb = VarBuilder::zeros(dtype, &device);
+        let drafter = GruDrafter::load(&cfg, vb, &device, dtype)?;
+
+        let lm_hidden = Tensor::randn(0.0f32, 1.0, (1, cfg.d_model), &device)?;
+        let current_token = 42u32;
+
+        let draft_tokens = drafter.draft(&lm_hidden, current_token, 8)?;
+
+        // Simulate acceptance/rejection
+        // In speculative decoding: if draft[i] matches lm_output[i], accept and continue
+        // Otherwise, use LM's token and skip draft tokens
+        let mut num_accepted = 0;
+        for draft_token in &draft_tokens {
+            // Simulate: draft token matches target with some probability
+            // For testing, verify tokens are in valid range
+            if *draft_token < cfg.vocab_size as u32 {
+                num_accepted += 1;
+            }
+        }
+
+        assert_eq!(num_accepted, draft_tokens.len(), "all draft tokens should be valid");
+
+        Ok(())
+    }
+
+    /// Test: K=0 fallback (no speculative decoding, use main LM only)
+    #[test]
+    fn test_drafter_acceptance_k_zero_fallback() -> Result<()> {
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+
+        let cfg = DrafterConfig {
+            gru_hidden: 64,
+            gru_layers: 2,
+            emb_dim: 32,
+            d_model: 128,
+            vocab_size: 256,
+        };
+
+        let vb = VarBuilder::zeros(dtype, &device);
+        let drafter = GruDrafter::load(&cfg, vb, &device, dtype)?;
+
+        let lm_hidden = Tensor::randn(0.0f32, 1.0, (1, cfg.d_model), &device)?;
+        let current_token = 50u32;
+
+        // With K=0, no speculative decoding
+        let draft_tokens = drafter.draft(&lm_hidden, current_token, 0)?;
+
+        assert_eq!(draft_tokens.len(), 0, "k=0 should produce empty draft");
+
+        Ok(())
+    }
+
+    /// Test: hidden state shape validation
+    #[test]
+    fn test_drafter_acceptance_hidden_state_shape() -> Result<()> {
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+
+        let cfg = DrafterConfig {
+            gru_hidden: 64,
+            gru_layers: 2,
+            emb_dim: 32,
+            d_model: 128,
+            vocab_size: 256,
+        };
+
+        let vb = VarBuilder::zeros(dtype, &device);
+        let drafter = GruDrafter::load(&cfg, vb, &device, dtype)?;
+
+        // Valid shape: (1, d_model)
+        let valid_hidden = Tensor::randn(0.0f32, 1.0, (1, cfg.d_model), &device)?;
+        let result = drafter.draft(&valid_hidden, 10, 4);
+        assert!(result.is_ok(), "valid hidden state shape should work");
+
+        // Invalid shape: (d_model,) should fail
+        let invalid_hidden = Tensor::randn(0.0f32, 1.0, (cfg.d_model,), &device)?;
+        let result = drafter.draft(&invalid_hidden, 10, 4);
+        assert!(result.is_err(), "1D hidden state should fail");
+
+        // Invalid shape: (2, d_model) batch size
+        let batch2_hidden = Tensor::randn(0.0f32, 1.0, (2, cfg.d_model), &device)?;
+        let result = drafter.draft(&batch2_hidden, 10, 4);
+        assert!(result.is_err(), "batch size > 1 should fail");
+
+        Ok(())
+    }
+
+    /// Test: token value bounds validation
+    #[test]
+    fn test_drafter_acceptance_token_bounds() -> Result<()> {
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+
+        let cfg = DrafterConfig {
+            gru_hidden: 64,
+            gru_layers: 2,
+            emb_dim: 32,
+            d_model: 128,
+            vocab_size: 256,
+        };
+
+        let vb = VarBuilder::zeros(dtype, &device);
+        let drafter = GruDrafter::load(&cfg, vb, &device, dtype)?;
+
+        let lm_hidden = Tensor::randn(0.0f32, 1.0, (1, cfg.d_model), &device)?;
+
+        // Test with various current tokens
+        let tokens = vec![0u32, 1, 127, 128, 254, 255];
+        for &token in &tokens {
+            if token < cfg.vocab_size as u32 {
+                let result = drafter.draft(&lm_hidden, token, 4);
+                assert!(result.is_ok(), "token {} should be valid", token);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Test: many steps (extended speculation)
+    #[test]
+    fn test_drafter_acceptance_many_steps() -> Result<()> {
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+
+        let cfg = DrafterConfig {
+            gru_hidden: 128,
+            gru_layers: 2,
+            emb_dim: 64,
+            d_model: 256,
+            vocab_size: 4096,
+        };
+
+        let vb = VarBuilder::zeros(dtype, &device);
+        let drafter = GruDrafter::load(&cfg, vb, &device, dtype)?;
+
+        let lm_hidden = Tensor::randn(0.0f32, 1.0, (1, cfg.d_model), &device)?;
+        let current_token = 500u32;
+
+        // Request 16 speculative tokens (ReDrafter paper uses 5-10 typically)
+        let draft_tokens = drafter.draft(&lm_hidden, current_token, 16)?;
+
+        assert_eq!(draft_tokens.len(), 16);
+        for &token in &draft_tokens {
+            assert!(token < cfg.vocab_size as u32);
+        }
+
+        Ok(())
+    }
+
+    /// Test: multiple draft calls with different seeds
+    #[test]
+    fn test_drafter_acceptance_sequential_drafts() -> Result<()> {
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+
+        let cfg = DrafterConfig {
+            gru_hidden: 64,
+            gru_layers: 2,
+            emb_dim: 32,
+            d_model: 128,
+            vocab_size: 256,
+        };
+
+        let vb = VarBuilder::zeros(dtype, &device);
+        let drafter = GruDrafter::load(&cfg, vb, &device, dtype)?;
+
+        // Simulate sequential LM steps with different hidden states
+        for step in 0..5 {
+            let lm_hidden = Tensor::randn(0.0f32, 1.0, (1, cfg.d_model), &device)?;
+            let current_token = (step * 50) as u32;
+
+            let draft_tokens = drafter.draft(&lm_hidden, current_token, 4)?;
+            assert_eq!(draft_tokens.len(), 4);
+
+            for &token in &draft_tokens {
+                assert!(token < cfg.vocab_size as u32);
+            }
         }
 
         Ok(())

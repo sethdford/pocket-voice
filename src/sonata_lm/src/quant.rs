@@ -55,10 +55,13 @@ pub fn quantize_weights(weights: &Tensor) -> Result<(Tensor, Tensor)> {
 /// Dequantize weights: multiply quantized weights by per-channel scales.
 ///
 /// weights_i8: quantized weights shape (out_features, in_features)
-/// scales: per-channel scales shape (in_features,)
+/// scales: per-channel scales shape (in_features,) — must be same dtype as weights_i8
 /// Returns: dequantized weights (out_features, in_features)
 pub fn dequantize_weights(weights_i8: &Tensor, scales: &Tensor) -> Result<Tensor> {
-    let scales_expanded = scales.unsqueeze(0)?;  // (1, in_features)
+    // P1: Keep scales in same dtype as weights_i8 to avoid F32→F16 conversion loss
+    let scales_dtype = weights_i8.dtype();
+    let scales_typed = scales.to_dtype(scales_dtype)?;
+    let scales_expanded = scales_typed.unsqueeze(0)?;  // (1, in_features)
     weights_i8.broadcast_mul(&scales_expanded)
 }
 
@@ -388,6 +391,182 @@ mod tests {
                 rel_error * 100.0
             );
         }
+
+        Ok(())
+    }
+
+    /// Test: INT8 quantized linear layer output shape matches input
+    #[test]
+    fn test_quantized_linear_output_shape() -> Result<()> {
+        let device = Device::Cpu;
+
+        let weights = Tensor::new(
+            &[
+                [0.1f32, 0.2, 0.3],
+                [0.4, 0.5, 0.6],
+                [0.7, 0.8, 0.9],
+            ],
+            &device,
+        )?;
+
+        let input = Tensor::new(&[[1.0f32, 0.5, -0.2]], &device)?;
+
+        let qlinear = QuantizedLinear::new(&weights, None)?;
+        let output = qlinear.forward(&input)?;
+
+        assert_eq!(output.dims(), vec![1, 3], "output shape should be (batch, out_features)");
+
+        Ok(())
+    }
+
+    /// Test: INT8 quantization with bias term (large scale test)
+    #[test]
+    fn test_quantized_linear_large_bias() -> Result<()> {
+        let device = Device::Cpu;
+
+        let weights = Tensor::new(
+            &[
+                [0.5f32, 0.3],
+                [0.2, 0.7],
+            ],
+            &device,
+        )?;
+
+        let bias = Tensor::new(&[0.1f32, -0.05], &device)?;
+        let input = Tensor::new(&[[1.0f32, 0.5]], &device)?;
+
+        let qlinear = QuantizedLinear::new(&weights, Some(&bias))?;
+        let output = qlinear.forward(&input)?;
+
+        assert_eq!(output.dims(), vec![1, 2], "output shape with bias correct");
+
+        Ok(())
+    }
+
+    /// Test: quantize_weights maintains per-channel scales
+    #[test]
+    fn test_quantize_per_channel_scales() -> Result<()> {
+        let device = Device::Cpu;
+
+        let weights = Tensor::new(
+            &[
+                [2.0f32, 4.0, 6.0],
+                [1.0, 3.0, 5.0],
+            ],
+            &device,
+        )?;
+
+        let (_weights_i8, scales) = quantize_weights(&weights)?;
+
+        // scales shape: (in_features,) = (3,)
+        assert_eq!(scales.dims(), vec![3], "scales should be per-input-channel");
+
+        // Each scale should be max(abs(col)) / 127
+        let scales_vec = scales.to_vec1::<f32>()?;
+        let expected = vec![2.0 / 127.0, 4.0 / 127.0, 6.0 / 127.0];
+
+        for (i, (exp, got)) in expected.iter().zip(scales_vec.iter()).enumerate() {
+            assert!((exp - got).abs() < 1e-6, "scale {} mismatch", i);
+        }
+
+        Ok(())
+    }
+
+    /// Test: Round-trip quantize/dequantize preserves reasonable accuracy
+    #[test]
+    fn test_quant_dequant_round_trip_accuracy() -> Result<()> {
+        let device = Device::Cpu;
+
+        let original = Tensor::randn(0.0f32, 1.0, (10, 5), &device)?;
+
+        let (quant, scales) = quantize_weights(&original)?;
+        let reconstructed = dequantize_weights(&quant, &scales)?;
+
+        let orig_vec = original.flatten_all()?.to_vec1::<f32>()?;
+        let recon_vec = reconstructed.flatten_all()?.to_vec1::<f32>()?;
+
+        // Quantization resolution is max_val / 127 per channel
+        // INT8 rounding + per-channel scaling can introduce ~1-5% error
+        // Use mean absolute error — individual elements can have high relative error
+        // near zero, but aggregate error should be small for INT8
+        let mae: f32 = orig_vec.iter().zip(recon_vec.iter())
+            .map(|(o, r)| (r - o).abs())
+            .sum::<f32>() / orig_vec.len() as f32;
+        let range: f32 = orig_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+            - orig_vec.iter().cloned().fold(f32::INFINITY, f32::min);
+        let normalized_mae = mae / range.max(1e-8);
+        assert!(
+            normalized_mae <= 0.01,
+            "Normalized MAE too large: {} (mae={}, range={})",
+            normalized_mae, mae, range
+        );
+
+        Ok(())
+    }
+
+    /// Test: Quantization handles negative weights correctly
+    #[test]
+    fn test_quantize_negative_weights() -> Result<()> {
+        let device = Device::Cpu;
+
+        let weights = Tensor::new(
+            &[
+                [-1.5f32, 2.5, -3.5],
+                [0.5, -2.0, 1.5],
+            ],
+            &device,
+        )?;
+
+        let (weights_i8, scales) = quantize_weights(&weights)?;
+
+        // All quantized values should be in [-127, 127]
+        let quant_vec = weights_i8.flatten_all()?.to_vec1::<f32>()?;
+        for val in quant_vec {
+            assert!(val >= -128.0 && val <= 128.0, "Quantized value out of range: {}", val);
+        }
+
+        // Scales should all be positive
+        let scales_vec = scales.to_vec1::<f32>()?;
+        for scale in scales_vec {
+            assert!(scale > 0.0, "Scale should be positive: {}", scale);
+        }
+
+        Ok(())
+    }
+
+    /// Test: Large batch matmul with quantized layer
+    #[test]
+    fn test_quantized_linear_large_batch() -> Result<()> {
+        let device = Device::Cpu;
+
+        let weights = Tensor::randn(0.0f32, 1.0, (256, 512), &device)?;
+        let input = Tensor::randn(0.0f32, 1.0, (32, 512), &device)?;  // batch=32
+
+        let qlinear = QuantizedLinear::new(&weights, None)?;
+        let output = qlinear.forward(&input)?;
+
+        assert_eq!(output.dims(), vec![32, 256], "large batch matmul shape correct");
+
+        Ok(())
+    }
+
+    /// Test: Memory footprint calculation
+    #[test]
+    fn test_quantized_linear_memory_footprint() -> Result<()> {
+        let device = Device::Cpu;
+
+        let weights = Tensor::randn(0.0f32, 1.0, (100, 50), &device)?;
+        let bias = Tensor::randn(0.0f32, 1.0, (100,), &device)?;
+
+        let qlinear = QuantizedLinear::new(&weights, Some(&bias))?;
+        let mem_bytes = qlinear.memory_bytes();
+
+        // weights: 100*50*4 = 20,000
+        // scales: 50*4 = 200
+        // bias: 100*4 = 400
+        // total: 20,600
+        let expected = 100 * 50 * 4 + 50 * 4 + 100 * 4;
+        assert_eq!(mem_bytes, expected, "memory footprint calculation");
 
         Ok(())
     }

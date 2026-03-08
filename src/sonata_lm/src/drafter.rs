@@ -122,11 +122,23 @@ impl GruDrafter {
     ///
     /// Returns vector of K draft token IDs.
     pub fn draft(&self, lm_hidden: &Tensor, current_token: u32, num_steps: usize) -> Result<Vec<u32>> {
-        // lm_hidden should be (1, 1, d_model) or (1, d_model)
-        let h0_squeezed = if lm_hidden.dims().len() == 3 {
-            lm_hidden.squeeze(1)?  // (1, 1, d_model) → (1, d_model)
-        } else {
-            lm_hidden.clone()
+        // P1: Drafter squeeze validation — validate shape before squeeze
+        let dims = lm_hidden.dims();
+        let h0_squeezed = match dims {
+            [1, 1, d] if *d == self.cfg.d_model => {
+                // (1, 1, d_model) → (1, d_model)
+                lm_hidden.squeeze(1)?
+            }
+            [1, d] if *d == self.cfg.d_model => {
+                // Already (1, d_model)
+                lm_hidden.clone()
+            }
+            dims => {
+                return Err(candle_core::Error::Msg(format!(
+                    "Expected lm_hidden shape (1, d_model) or (1, 1, d_model), got {:?}",
+                    dims
+                )));
+            }
         };
 
         // Validate h0_squeezed shape before using

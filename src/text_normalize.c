@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Lookup Tables (compile-time constants)
@@ -1211,6 +1212,11 @@ int text_apply_pronunciation_dict(const char *text, char *out, int out_cap,
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 int text_expand_nonverbalisms(const char *text, char *out, int out_cap) {
+    if (!text || !out || out_cap <= 0) {
+        if (out && out_cap > 0) out[0] = '\0';
+        return 0;
+    }
+
     static const struct {
         const char *marker;
         int         marker_len;
