@@ -170,10 +170,16 @@ def train(args):
         start_epoch = ckpt.get("epoch", 0)
         print(f"Resumed from {args.resume} at step {step}, epoch {start_epoch}")
 
-    # Mel warmup is relative to current step (so it works after resume)
-    mel_warmup_end = step + args.mel_warmup_steps
-    print(f"  Mel-only warmup until step {mel_warmup_end} "
-          f"(D lr ratio: {args.d_lr_ratio})")
+    # Mel warmup only applies at the start of training, not after resume.
+    # If resuming past the warmup period, skip it entirely.
+    if step >= args.mel_warmup_steps:
+        mel_warmup_end = 0  # Already past warmup, D stays active
+        print(f"  Resumed at step {step} — mel warmup already completed "
+              f"(D lr ratio: {args.d_lr_ratio})")
+    else:
+        mel_warmup_end = args.mel_warmup_steps
+        print(f"  Mel-only warmup until step {mel_warmup_end} "
+              f"(D lr ratio: {args.d_lr_ratio})")
 
     for epoch in range(start_epoch, args.epochs):
         model.train()

@@ -54,6 +54,13 @@ while [ $RETRY -lt $MAX_RETRIES ]; do
             GCS_CKPT_DIR="$BUCKET/checkpoints/flow_v3_large_fixed"
             mkdir -p "$JOB_CKPT_DIR"
 
+            # Sync GCS → local if local dir is empty (preemption recovery)
+            if [ -z "$(ls "$JOB_CKPT_DIR"/flow_v3_step_*.pt 2>/dev/null)" ]; then
+                echo "  No local checkpoints found, pulling from GCS..."
+                gsutil -m cp "$GCS_CKPT_DIR/flow_v3_step_*.pt" "$JOB_CKPT_DIR/" 2>/dev/null || true
+                gsutil -m cp "$GCS_CKPT_DIR/flow_v3_best.pt" "$JOB_CKPT_DIR/" 2>/dev/null || true
+            fi
+
             # Find latest checkpoint to resume from
             RESUME=$(find_latest_checkpoint "$JOB_CKPT_DIR" "flow_v3_step_*.pt")
             if [ -z "$RESUME" ]; then
@@ -88,9 +95,16 @@ while [ $RETRY -lt $MAX_RETRIES ]; do
             ;;
 
         vocoder)
-            JOB_CKPT_DIR="$CKPT_DIR/vocoder_large_fixed"
-            GCS_CKPT_DIR="$BUCKET/checkpoints/vocoder_large_fixed"
+            JOB_CKPT_DIR="$CKPT_DIR/vocoder_v3_snake_fix"
+            GCS_CKPT_DIR="$BUCKET/checkpoints/vocoder_v3_snake_fix"
             mkdir -p "$JOB_CKPT_DIR"
+
+            # Sync GCS → local if local dir is empty (preemption recovery)
+            if [ -z "$(ls "$JOB_CKPT_DIR"/vocoder_step*.pt 2>/dev/null)" ]; then
+                echo "  No local checkpoints found, pulling from GCS..."
+                gsutil -m cp "$GCS_CKPT_DIR/vocoder_step*.pt" "$JOB_CKPT_DIR/" 2>/dev/null || true
+                gsutil -m cp "$GCS_CKPT_DIR/losses.jsonl" "$JOB_CKPT_DIR/" 2>/dev/null || true
+            fi
 
             # Find latest checkpoint (prefer step-based, then epoch-based)
             RESUME=$(find_latest_checkpoint "$JOB_CKPT_DIR" "vocoder_step*.pt")
@@ -151,6 +165,13 @@ while [ $RETRY -lt $MAX_RETRIES ]; do
             JOB_CKPT_DIR="$CKPT_DIR/codec_12hz"
             GCS_CKPT_DIR="$BUCKET/checkpoints/codec_12hz"
             mkdir -p "$JOB_CKPT_DIR"
+
+            # Sync GCS → local if local dir is empty (preemption recovery)
+            if [ -z "$(ls "$JOB_CKPT_DIR"/sonata_codec_step_*.pt 2>/dev/null)" ]; then
+                echo "  No local checkpoints found, pulling from GCS..."
+                gsutil -m cp "$GCS_CKPT_DIR/sonata_codec_step_*.pt" "$JOB_CKPT_DIR/" 2>/dev/null || true
+                gsutil -m cp "$GCS_CKPT_DIR/sonata_codec_best.pt" "$JOB_CKPT_DIR/" 2>/dev/null || true
+            fi
 
             RESUME=$(find_latest_checkpoint "$JOB_CKPT_DIR" "sonata_codec_step_*.pt")
             if [ -z "$RESUME" ]; then
