@@ -88,6 +88,22 @@ int speaker_encoder_embedding_dim(const SpeakerEncoder *enc);
  */
 int speaker_encoder_sample_rate(const SpeakerEncoder *enc);
 
+/**
+ * Extract speaker embedding from 16kHz PCM audio.
+ * Alias for speaker_encoder_encode_audio with sample_rate=16000.
+ */
+int speaker_encoder_extract(SpeakerEncoder *enc, const float *audio,
+                             int n_samples, float *embedding_out);
+
+/**
+ * Extract speaker embedding from a WAV file.
+ * Supports 16/24/32-bit PCM, mono or stereo (downmixed to mono).
+ * Returns embedding dimension on success, -1 on error.
+ */
+int speaker_encoder_extract_from_wav(SpeakerEncoder *enc,
+                                      const char *wav_path,
+                                      float *embedding_out);
+
 #ifdef __cplusplus
 }
 #endif

@@ -33,6 +33,8 @@ extern int        sonata_stt_get_logits(SonataSTT *stt, const float *pcm, int n_
 extern int        sonata_stt_vocab_size(const SonataSTT *stt);
 extern int        sonata_stt_enc_dim(const SonataSTT *stt);
 extern int        sonata_stt_eou_id(const SonataSTT *stt);
+extern int        sonata_stt_enable_fp16(SonataSTT *stt);
+extern int        sonata_stt_is_fp16(const SonataSTT *stt);
 /* Streaming */
 extern int        sonata_stt_stream_start(SonataSTT *stt, float max_seconds);
 extern int        sonata_stt_stream_feed(SonataSTT *stt, const float *pcm, int n_samples);

@@ -129,7 +129,7 @@ while [ $RETRY -lt $MAX_RETRIES ]; do
                 --grad-accum 3 \
                 --amp \
                 --save-interval 5 \
-                --save-steps 5000 \
+                --save-steps 2500 \
                 --log-interval 50 \
                 --num-workers 4 \
                 $RESUME_FLAG &

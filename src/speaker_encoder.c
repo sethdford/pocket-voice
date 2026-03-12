@@ -126,3 +126,97 @@ int speaker_encoder_embedding_dim(const SpeakerEncoder *enc) {
 int speaker_encoder_sample_rate(const SpeakerEncoder *enc) {
     return enc ? enc->sample_rate : -1;
 }
+
+/* Alias: extract from raw PCM at 16kHz (historically used by diarizer and voice_onboard). */
+int speaker_encoder_extract(SpeakerEncoder *enc, const float *audio,
+                             int n_samples, float *embedding_out) {
+    return speaker_encoder_encode_audio(enc, audio, n_samples, 16000, embedding_out);
+}
+
+/* Extract embedding from a WAV file (16/24-bit PCM, mono or stereo). */
+int speaker_encoder_extract_from_wav(SpeakerEncoder *enc,
+                                      const char *wav_path,
+                                      float *embedding_out) {
+    if (!enc || !wav_path || !embedding_out) return -1;
+
+    FILE *f = fopen(wav_path, "rb");
+    if (!f) {
+        fprintf(stderr, "[speaker_encoder] Cannot open WAV: %s\n", wav_path);
+        return -1;
+    }
+
+    /* Parse minimal RIFF/WAV header */
+    uint8_t hdr[44];
+    if (fread(hdr, 1, 44, f) < 44) { fclose(f); return -1; }
+
+    /* Validate RIFF/WAVE magic */
+    if (hdr[0] != 'R' || hdr[1] != 'I' || hdr[2] != 'F' || hdr[3] != 'F' ||
+        hdr[8] != 'W' || hdr[9] != 'A' || hdr[10] != 'V' || hdr[11] != 'E') {
+        fprintf(stderr, "[speaker_encoder] Not a RIFF/WAVE file: %s\n", wav_path);
+        fclose(f); return -1;
+    }
+
+    int fmt_tag     = hdr[20] | (hdr[21] << 8);
+    int n_channels  = hdr[22] | (hdr[23] << 8);
+    int sample_rate = hdr[24] | (hdr[25] << 8) | (hdr[26] << 16) | (hdr[27] << 24);
+    int bits        = hdr[34] | (hdr[35] << 8);
+
+    if (fmt_tag != 1 || (bits != 16 && bits != 24 && bits != 32)) {
+        fprintf(stderr, "[speaker_encoder] Unsupported WAV format (tag=%d bits=%d)\n",
+                fmt_tag, bits);
+        fclose(f); return -1;
+    }
+
+    /* Scan forward to 'data' chunk */
+    uint8_t chunk[8];
+    while (fread(chunk, 1, 8, f) == 8) {
+        uint32_t chunk_size = chunk[4] | ((uint32_t)chunk[5] << 8) |
+                              ((uint32_t)chunk[6] << 16) | ((uint32_t)chunk[7] << 24);
+        if (chunk[0] == 'd' && chunk[1] == 'a' && chunk[2] == 't' && chunk[3] == 'a') {
+            int bytes_per_sample = bits / 8;
+            int n_samples_total = (int)(chunk_size / (bytes_per_sample * n_channels));
+            /* Cap at 30s to avoid huge allocations */
+            if (n_samples_total > sample_rate * 30) n_samples_total = sample_rate * 30;
+
+            float *pcm = (float *)malloc(n_samples_total * sizeof(float));
+            if (!pcm) { fclose(f); return -1; }
+
+            int read_ok = 1;
+            for (int i = 0; i < n_samples_total; i++) {
+                /* Read first channel only (downmix to mono) */
+                float s = 0.0f;
+                for (int ch = 0; ch < n_channels; ch++) {
+                    uint8_t buf[4] = {0};
+                    if (fread(buf, 1, bytes_per_sample, f) < (size_t)bytes_per_sample) {
+                        read_ok = 0; break;
+                    }
+                    if (ch == 0) {
+                        if (bits == 16) {
+                            int16_t v = buf[0] | ((int16_t)buf[1] << 8);
+                            s = v / 32768.0f;
+                        } else if (bits == 24) {
+                            int32_t v = buf[0] | (buf[1] << 8) | ((int32_t)(int8_t)buf[2] << 16);
+                            s = v / 8388608.0f;
+                        } else { /* 32-bit float */
+                            memcpy(&s, buf, 4);
+                        }
+                    }
+                }
+                if (!read_ok) { n_samples_total = i; break; }
+                pcm[i] = s;
+            }
+
+            fclose(f);
+            int ret = speaker_encoder_encode_audio(enc, pcm, n_samples_total,
+                                                   sample_rate, embedding_out);
+            free(pcm);
+            return ret;
+        }
+        /* Skip non-data chunks */
+        fseek(f, (long)chunk_size, SEEK_CUR);
+    }
+
+    fclose(f);
+    fprintf(stderr, "[speaker_encoder] No data chunk found in WAV: %s\n", wav_path);
+    return -1;
+}

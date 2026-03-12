@@ -543,10 +543,24 @@ struct TextEncoderBlock {
 impl TextEncoderBlock {
     fn load(cfg: &LmConfig, vb: VarBuilder) -> Result<Self> {
         let head_dim = cfg.head_dim();
-        let attn_q = linear_no_bias(cfg.d_model, cfg.d_model, vb.pp("attn.in_proj_weight_q"))?;
-        let attn_k = linear_no_bias(cfg.d_model, cfg.d_model, vb.pp("attn.in_proj_weight_k"))?;
-        let attn_v = linear_no_bias(cfg.d_model, cfg.d_model, vb.pp("attn.in_proj_weight_v"))?;
-        let attn_o = linear_no_bias(cfg.d_model, cfg.d_model, vb.pp("attn.out_proj"))?;
+        let d = cfg.d_model;
+        let attn_vb = vb.pp("attn");
+
+        // Weights are stored as combined in_proj_weight [3*d, d] (PyTorch MHA format).
+        // Split into Q, K, V each [d, d].
+        let in_proj_w = attn_vb.get((3 * d, d), "in_proj_weight")?;
+        let wq_w = in_proj_w.narrow(0, 0, d)?;
+        let wk_w = in_proj_w.narrow(0, d, d)?;
+        let wv_w = in_proj_w.narrow(0, 2 * d, d)?;
+
+        // out_proj has a bias in the weights — load it.
+        let out_w = attn_vb.get((d, d), "out_proj.weight")?;
+        let out_b = attn_vb.get(d, "out_proj.bias").ok();
+
+        let attn_q = candle_nn::Linear::new(wq_w, None);
+        let attn_k = candle_nn::Linear::new(wk_w, None);
+        let attn_v = candle_nn::Linear::new(wv_w, None);
+        let attn_o = candle_nn::Linear::new(out_w, out_b);
 
         Ok(Self {
             attn_norm: rms_norm(cfg.d_model, cfg.norm_eps, vb.pp("attn_norm"))?,

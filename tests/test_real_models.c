@@ -126,8 +126,8 @@ static void test_speaker_encoder(void) {
     printf("\n═══ Speaker Encoder (Real Model) ═══\n");
 
     const char *model_path = "models/ecapa_tdnn.onnx";
-    if (!file_exists(model_path)) {
-        SKIP("ECAPA-TDNN model not found — download to models/ecapa_tdnn.onnx");
+    if (!file_exists(model_path) || !file_exists("models/speaker_encoder_config.json")) {
+        SKIP("ECAPA-TDNN safetensors model/config not found — skipping speaker encoder tests");
         return;
     }
 
@@ -418,8 +418,8 @@ static void test_speaker_encoder_embedding_norms(void) {
     printf("\n═══ Embedding Norm Validation ═══\n");
 
     const char *model_path = "models/ecapa_tdnn.onnx";
-    if (!file_exists(model_path)) {
-        SKIP("ECAPA-TDNN model not found for norm validation");
+    if (!file_exists(model_path) || !file_exists("models/speaker_encoder_config.json")) {
+        SKIP("ECAPA-TDNN model/config not found for norm validation");
         return;
     }
 

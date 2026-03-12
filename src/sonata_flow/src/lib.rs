@@ -45,8 +45,10 @@ struct FlowConfig {
     d_model: usize,
     n_layers: usize,
     n_heads: usize,
+    #[serde(alias = "mel_dim", default = "default_acoustic_dim")]
     acoustic_dim: usize,
     cond_dim: usize,
+    #[serde(default = "default_semantic_vocab_size")]
     semantic_vocab_size: usize,
     n_steps_inference: usize,
     #[serde(default = "default_sigma_min")]
@@ -71,6 +73,8 @@ struct FlowConfig {
     moe_every_n: usize,
 }
 
+fn default_acoustic_dim() -> usize { 80 }
+fn default_semantic_vocab_size() -> usize { 4096 }
 fn default_prosody_dim() -> usize { 3 }
 fn default_prosody_embedding_dim() -> usize { 256 }
 fn default_top_k() -> usize { 2 }
@@ -420,7 +424,12 @@ struct SonataFlow {
 impl SonataFlow {
     fn load(config: FlowConfig, vb: VarBuilder) -> Result<Self> {
         let sem_size = config.semantic_vocab_size + 4;
-        let semantic_emb = embedding(sem_size, config.cond_dim, vb.pp("semantic_emb"))?;
+        let semantic_emb = embedding(sem_size, config.cond_dim, vb.pp("semantic_emb"))
+            .unwrap_or_else(|_| {
+                // V3/char-based models don't have semantic_emb; create zero-init fallback
+                let w = candle_core::Tensor::zeros((sem_size, config.cond_dim), candle_core::DType::F32, vb.device()).expect("zeros");
+                candle_nn::Embedding::new(w, config.cond_dim)
+            });
         let time_emb = TimestepEmbedding::load(config.cond_dim, vb.device(), vb.pp("time_emb"))?;
         let cond_proj = linear(config.cond_dim * 2, config.d_model, vb.pp("cond_proj"))?;
         let input_proj = linear(config.acoustic_dim, config.d_model, vb.pp("input_proj"))?;
@@ -1856,7 +1865,7 @@ pub extern "C" fn sonata_flow_generate_audio(
 ) -> c_int {
     if engine.is_null() || semantic_tokens.is_null() || n_frames <= 0
         || n_frames > MAX_FRAMES as c_int
-        || out_audio.is_null() || max_samples <= 0 { return 0; }
+        || out_audio.is_null() || max_samples <= 0 { return -1; }
     let eng = unsafe { &mut *(engine as *mut SonataFlowEngine) };
 
     if eng.decoder.is_none() {

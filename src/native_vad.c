@@ -463,7 +463,8 @@ float native_vad_process(NativeVad *vad, const float *samples) {
 
 int native_vad_process_audio(NativeVad *vad, const float *audio, int n_samples,
                               float *probs_out, int max_probs) {
-    if (!vad || !audio || !probs_out || max_probs <= 0) return -1;
+    if (!vad || !audio || !probs_out || max_probs < 0) return -1;
+    if (max_probs == 0) return 0;
 
     int n_chunks = n_samples / NVAD_CHUNK;
     if (n_chunks <= 0) return 0;
