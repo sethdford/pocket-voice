@@ -66,7 +66,7 @@ endif
 BUILD := build
 
 # Rust release output directories
-STT_DYLIB   := src/stt/target/release/libpocket_stt.dylib
+STT_DYLIB   := target/release/libpocket_stt.dylib
 
 .PHONY: all clean libs sonata pocket-voice
 
@@ -397,19 +397,19 @@ libs: $(BUILD)/libpocket_voice.dylib $(BUILD)/libvdsp_prosody.dylib \
 # ─── Rust cdylibs ─────────────────────────────────────────────────────────
 
 $(STT_DYLIB): src/stt/src/lib.rs src/stt/Cargo.toml src/stt/build.rs
-	cd src/stt && RUSTFLAGS="-C target-cpu=native" cargo build --release
+	cargo build --release -p pocket-stt
 
-LLM_DYLIB := src/llm/target/release/libpocket_llm.dylib
+LLM_DYLIB := target/release/libpocket_llm.dylib
 $(LLM_DYLIB): src/llm/src/lib.rs src/llm/Cargo.toml src/llm/build.rs
-	cd src/llm && RUSTFLAGS="-C target-cpu=native" cargo build --release
+	cargo build --release -p pocket-llm
 
-SONATA_LM_DYLIB := src/sonata_lm/target/release/libsonata_lm.dylib
+SONATA_LM_DYLIB := target/release/libsonata_lm.dylib
 $(SONATA_LM_DYLIB): src/sonata_lm/src/lib.rs src/sonata_lm/Cargo.toml src/sonata_lm/build.rs
-	cd src/sonata_lm && RUSTFLAGS="-C target-cpu=native" cargo build --release
+	cargo build --release -p sonata-lm
 
-SONATA_FLOW_DYLIB := src/sonata_flow/target/release/libsonata_flow.dylib
+SONATA_FLOW_DYLIB := target/release/libsonata_flow.dylib
 $(SONATA_FLOW_DYLIB): src/sonata_flow/src/lib.rs src/sonata_flow/Cargo.toml src/sonata_flow/build.rs
-	cd src/sonata_flow && RUSTFLAGS="-C target-cpu=native" cargo build --release
+	cargo build --release -p sonata-flow
 
 SONATA_STORM_DYLIB := target/release/libsonata_storm.dylib
 $(SONATA_STORM_DYLIB): src/sonata_storm/src/lib.rs src/sonata_storm/Cargo.toml src/sonata_storm/build.rs
@@ -442,13 +442,9 @@ sonata: src/pocket_voice_pipeline.c libs $(STT_DYLIB) $(LLM_DYLIB) $(SONATA_LM_D
 	  -lprosody_log -lemphasis_predict -lvoice_onboard -lsonata_istft -lsonata_stt -lsonata_refiner -lweb_remote -lwebsocket -lhttp_api -lapple_perf \
 	  -lbackchannel -laudio_emotion -lconversation_memory -lspeaker_diarizer -lvap_model \
 	  -lneural_backchannel -lintent_router -lresponse_cache -lstreaming_tts -laudio_mixer -lspeculative_gen -lstreaming_llm \
-	  $(OPUS_LDFLAGS) -Lsrc/llm/target/release -lpocket_llm \
+	  $(OPUS_LDFLAGS) -Ltarget/release -lpocket_llm \
 	  $(STT_DYLIB) $(LLM_DYLIB) $(SONATA_LM_DYLIB) $(SONATA_FLOW_DYLIB) $(SONATA_STORM_DYLIB) \
 	  -Wl,-rpath,@executable_path/$(BUILD) \
-	  -Wl,-rpath,@executable_path/src/stt/target/release \
-	  -Wl,-rpath,@executable_path/src/llm/target/release \
-	  -Wl,-rpath,@executable_path/src/sonata_lm/target/release \
-	  -Wl,-rpath,@executable_path/src/sonata_flow/target/release \
 	  -Wl,-rpath,@executable_path/target/release \
 	  -Wl,-rpath,$(HOMEBREW_PREFIX)/lib \
 	  $(ORT_RPATH) \
@@ -709,10 +705,9 @@ test-sonata-stt: tests/test_sonata_stt.c $(BUILD)/libsonata_stt.dylib $(BUILD)/l
 test-sonata: tests/test_sonata.c $(BUILD)/libsonata_istft.dylib $(BUILD)/libspm_tokenizer.dylib $(BUILD)/libbnns_convnext_decoder.dylib $(SONATA_LM_DYLIB) $(SONATA_FLOW_DYLIB) | $(BUILD)
 	$(CC) $(CFLAGS) -DACCELERATE_NEW_LAPACK -Isrc -framework Accelerate \
 	  -L$(BUILD) -lsonata_istft -lspm_tokenizer -lbnns_convnext_decoder \
-	  -Lsrc/sonata_lm/target/release -Lsrc/sonata_flow/target/release \
+	  -Ltarget/release \
 	  -Wl,-rpath,$(CURDIR)/$(BUILD) \
-	  -Wl,-rpath,$(CURDIR)/src/sonata_lm/target/release \
-	  -Wl,-rpath,$(CURDIR)/src/sonata_flow/target/release \
+	  -Wl,-rpath,$(CURDIR)/target/release \
 	  -lsonata_lm -lsonata_flow -lm \
 	  -o $(BUILD)/test-sonata tests/test_sonata.c
 	./$(BUILD)/test-sonata
@@ -724,10 +719,9 @@ test-sonata-quality: tests/test_sonata_quality.c \
                      $(SONATA_LM_DYLIB) $(SONATA_FLOW_DYLIB) | $(BUILD)
 	$(CC) $(CFLAGS) -DACCELERATE_NEW_LAPACK -Isrc -framework Accelerate \
 	  -L$(BUILD) -lspm_tokenizer -lconformer_stt -lctc_beam_decoder -lmel_spectrogram -ltdt_decoder \
-	  -Lsrc/sonata_lm/target/release -Lsrc/sonata_flow/target/release \
+	  -Ltarget/release \
 	  -Wl,-rpath,$(CURDIR)/$(BUILD) \
-	  -Wl,-rpath,$(CURDIR)/src/sonata_lm/target/release \
-	  -Wl,-rpath,$(CURDIR)/src/sonata_flow/target/release \
+	  -Wl,-rpath,$(CURDIR)/target/release \
 	  -lsonata_lm -lsonata_flow -lm \
 	  src/quality/wer.c src/quality/audio_quality.c \
 	  -o $(BUILD)/test-sonata-quality tests/test_sonata_quality.c
@@ -741,9 +735,9 @@ eval-generate: tests/eval_sonata_baseline.c \
 	@mkdir -p eval/generated eval/reports
 	$(CC) $(CFLAGS) -DACCELERATE_NEW_LAPACK -Isrc -framework Accelerate \
 	  -L$(BUILD) -lconformer_stt -lctc_beam_decoder -lmel_spectrogram -ltdt_decoder \
-	  -Lsrc/sonata_flow/target/release \
+	  -Ltarget/release \
 	  -Wl,-rpath,$(CURDIR)/$(BUILD) \
-	  -Wl,-rpath,$(CURDIR)/src/sonata_flow/target/release \
+	  -Wl,-rpath,$(CURDIR)/target/release \
 	  -lsonata_flow -lm \
 	  src/quality/wer.c src/quality/audio_quality.c \
 	  -o $(BUILD)/eval-sonata-baseline tests/eval_sonata_baseline.c
@@ -837,10 +831,9 @@ test-http-api: tests/test_http_api.c $(BUILD)/libhttp_api.dylib $(BUILD)/libwebs
 bench-sonata: tests/bench_sonata.c $(BUILD)/libsonata_istft.dylib $(BUILD)/libspm_tokenizer.dylib $(SONATA_LM_DYLIB) $(SONATA_FLOW_DYLIB) | $(BUILD)
 	$(CC) $(CFLAGS) -DACCELERATE_NEW_LAPACK -Isrc -framework Accelerate \
 	  -L$(BUILD) -lsonata_istft -lspm_tokenizer \
-	  -Lsrc/sonata_lm/target/release -Lsrc/sonata_flow/target/release \
+	  -Ltarget/release \
 	  -Wl,-rpath,$(CURDIR)/$(BUILD) \
-	  -Wl,-rpath,$(CURDIR)/src/sonata_lm/target/release \
-	  -Wl,-rpath,$(CURDIR)/src/sonata_flow/target/release \
+	  -Wl,-rpath,$(CURDIR)/target/release \
 	  -lsonata_lm -lsonata_flow -lm \
 	  -o $(BUILD)/bench-sonata tests/bench_sonata.c
 	./$(BUILD)/bench-sonata
@@ -848,10 +841,9 @@ bench-sonata: tests/bench_sonata.c $(BUILD)/libsonata_istft.dylib $(BUILD)/libsp
 bench-e2e-latency: tools/bench_e2e_latency.c $(BUILD)/libsonata_istft.dylib $(BUILD)/libspm_tokenizer.dylib $(BUILD)/libconformer_stt.dylib $(SONATA_LM_DYLIB) $(SONATA_FLOW_DYLIB) | $(BUILD)
 	$(CC) $(CFLAGS) -DACCELERATE_NEW_LAPACK -Isrc -framework Accelerate \
 	  -L$(BUILD) -lsonata_istft -lspm_tokenizer -lconformer_stt \
-	  -Lsrc/sonata_lm/target/release -Lsrc/sonata_flow/target/release \
+	  -Ltarget/release \
 	  -Wl,-rpath,$(CURDIR)/$(BUILD) \
-	  -Wl,-rpath,$(CURDIR)/src/sonata_lm/target/release \
-	  -Wl,-rpath,$(CURDIR)/src/sonata_flow/target/release \
+	  -Wl,-rpath,$(CURDIR)/target/release \
 	  -lsonata_lm -lsonata_flow -lm \
 	  -o $(BUILD)/bench-e2e-latency tools/bench_e2e_latency.c
 	@echo "E2E latency benchmark built: ./$(BUILD)/bench-e2e-latency"
@@ -860,8 +852,8 @@ bench-e2e-latency: tools/bench_e2e_latency.c $(BUILD)/libsonata_istft.dylib $(BU
 bench-speculative: tools/bench_speculative.c $(SONATA_LM_DYLIB) | $(BUILD)
 	mkdir -p bench_output
 	$(CC) $(CFLAGS) -Isrc \
-	  -Lsrc/sonata_lm/target/release \
-	  -Wl,-rpath,$(CURDIR)/src/sonata_lm/target/release \
+	  -Ltarget/release \
+	  -Wl,-rpath,$(CURDIR)/target/release \
 	  -lsonata_lm -lm \
 	  -o $(BUILD)/bench-speculative tools/bench_speculative.c
 	@echo "Speculative decoding benchmark built: ./$(BUILD)/bench-speculative"
@@ -887,16 +879,16 @@ test-audio-emotion: tests/test_audio_emotion.c $(BUILD)/libaudio_emotion.dylib |
 
 test-sonata-flow-ffi: tests/test_sonata_flow_ffi.c $(SONATA_FLOW_DYLIB) | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc \
-	  -Lsrc/sonata_flow/target/release \
-	  -Wl,-rpath,$(CURDIR)/src/sonata_flow/target/release \
+	  -Ltarget/release \
+	  -Wl,-rpath,$(CURDIR)/target/release \
 	  -lsonata_flow -lm \
 	  -o $(BUILD)/test-sonata-flow-ffi tests/test_sonata_flow_ffi.c
 	./$(BUILD)/test-sonata-flow-ffi
 
 test-flow-quality-modes: tests/test_flow_quality_modes.c $(SONATA_FLOW_DYLIB) | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc \
-	  -Lsrc/sonata_flow/target/release \
-	  -Wl,-rpath,$(CURDIR)/src/sonata_flow/target/release \
+	  -Ltarget/release \
+	  -Wl,-rpath,$(CURDIR)/target/release \
 	  -lsonata_flow -lm \
 	  -o $(BUILD)/test-flow-quality-modes tests/test_flow_quality_modes.c
 	./$(BUILD)/test-flow-quality-modes
@@ -906,24 +898,24 @@ test-sonata-flow-distilled: $(SONATA_FLOW_DYLIB)
 
 test-sonata-v3: tests/test_sonata_v3.c $(SONATA_FLOW_DYLIB) | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc \
-	  -Lsrc/sonata_flow/target/release \
-	  -Wl,-rpath,$(CURDIR)/src/sonata_flow/target/release \
+	  -Ltarget/release \
+	  -Wl,-rpath,$(CURDIR)/target/release \
 	  -lsonata_flow -lm \
 	  -o $(BUILD)/test-sonata-v3 tests/test_sonata_v3.c
 	./$(BUILD)/test-sonata-v3
 
 test-sonata-lm-ffi: tests/test_sonata_lm_ffi.c $(SONATA_LM_DYLIB) | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc \
-	  -Lsrc/sonata_lm/target/release \
-	  -Wl,-rpath,$(CURDIR)/src/sonata_lm/target/release \
+	  -Ltarget/release \
+	  -Wl,-rpath,$(CURDIR)/target/release \
 	  -lsonata_lm -lm \
 	  -o $(BUILD)/test-sonata-lm-ffi tests/test_sonata_lm_ffi.c
 	./$(BUILD)/test-sonata-lm-ffi
 
 test-sonata-lm-dual-head: tests/test_sonata_lm_dual_head.c $(SONATA_LM_DYLIB) | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc \
-	  -Lsrc/sonata_lm/target/release \
-	  -Wl,-rpath,$(CURDIR)/src/sonata_lm/target/release \
+	  -Ltarget/release \
+	  -Wl,-rpath,$(CURDIR)/target/release \
 	  -lsonata_lm -lm \
 	  -o $(BUILD)/test-sonata-lm-dual-head tests/test_sonata_lm_dual_head.c
 	./$(BUILD)/test-sonata-lm-dual-head
@@ -937,8 +929,8 @@ test-speaker-encoder-unit: tests/test_speaker_encoder_unit.c $(BUILD)/libspeaker
 
 test-sonata-lm-prosody-edge: tests/test_sonata_lm_prosody_edge.c $(SONATA_LM_DYLIB) | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc \
-	  -Lsrc/sonata_lm/target/release \
-	  -Wl,-rpath,$(CURDIR)/src/sonata_lm/target/release \
+	  -Ltarget/release \
+	  -Wl,-rpath,$(CURDIR)/target/release \
 	  -lsonata_lm -lm \
 	  -o $(BUILD)/test-sonata-lm-prosody-edge tests/test_sonata_lm_prosody_edge.c
 	./$(BUILD)/test-sonata-lm-prosody-edge
@@ -956,6 +948,11 @@ test-phonemizer-v3: tests/test_phonemizer_v3.c $(BUILD)/libphonemizer.dylib | $(
 	  -Wl,-rpath,$(CURDIR)/$(BUILD) -Wl,-rpath,$(HOMEBREW_PREFIX)/lib \
 	  -o $(BUILD)/test-phonemizer-v3 tests/test_phonemizer_v3.c
 	./$(BUILD)/test-phonemizer-v3
+
+test-phoneme-word-mapping: tests/test_phoneme_word_mapping.c | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc \
+	  -lm -o $(BUILD)/test-phoneme-word-mapping tests/test_phoneme_word_mapping.c
+	./$(BUILD)/test-phoneme-word-mapping
 
 test-phase2-regressions: tests/test_phase2_regressions.c \
                           $(BUILD)/libbreath_synthesis.dylib \
@@ -1202,8 +1199,10 @@ test-voice-cloning-e2e: tests/test_voice_cloning_e2e.c $(BUILD)/libmel_spectrogr
 	  -o $(BUILD)/test-voice-cloning-e2e tests/test_voice_cloning_e2e.c -lm
 	./$(BUILD)/test-voice-cloning-e2e
 
-test-flow-streaming: tests/test_flow_streaming.c | $(BUILD)
+test-flow-streaming: tests/test_flow_streaming.c $(SONATA_FLOW_DYLIB) | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc \
+	  -Ltarget/release -lsonata_flow \
+	  -Wl,-rpath,$(CURDIR)/target/release \
 	  -o $(BUILD)/test-flow-streaming tests/test_flow_streaming.c -lm
 	./$(BUILD)/test-flow-streaming
 

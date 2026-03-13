@@ -1064,12 +1064,6 @@ static int sonatav3_get_words(void *e, WordTimestamp *out, int max_words) {
     SonataV3Engine *ev = (SonataV3Engine *)e;
     if (!ev || !out || max_words <= 0 || !ev->flow_v3 || !ev->synthesized) return 0;
 
-    /* Phoneme durations don't map 1:1 to text characters; char-based logic is wrong. */
-    if (ev->phonemizer) {
-        /* TODO: implement phoneme→word mapping for accurate timestamps with phonemizer */
-        return 0;
-    }
-
     float durs[SONATA_V3_MAX_DUR];
     int n_dur = sonata_flow_v3_get_durations(ev->flow_v3, durs, SONATA_V3_MAX_DUR);
     if (n_dur <= 0) return 0;
@@ -1078,9 +1072,88 @@ static int sonatav3_get_words(void *e, WordTimestamp *out, int max_words) {
     int text_len = (int)strlen(text);
     if (text_len <= 0) return 0;
 
-    /* Char-aligned: durations match char count. Split text by spaces. */
-    int n_words = 0;
-    int dur_pos = 0;  /* current position in duration array (in frames) */
+    /* Phoneme-aligned path: map per-phoneme durations to word boundaries */
+    if (ev->phonemizer && phonemizer_vocab_size(ev->phonemizer) > 0) {
+        int pids[512];
+        int n_phonemes = phonemizer_text_to_ids(ev->phonemizer, text, pids, 512);
+        if (n_phonemes <= 0 || n_phonemes > n_dur) {
+            /* Fallback to char-aligned if phonemization fails */
+            goto char_aligned_fallback;
+        }
+
+        /* Build word→phoneme mapping: split text by whitespace, count phonemes per word */
+        struct {
+            const char *word_text;
+            int word_len;
+            int phoneme_count;
+        } words[256];
+        int n_words = 0;
+
+        const char *p = text;
+        while (*p && n_words < 256) {
+            /* Skip whitespace */
+            while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+            if (!*p) break;
+
+            const char *word_start = p;
+            int word_len = 0;
+            while (*p && *p != ' ' && *p != '\t' && *p != '\n') { p++; word_len++; }
+
+            /* Count phonemes for this word by running phonemizer on just this word */
+            char word_buf[512];
+            if (word_len >= (int)sizeof(word_buf)) word_len = (int)sizeof(word_buf) - 1;
+            memcpy(word_buf, word_start, (size_t)word_len);
+            word_buf[word_len] = '\0';
+
+            int word_pids[256];
+            int word_phoneme_count = phonemizer_text_to_ids(ev->phonemizer, word_buf, word_pids, 256);
+            if (word_phoneme_count < 0) word_phoneme_count = 1;  /* fallback: count as 1 phoneme */
+
+            words[n_words].word_text = word_start;
+            words[n_words].word_len = word_len;
+            words[n_words].phoneme_count = word_phoneme_count;
+            n_words++;
+        }
+
+        if (n_words <= 0) return 0;
+
+        /* Map phoneme durations to words using word→phoneme counts */
+        int n_out = 0;
+        int dur_pos = 1;  /* Skip BOS token (id 0) */
+        for (int w = 0; w < n_words && n_out < max_words && n_out < TTS_MAX_WORD_TIMESTAMPS; w++) {
+            float word_start_s = (float)dur_pos * SONATA_V3_FRAME_DUR_S;
+            float word_dur_s = 0.0f;
+
+            int phoneme_count = words[w].phoneme_count;
+            for (int p = 0; p < phoneme_count && dur_pos < n_dur; p++) {
+                word_dur_s += durs[dur_pos] * SONATA_V3_FRAME_DUR_S;
+                dur_pos++;
+            }
+
+            int word_copy = words[w].word_len;
+            if (word_copy >= (int)sizeof(out[n_out].word)) {
+                word_copy = (int)sizeof(out[n_out].word) - 1;
+            }
+            if (word_copy > 0) {
+                memcpy(out[n_out].word, words[w].word_text, (size_t)word_copy);
+                out[n_out].word[word_copy] = '\0';
+            } else {
+                out[n_out].word[0] = '\0';
+            }
+
+            out[n_out].start_s = word_start_s;
+            out[n_out].end_s = word_start_s + word_dur_s;
+            n_out++;
+        }
+
+        return n_out;
+    }
+
+char_aligned_fallback:
+    {
+        /* Char-aligned fallback: durations match character count. Split text by spaces. */
+        int n_words = 0;
+        int dur_pos = 0;  /* current position in duration array (in frames) */
 
     const char *p = text;
     while (*p && n_words < max_words && n_words < TTS_MAX_WORD_TIMESTAMPS) {
@@ -1111,8 +1184,9 @@ static int sonatav3_get_words(void *e, WordTimestamp *out, int max_words) {
         out[n_words].start_s = word_start_s;
         out[n_words].end_s = word_start_s + word_dur_s;
         n_words++;
+        }
+        return n_words;
     }
-    return n_words;
 }
 
 static void sonatav3_destroy(void *e) {
