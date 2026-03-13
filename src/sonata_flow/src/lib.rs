@@ -1524,10 +1524,10 @@ pub extern "C" fn sonata_flow_generate_streaming_chunk(
 ) -> c_int {
     if engine.is_null() || semantic_tokens.is_null() || n_frames <= 0
         || n_frames > MAX_FRAMES as c_int || chunk_offset < 0
-        || out_magnitude.is_null() || out_phase.is_null() { return 0; }
+        || out_magnitude.is_null() || out_phase.is_null() { return -1; }
     // Guard against integer overflow: offset + n_frames must fit in usize
     let total_len_check = (chunk_offset as i64) + (n_frames as i64);
-    if total_len_check > MAX_FRAMES as i64 { return 0; }
+    if total_len_check > MAX_FRAMES as i64 { return -1; }
     let eng = unsafe { &mut *(engine as *mut SonataFlowEngine) };
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1694,7 +1694,7 @@ pub extern "C" fn sonata_flow_generate(
 ) -> c_int {
     if engine.is_null() || semantic_tokens.is_null() || n_frames <= 0
         || n_frames > MAX_FRAMES as c_int
-        || out_magnitude.is_null() || out_phase.is_null() { return 0; }
+        || out_magnitude.is_null() || out_phase.is_null() { return -1; }
     let eng = unsafe { &mut *(engine as *mut SonataFlowEngine) };
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<usize> {

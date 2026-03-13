@@ -1226,7 +1226,21 @@ test-speaker-encoder: tests/test_speaker_encoder.c $(BUILD)/libspeaker_encoder.d
 	  -o $(BUILD)/test-speaker-encoder tests/test_speaker_encoder.c
 	./$(BUILD)/test-speaker-encoder
 
-.PHONY: test test-eou test-semantic-eou test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-roundtrip test-llm-prosody test-websocket test-optimizations test-sonata test-sonata-quality test-sonata-stt test-sonata-v3 test-beam-search bench-sonata bench-e2e-latency bench-speculative bench-quality bench-live bench-industry test-apple-perf test-quality-improvements test-real-models test-native-vad bench-vad test-speech-detector test-fused-eou-parallel test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-sonata-storm test-audio-emotion test-audio-mixer test-sonata-flow-ffi test-flow-quality-modes test-sonata-flow-distilled test-sonata-lm-ffi test-sonata-lm-dual-head test-speaker-encoder-unit test-sonata-lm-prosody-edge test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-neural-backchannel test-intent-router test-response-cache test-speculative-gen test-streaming-tts test-streaming-llm test-full-duplex test-sonata-refiner test-tdt-decoder test-web-remote test-opus-codec test-audio-converter test-spatial-audio test-metal-loader test-metal-dispatch test-bnns-convnext test-coverage-gaps test-correctness-audit test-integration-audit test-security-audit test-assumptions bench-audit bench test-research-stt test-research-eou test-research-istft test-research-metal test-audio-watermark test-deep-filter test-codec-12hz test-gru-drafter test-speaker-encoder test-voice-cloning-e2e test-flow-streaming test-flow-distilled-loading test-speaker-encoder-integration eval eval-python eval-full eval-generate
+test-speaker-encoder-ffi-safety: tests/test_speaker_encoder_ffi_safety.c $(SONATA_SPEAKER_DYLIB) | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc \
+	  -Ltarget/release -lsonata_speaker \
+	  -Wl,-rpath,$(CURDIR)/target/release \
+	  -o $(BUILD)/test-speaker-encoder-ffi-safety tests/test_speaker_encoder_ffi_safety.c -lm
+	./$(BUILD)/test-speaker-encoder-ffi-safety
+
+test-sonata-flow-ffi-safety: tests/test_sonata_flow_ffi_safety.c $(SONATA_FLOW_DYLIB) | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc \
+	  -Ltarget/release -lsonata_flow \
+	  -Wl,-rpath,$(CURDIR)/target/release \
+	  -o $(BUILD)/test-sonata-flow-ffi-safety tests/test_sonata_flow_ffi_safety.c -lm
+	./$(BUILD)/test-sonata-flow-ffi-safety
+
+.PHONY: test test-eou test-semantic-eou test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-roundtrip test-llm-prosody test-websocket test-optimizations test-sonata test-sonata-quality test-sonata-stt test-sonata-v3 test-beam-search bench-sonata bench-e2e-latency bench-speculative bench-quality bench-live bench-industry test-apple-perf test-quality-improvements test-real-models test-native-vad bench-vad test-speech-detector test-fused-eou-parallel test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-sonata-storm test-audio-emotion test-audio-mixer test-sonata-flow-ffi test-flow-quality-modes test-sonata-flow-distilled test-sonata-lm-ffi test-sonata-lm-dual-head test-speaker-encoder-unit test-sonata-lm-prosody-edge test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-neural-backchannel test-intent-router test-response-cache test-speculative-gen test-streaming-tts test-streaming-llm test-full-duplex test-sonata-refiner test-tdt-decoder test-web-remote test-opus-codec test-audio-converter test-spatial-audio test-metal-loader test-metal-dispatch test-bnns-convnext test-coverage-gaps test-correctness-audit test-integration-audit test-security-audit test-assumptions bench-audit bench test-research-stt test-research-eou test-research-istft test-research-metal test-audio-watermark test-deep-filter test-codec-12hz test-gru-drafter test-speaker-encoder test-speaker-encoder-ffi-safety test-sonata-flow-ffi-safety test-voice-cloning-e2e test-flow-streaming test-flow-distilled-loading test-speaker-encoder-integration eval eval-python eval-full eval-generate
 
 bench: libs sonata
 	@bash scripts/benchmark.sh --all

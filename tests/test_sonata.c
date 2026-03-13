@@ -353,7 +353,7 @@ static void test_flow_api(void) {
     CHECK(1, "reset_phase handles NULL gracefully");
 
     rc = sonata_flow_generate(NULL, NULL, 0, NULL, NULL);
-    CHECK(rc == 0, "generate rejects NULL engine");
+    CHECK(rc == -1, "generate rejects NULL engine");
 
     rc = sonata_flow_set_solver(NULL, 1);
     CHECK(rc == -1, "set_solver rejects NULL engine");

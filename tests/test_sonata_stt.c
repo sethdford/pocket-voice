@@ -18,6 +18,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <unistd.h>
+
+/* ─── Temp File Helper ────────────────────────────────────────────────── */
+
+static void get_tmp_path(char *buf, size_t buf_size, const char *filename) {
+    const char *tmpdir = getenv("TMPDIR");
+    if (!tmpdir) tmpdir = "/tmp";
+    snprintf(buf, buf_size, "%s/%s", tmpdir, filename);
+}
 
 /* ─── Sonata STT FFI ──────────────────────────────────────────────────── */
 
@@ -275,7 +284,8 @@ static void test_weight_format(void) {
     printf("\n─── Test 5: Weight File Format ───\n");
 
     /* Write a minimal valid weight file */
-    const char *tmp = "/tmp/test_sonata_stt_weights.cstt_sonata";
+    char tmp[256];
+    get_tmp_path(tmp, sizeof(tmp), "test_sonata_stt_weights.cstt_sonata");
     FILE *f = fopen(tmp, "wb");
     CHECK(f != NULL, "create temp weight file");
 
@@ -418,7 +428,8 @@ static void test_ctc_edge_cases(void) {
 static void test_e2e_synthetic(void) {
     printf("\n─── Test 7: End-to-End Synthetic Weights ───\n");
 
-    const char *tmp = "/tmp/test_sonata_stt_e2e.cstt_sonata";
+    char tmp[256];
+    get_tmp_path(tmp, sizeof(tmp), "test_sonata_stt_e2e.cstt_sonata");
     FILE *f = fopen(tmp, "wb");
     if (!f) { g_fail++; printf("  [FAIL] cannot create temp file\n"); return; }
 
@@ -528,7 +539,8 @@ static void test_streaming_api(void) {
     CHECK(1, "stream_end(NULL) no crash");
 
     /* Streaming with synthetic weights */
-    const char *tmp = "/tmp/test_sonata_stt_stream.cstt_sonata";
+    char tmp[256];
+    get_tmp_path(tmp, sizeof(tmp), "test_sonata_stt_stream.cstt_sonata");
     FILE *f = fopen(tmp, "wb");
     if (!f) { g_fail++; printf("  [FAIL] cannot create temp file\n"); return; }
 
@@ -602,7 +614,8 @@ static void test_get_words(void) {
     CHECK(sonata_stt_get_words(NULL, words, 32) == -1, "get_words(NULL, ...) returns -1");
 
     /* get_words after silence returns 0 words (zero-weight model produces all blanks) */
-    const char *tmp = "/tmp/test_sonata_stt_getwords.cstt_sonata";
+    char tmp[256];
+    get_tmp_path(tmp, sizeof(tmp), "test_sonata_stt_getwords.cstt_sonata");
     FILE *f = fopen(tmp, "wb");
     if (!f) { g_fail++; printf("  [FAIL] cannot create temp file\n"); return; }
 
@@ -640,7 +653,7 @@ static void test_get_words(void) {
     remove(tmp);
 
     /* get_words returns valid struct fields (with synthetic weights that may emit tokens) */
-    tmp = "/tmp/test_sonata_stt_getwords2.cstt_sonata";
+    get_tmp_path(tmp, sizeof(tmp), "test_sonata_stt_getwords2.cstt_sonata");
     f = fopen(tmp, "wb");
     if (!f) { g_fail++; printf("  [FAIL] cannot create temp file 2\n"); return; }
 
@@ -864,7 +877,8 @@ static void test_streaming_edge_cases(void) {
 static void test_weight_bad_version(void) {
     printf("\n─── Test 18: Weight File Bad Version ───\n");
 
-    const char *tmp = "/tmp/test_sonata_stt_badver.cstt_sonata";
+    char tmp[256];
+    get_tmp_path(tmp, sizeof(tmp), "test_sonata_stt_badver.cstt_sonata");
     FILE *f = fopen(tmp, "wb");
     if (!f) { g_fail++; printf("  [FAIL] cannot create temp file\n"); return; }
 
@@ -902,7 +916,8 @@ static void test_special_paths(void) {
     if (stt) sonata_stt_destroy(stt);
 
     /* Truncated file (just 4 bytes) */
-    const char *tmp = "/tmp/test_sonata_truncated.cstt_sonata";
+    char tmp[256];
+    get_tmp_path(tmp, sizeof(tmp), "test_sonata_truncated.cstt_sonata");
     FILE *f = fopen(tmp, "wb");
     if (f) {
         unsigned int magic = 0x53545453;
@@ -924,7 +939,8 @@ static void test_special_paths(void) {
 static void test_eou_with_model(void) {
     printf("\n─── Test 20: EOU with Synthetic Model ───\n");
 
-    const char *tmp = "/tmp/test_sonata_stt_eou_model.cstt_sonata";
+    char tmp[256];
+    get_tmp_path(tmp, sizeof(tmp), "test_sonata_stt_eou_model.cstt_sonata");
     FILE *f = fopen(tmp, "wb");
     if (!f) { g_fail++; printf("  [FAIL] cannot create temp file\n"); return; }
 
