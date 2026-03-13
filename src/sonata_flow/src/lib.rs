@@ -1194,6 +1194,8 @@ struct SonataFlowEngine {
     causal: bool,
     streaming_kv_caches: Vec<Option<(Tensor, Tensor)>>,
     streaming_prefix_x_at_step: Vec<Tensor>,
+    n_speakers: usize,  // Bounds for speaker_id validation
+    n_emotions: usize,  // Bounds for emotion_id validation
 }
 
 fn resolve_hf_flow(path: &str, candidates: &[&str]) -> std::result::Result<String, Box<dyn std::error::Error>> {
@@ -1336,6 +1338,7 @@ pub extern "C" fn sonata_flow_create(
             }
         }
 
+        let n_emotions = flow.config.n_emotions;
         eprintln!("[sonata_flow] Loaded on {:?} (dtype={:?}, speakers={}, steps={})",
                   device, dtype, n_speakers, n_steps);
         let n_layers = flow.blocks.len();
@@ -1358,6 +1361,8 @@ pub extern "C" fn sonata_flow_create(
             causal: false,
             streaming_kv_caches: vec![None; n_layers],
             streaming_prefix_x_at_step: Vec::new(),
+            n_speakers,
+            n_emotions,
         })
         })()
     }));
@@ -1393,6 +1398,15 @@ pub extern "C" fn sonata_flow_set_speaker(engine: *mut c_void, speaker_id: c_int
     if speaker_id < 0 {
         eng.speaker_id = None;
     } else {
+        // Validate speaker_id is within bounds
+        if eng.n_speakers == 0 {
+            eprintln!("[sonata_flow] Cannot set speaker: model has no speaker conditioning (n_speakers=0)");
+            return -1;
+        }
+        if (speaker_id as usize) >= eng.n_speakers {
+            eprintln!("[sonata_flow] Invalid speaker_id {}: must be < {} (n_speakers)", speaker_id, eng.n_speakers);
+            return -1;
+        }
         eng.speaker_id = Some(speaker_id as u32);
     }
     0
@@ -2117,7 +2131,20 @@ pub extern "C" fn sonata_flow_interpolate_speakers(
 pub extern "C" fn sonata_flow_set_emotion(engine: *mut c_void, emotion_id: c_int) -> c_int {
     if engine.is_null() { return -1; }
     let eng = unsafe { &mut *(engine as *mut SonataFlowEngine) };
-    eng.emotion_id = if emotion_id < 0 { None } else { Some(emotion_id as u32) };
+    if emotion_id < 0 {
+        eng.emotion_id = None;
+    } else {
+        // Validate emotion_id is within bounds
+        if eng.n_emotions == 0 {
+            eprintln!("[sonata_flow] Cannot set emotion: model has no emotion conditioning (n_emotions=0)");
+            return -1;
+        }
+        if (emotion_id as usize) >= eng.n_emotions {
+            eprintln!("[sonata_flow] Invalid emotion_id {}: must be < {} (n_emotions)", emotion_id, eng.n_emotions);
+            return -1;
+        }
+        eng.emotion_id = Some(emotion_id as u32);
+    }
     0
 }
 
@@ -2728,6 +2755,7 @@ struct SonataFlowV2Engine {
     use_heun: bool,
     quality_mode: i32,
     prosody_features: Option<Tensor>,
+    n_speakers: usize,  // Bounds for speaker_id validation
 }
 
 #[no_mangle]
@@ -2778,6 +2806,7 @@ pub extern "C" fn sonata_flow_v2_create(
             eprintln!("[sonata_flow_v2] Loaded ({}L, mel_dim={}, steps={})",
                       config.n_layers, config.mel_dim, config.n_steps_inference);
 
+            let n_speakers = config.n_speakers;
             Ok(SonataFlowV2Engine {
                 model,
                 device,
@@ -2788,6 +2817,7 @@ pub extern "C" fn sonata_flow_v2_create(
                 use_heun: false,
                 quality_mode: FLOW_QUALITY_BALANCED,
                 prosody_features: None,
+                n_speakers,
             })
         })()
     }));
@@ -2862,7 +2892,20 @@ pub extern "C" fn sonata_flow_v2_set_quality_mode(engine: *mut c_void, mode: c_i
 pub extern "C" fn sonata_flow_v2_set_speaker(engine: *mut c_void, speaker_id: c_int) -> c_int {
     if engine.is_null() { return -1; }
     let eng = unsafe { &mut *(engine as *mut SonataFlowV2Engine) };
-    eng.speaker_id = if speaker_id < 0 { None } else { Some(speaker_id as u32) };
+    if speaker_id < 0 {
+        eng.speaker_id = None;
+    } else {
+        // Validate speaker_id is within bounds
+        if eng.n_speakers == 0 {
+            eprintln!("[sonata_flow_v2] Cannot set speaker: model has no speaker conditioning (n_speakers=0)");
+            return -1;
+        }
+        if (speaker_id as usize) >= eng.n_speakers {
+            eprintln!("[sonata_flow_v2] Invalid speaker_id {}: must be < {} (n_speakers)", speaker_id, eng.n_speakers);
+            return -1;
+        }
+        eng.speaker_id = Some(speaker_id as u32);
+    }
     0
 }
 
@@ -3880,6 +3923,7 @@ struct SonataFlowV3Engine {
     last_durations: Vec<f32>,
     /// True if this is a distilled checkpoint (trained for 1-step generation)
     is_distilled: bool,
+    n_speakers: usize,  // Bounds for speaker_id validation
 }
 
 #[no_mangle]
@@ -3944,6 +3988,7 @@ pub extern "C" fn sonata_flow_v3_create(
             eprintln!("[sonata_flow_v3] Loaded ({}L, mel_dim={}, steps={}, distilled={})",
                       config.n_layers, config.mel_dim, n_steps, is_distilled);
 
+            let n_speakers = config.n_speakers;
             Ok(SonataFlowV3Engine {
                 model,
                 device,
@@ -3959,6 +4004,7 @@ pub extern "C" fn sonata_flow_v3_create(
                 streaming: None,
                 last_durations: Vec::new(),
                 is_distilled,
+                n_speakers,
             })
         })()
     }));
@@ -4045,7 +4091,20 @@ pub extern "C" fn sonata_flow_v3_set_quality_mode(engine: *mut c_void, mode: c_i
 pub extern "C" fn sonata_flow_v3_set_speaker(engine: *mut c_void, speaker_id: c_int) -> c_int {
     if engine.is_null() { return -1; }
     let eng = unsafe { &mut *(engine as *mut SonataFlowV3Engine) };
-    eng.speaker_id = if speaker_id < 0 { None } else { Some(speaker_id as u32) };
+    if speaker_id < 0 {
+        eng.speaker_id = None;
+    } else {
+        // Validate speaker_id is within bounds
+        if eng.n_speakers == 0 {
+            eprintln!("[sonata_flow_v3] Cannot set speaker: model has no speaker conditioning (n_speakers=0)");
+            return -1;
+        }
+        if (speaker_id as usize) >= eng.n_speakers {
+            eprintln!("[sonata_flow_v3] Invalid speaker_id {}: must be < {} (n_speakers)", speaker_id, eng.n_speakers);
+            return -1;
+        }
+        eng.speaker_id = Some(speaker_id as u32);
+    }
     0
 }
 

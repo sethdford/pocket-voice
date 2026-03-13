@@ -774,7 +774,18 @@ static int sonatav2_set_text_done(void *e) {
 
     /* Grow pre-allocated mag/phase buffers if needed */
     if (n_frames > ev->istft_buf_cap) {
+        /* Cap n_frames to prevent integer overflow in multiplication */
+        #define MAX_MEL_FRAMES 16384
+        if (n_frames > MAX_MEL_FRAMES) {
+            fprintf(stderr, "[sonata] Mel frame count %d exceeds maximum %d\n", n_frames, MAX_MEL_FRAMES);
+            return -1;
+        }
         int new_cap = n_frames + 64;
+        /* Check for overflow: new_cap * n_bins * sizeof(float) must fit in size_t */
+        if (new_cap > (int)(SIZE_MAX / (n_bins * sizeof(float)))) {
+            fprintf(stderr, "[sonata] Buffer allocation size overflow: %d frames * %d bins\n", new_cap, n_bins);
+            return -1;
+        }
         float *new_mag = (float *)malloc((size_t)new_cap * n_bins * sizeof(float));
         float *new_phase = (float *)malloc((size_t)new_cap * n_bins * sizeof(float));
         if (!new_mag || !new_phase) {
@@ -1262,11 +1273,6 @@ extern int   sonata_flow_interpolate_speakers(void *engine, const float *emb_a,
 /* Sonata Flow v2 externs declared above near line ~812 */
 
 #define SONATA_BUF_CAPACITY (24000 * 30)
-#ifndef SONATA_N_FFT
-#define SONATA_N_FFT 1024
-#define SONATA_HOP 480
-#define SONATA_N_BINS (SONATA_N_FFT / 2 + 1)
-#endif
 #define SONATA_MAX_FRAMES 2000
 #define SONATA_FIRST_CHUNK_DEFAULT 8  /* configurable via --sonata-first-chunk */
 #define SONATA_CHUNK_SIZE 50
@@ -2220,6 +2226,38 @@ static int sonata_set_reference_audio(void *engine, const char *encoder_path,
     if (!e || !encoder_path || !pcm || n_samples <= 0) return -1;
     if (!e->flow_engine) {
         fprintf(stderr, "[sonata] Flow engine not available for voice cloning\n");
+        return -1;
+    }
+
+    /* Validate sample rate (16kHz or 24kHz) */
+    if (sample_rate != 16000 && sample_rate != 24000) {
+        fprintf(stderr, "[sonata] Invalid sample rate %d (must be 16000 or 24000 Hz)\n", sample_rate);
+        return -1;
+    }
+
+    /* Validate minimum audio duration (at least 1 second = sample_rate samples) */
+    if (n_samples < sample_rate) {
+        fprintf(stderr, "[sonata] Audio too short: %d samples (minimum %.1f seconds @ %dHz)\n",
+                n_samples, 1.0f, sample_rate);
+        return -1;
+    }
+
+    /* Validate maximum audio duration (cap at 30 seconds to prevent abuse) */
+    int max_samples = sample_rate * 30;
+    if (n_samples > max_samples) {
+        fprintf(stderr, "[sonata] Audio too long: %d samples (maximum 30 seconds @ %dHz)\n",
+                n_samples, sample_rate);
+        return -1;
+    }
+
+    /* Check for silence/non-zero energy (prevent processing silent or near-silent audio) */
+    float max_abs = 0.0f;
+    for (int i = 0; i < n_samples; i++) {
+        float abs_val = pcm[i] < 0.0f ? -pcm[i] : pcm[i];
+        if (abs_val > max_abs) max_abs = abs_val;
+    }
+    if (max_abs < 1e-4f) {
+        fprintf(stderr, "[sonata] Reference audio is silent or near-zero (max amplitude %.2e)\n", max_abs);
         return -1;
     }
 

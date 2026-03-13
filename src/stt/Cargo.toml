@@ -8,7 +8,7 @@ crate-type = ["cdylib"]
 name = "pocket_stt"
 
 [dependencies]
-candle = { version = "0.9", package = "candle-core" }
+candle = { workspace = true }
 candle-nn = { workspace = true }
 candle-transformers = { workspace = true }
 hf-hub = { workspace = true }

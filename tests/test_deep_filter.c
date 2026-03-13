@@ -473,7 +473,8 @@ static void test_edge_cases(void) {
     deep_filter_process(df, buf, 1);
     ASSERT(isfinite(buf[0]), "single sample should produce finite output");
 
-    /* Silent input */
+    /* Silent input: reset first so prior audio state doesn't bleed through */
+    deep_filter_reset(df);
     float silence[2048];
     memset(silence, 0, sizeof(silence));
     deep_filter_process(df, silence, 2048);

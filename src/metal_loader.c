@@ -32,7 +32,7 @@ struct MetalKernels {
 #ifdef __OBJC__
 
 MetalKernels *metal_kernels_load(const char *metallib_path) {
-    if (!metallib_path) return NULL;
+    if (!metallib_path || metallib_path[0] == '\0') return NULL;
 
     MetalKernels *mk = (MetalKernels *)calloc(1, sizeof(MetalKernels));
     if (!mk) return NULL;

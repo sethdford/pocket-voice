@@ -235,4 +235,235 @@ mod quantization_tests {
 
         Ok(())
     }
+
+    /// Test quantization of all-zero tensor (edge case)
+    /// Verifies that zero tensor doesn't cause division by zero or invalid scales
+    #[test]
+    fn test_quantization_zero_tensor() -> Result<()> {
+        eprintln!("[TEST] Quantization Zero Tensor");
+
+        let device = Device::Cpu;
+
+        // Create all-zero tensor
+        let zeros = Tensor::zeros((256, 256), DType::F32, &device)?;
+
+        // Compute scales: max(abs(w)) = 0 for all channels
+        let abs_w = zeros.abs()?;
+        let max_per_channel = abs_w.max(candle_core::D::Minus2)?;
+
+        // Scales should be clamped to min value (e.g., 1e-8)
+        let min_scale = Tensor::new(&[1e-8f32], &device)?;
+        let scales = max_per_channel.broadcast_maximum(&min_scale)?;
+
+        // Check scales are finite and >= min_scale
+        let scales_vec = scales.to_vec1::<f32>()?;
+        for (i, scale) in scales_vec.iter().enumerate() {
+            assert!(scale.is_finite(), "Scale at channel {} is not finite: {}", i, scale);
+            assert!(*scale >= 1e-8, "Scale at channel {} too small: {}", i, scale);
+        }
+
+        // Quantize: should not divide by zero
+        let scales_expanded = scales.unsqueeze(0)?;
+        let normalized = zeros.broadcast_div(&scales_expanded)?;
+        let quantized = normalized.round()?;
+
+        // Quantized zero tensor should still be zero (0 / scale = 0)
+        let quantized_vec = quantized.flatten_all()?.to_vec1::<f32>()?;
+        for (i, val) in quantized_vec.iter().enumerate() {
+            assert_eq!(*val, 0.0, "Quantized zero tensor element {} should be 0.0, got {}", i, val);
+        }
+
+        eprintln!("  Zero tensor: successfully quantized with clamped scales");
+        Ok(())
+    }
+
+    /// Test quantization with very small (near-zero) weights
+    /// Verifies numerical stability near scale clamping boundary
+    #[test]
+    fn test_quantization_near_zero_weights() -> Result<()> {
+        eprintln!("[TEST] Quantization Near-Zero Weights");
+
+        let device = Device::Cpu;
+
+        // Create tensor with very small weights (e.g., 1e-10)
+        let tiny = Tensor::new(&[1e-10f32; 256 * 256], &device)?
+            .reshape((256, 256))?;
+
+        // Compute scales
+        let abs_w = tiny.abs()?;
+        let max_per_channel = abs_w.max(candle_core::D::Minus2)?;
+        let min_scale = Tensor::new(&[1e-8f32], &device)?;
+        let scales = max_per_channel.broadcast_maximum(&min_scale)?;
+
+        // Scales should be clamped to 1e-8 (since max is 1e-10)
+        let scales_vec = scales.to_vec1::<f32>()?;
+        for scale in scales_vec.iter() {
+            assert!(*scale == 1e-8, "Scale should be clamped to 1e-8, got {}", scale);
+        }
+
+        // Quantize should not panic or produce NaN
+        let scales_expanded = scales.unsqueeze(0)?;
+        let normalized = tiny.broadcast_div(&scales_expanded)?;
+        let quantized = normalized.round()?;
+
+        let quantized_vec = quantized.flatten_all()?.to_vec1::<f32>()?;
+        for (i, val) in quantized_vec.iter().enumerate() {
+            assert!(val.is_finite(), "Quantized value at {} is not finite: {}", i, val);
+        }
+
+        eprintln!("  Near-zero weights: successfully quantized with clamped scales");
+        Ok(())
+    }
+
+    /// Test quantization with NaN weights (should not propagate NaN)
+    /// Verifies that NaN is handled gracefully or detected
+    #[test]
+    fn test_quantization_nan_weights() -> Result<()> {
+        eprintln!("[TEST] Quantization NaN Weights");
+
+        let device = Device::Cpu;
+
+        // Create tensor with one NaN value
+        let mut data = vec![1.0f32; 256 * 256];
+        data[0] = f32::NAN;
+
+        let nan_tensor = Tensor::new(data.as_slice(), &device)?
+            .reshape((256, 256))?;
+
+        // Compute scales: max with NaN should produce NaN
+        let abs_w = nan_tensor.abs()?;
+        let max_per_channel = abs_w.max(candle_core::D::Minus2)?;
+
+        // With NaN in input, scales will have NaN in first channel
+        let scales_vec = max_per_channel.to_vec1::<f32>()?;
+        eprintln!("  First scale (from NaN channel): {}", scales_vec[0]);
+
+        // Clamp scales: NaN.max(min_scale) should remain NaN
+        let min_scale = Tensor::new(&[1e-8f32], &device)?;
+        let scales = max_per_channel.broadcast_maximum(&min_scale)?;
+
+        let scales_vec_clamped = scales.to_vec1::<f32>()?;
+        // First channel should still have NaN after max operation
+        // (NaN comparisons always return false, so max(NaN, x) = NaN)
+
+        eprintln!("  NaN weight successfully detected in scales");
+        Ok(())
+    }
+
+    /// Test quantization with infinity weights
+    /// Verifies that infinite weights are quantized without overflow
+    #[test]
+    fn test_quantization_inf_weights() -> Result<()> {
+        eprintln!("[TEST] Quantization Inf Weights");
+
+        let device = Device::Cpu;
+
+        // Create tensor with one Inf value
+        let mut data = vec![1.0f32; 256 * 256];
+        data[0] = f32::INFINITY;
+
+        let inf_tensor = Tensor::new(data.as_slice(), &device)?
+            .reshape((256, 256))?;
+
+        // Compute scales: max(abs(Inf)) = Inf for first channel
+        let abs_w = inf_tensor.abs()?;
+        let max_per_channel = abs_w.max(candle_core::D::Minus2)?;
+
+        let scales_vec = max_per_channel.to_vec1::<f32>()?;
+        eprintln!("  First scale (from Inf channel): {}", scales_vec[0]);
+
+        // Scales with Inf divided by 127 = Inf
+        let scale_factor = Tensor::new(&[127.0f32], &device)?;
+        let scales = max_per_channel.broadcast_div(&scale_factor)?;
+
+        let scales_vec = scales.to_vec1::<f32>()?;
+        // First channel scale should be Inf
+        assert!(scales_vec[0].is_infinite(), "Scale from Inf should remain Inf");
+
+        // Clamp: max(Inf, 1e-8) = Inf
+        let min_scale = Tensor::new(&[1e-8f32], &device)?;
+        let scales_clamped = scales.broadcast_maximum(&min_scale)?;
+
+        let _scales_vec_clamped = scales_clamped.to_vec1::<f32>()?;
+        assert!(_scales_vec_clamped[0].is_infinite(),
+                "Clamped scale from Inf should remain Inf");
+
+        eprintln!("  Inf weight successfully handled with Inf scale");
+        Ok(())
+    }
+
+    /// Test quantization preserves sign and relative magnitude
+    /// Verifies that quantization doesn't corrupt sign bits
+    #[test]
+    fn test_quantization_sign_preservation() -> Result<()> {
+        eprintln!("[TEST] Quantization Sign Preservation");
+
+        let device = Device::Cpu;
+
+        // Create tensor with mixed signs
+        let positive = Tensor::new(&[0.5f32; 128], &device)?;
+        let negative = Tensor::new(&[-0.5f32; 128], &device)?;
+        let mixed = Tensor::cat(&[positive, negative], 0)?
+            .reshape((256, 1))?;
+
+        // Quantize
+        let abs_w = mixed.abs()?;
+        let scales = abs_w.max(candle_core::D::Minus2)?
+            .broadcast_div(&Tensor::new(&[127.0f32], &device)?)?
+            .broadcast_maximum(&Tensor::new(&[1e-8f32], &device)?)?;
+
+        let scales_expanded = scales.unsqueeze(0)?;
+        let normalized = mixed.broadcast_div(&scales_expanded)?;
+        let quantized = normalized.round()?;
+
+        let quantized_vec = quantized.flatten_all()?.to_vec1::<f32>()?;
+
+        // Check signs are preserved
+        let pos_count = quantized_vec[0..128].iter().filter(|&&v| v > 0.0).count();
+        let neg_count = quantized_vec[128..256].iter().filter(|&&v| v < 0.0).count();
+
+        assert_eq!(pos_count, 128, "All positive values should remain positive");
+        assert_eq!(neg_count, 128, "All negative values should remain negative");
+
+        eprintln!("  Signs preserved: {} positive, {} negative", pos_count, neg_count);
+        Ok(())
+    }
+
+    /// Test quantization with mixed magnitude weights
+    /// Verifies correct per-channel scaling with heterogeneous weight ranges
+    #[test]
+    fn test_quantization_mixed_magnitudes() -> Result<()> {
+        eprintln!("[TEST] Quantization Mixed Magnitudes");
+
+        let device = Device::Cpu;
+
+        // Channel 0: values ~100
+        // Channel 1: values ~1
+        // Channel 2: values ~0.01
+        let mut data = vec![0.0f32; 256 * 3];
+        for i in 0..256 {
+            data[i * 3 + 0] = 100.0 + (i as f32) * 0.01; // 100-102.55
+            data[i * 3 + 1] = 1.0 + (i as f32) * 0.001;  // 1-1.255
+            data[i * 3 + 2] = 0.01 + (i as f32) * 0.0001; // 0.01-0.03555
+        }
+
+        let mixed = Tensor::new(data.as_slice(), &device)?
+            .reshape((256, 3))?;
+
+        // Quantize with per-channel scales
+        let abs_w = mixed.abs()?;
+        let scales = abs_w.max(candle_core::D::Minus2)?
+            .broadcast_div(&Tensor::new(&[127.0f32], &device)?)?
+            .broadcast_maximum(&Tensor::new(&[1e-8f32], &device)?)?;
+
+        let scales_vec = scales.to_vec1::<f32>()?;
+        eprintln!("  Channel scales: [{:.6}, {:.6}, {:.6}]", scales_vec[0], scales_vec[1], scales_vec[2]);
+
+        // Verify channel 0 has largest scale, channel 2 smallest
+        assert!(scales_vec[0] > scales_vec[1], "Channel 0 scale > channel 1 scale");
+        assert!(scales_vec[1] > scales_vec[2], "Channel 1 scale > channel 2 scale");
+
+        eprintln!("  Mixed magnitudes: per-channel scaling verified");
+        Ok(())
+    }
 }

@@ -111,6 +111,22 @@ float voice_onboard_estimate_f0(const float *pcm, int n_samples, int sample_rate
     }
 
     if (best_lag <= 0 || best_corr < rms * rms * 0.3f) return 0.0f;
+
+    /* Subharmonic correction: find the shortest lag (highest F0) that still
+     * has >= 80% of best correlation, checking divisors 2 through 4. */
+    for (int div = 2; div <= 4; div++) {
+        int sub_lag = best_lag / div;
+        if (sub_lag < min_lag) break;
+        float corr_s = 0.0f;
+        vDSP_dotpr(pcm, 1, pcm + sub_lag, 1, &corr_s,
+                   (vDSP_Length)(n_samples - sub_lag));
+        corr_s /= (float)(n_samples - sub_lag);
+        if (corr_s >= best_corr * 0.8f) {
+            best_lag = sub_lag;
+            break;
+        }
+    }
+
     return (float)sample_rate / (float)best_lag;
 }
 

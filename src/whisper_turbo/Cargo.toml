@@ -8,13 +8,13 @@ crate-type = ["cdylib"]
 name = "whisper_turbo"
 
 [dependencies]
-anyhow = "1.0"
-candle-core = "0.9"
-candle-nn = "0.9"
-candle-transformers = "0.9"
-safetensors = "0.4"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+anyhow = { workspace = true }
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+candle-transformers = { workspace = true }
+safetensors = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 tokenizers = "0.15"
 
 [features]

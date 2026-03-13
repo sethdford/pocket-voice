@@ -73,6 +73,26 @@ static float estimate_pitch_ac(const float *audio, int n, int sr) {
         }
     }
     if (best_corr < 0.3f || best_lag == 0) return 0.0f;
+
+    /* Subharmonic correction: find the shortest lag (highest F0) that still has
+     * good correlation, checking divisors 2 through 4. */
+    for (int div = 2; div <= 4; div++) {
+        int sub_lag = best_lag / div;
+        if (sub_lag < min_lag) break;
+        float corr_s = 0.0f, e1_s = 0.0f, e2_s = 0.0f;
+        int end_s = window - sub_lag;
+        if (end_s <= 0) continue;
+        vDSP_dotpr(audio, 1, audio + sub_lag, 1, &corr_s, end_s);
+        vDSP_dotpr(audio, 1, audio, 1, &e1_s, end_s);
+        vDSP_dotpr(audio + sub_lag, 1, audio + sub_lag, 1, &e2_s, end_s);
+        float denom_s = sqrtf(e1_s * e2_s);
+        if (denom_s > 1e-8f) corr_s /= denom_s;
+        if (corr_s >= best_corr * 0.8f) {
+            best_lag = sub_lag;
+            break;
+        }
+    }
+
     return (float)sr / (float)best_lag;
 }
 
@@ -353,5 +373,6 @@ int audio_emotion_describe(const AudioEmotionResult *r, char *buf, int buf_size)
             "Match their enthusiasm! ");
     }
 
-    return wrote;
+    /* Cap to actual bytes written (snprintf returns "would-have-written" count) */
+    return wrote < buf_size ? wrote : buf_size - 1;
 }

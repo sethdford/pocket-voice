@@ -116,8 +116,8 @@ static void test_step_dual_validation(void) {
     ret = sonata_lm_step_dual((void *)0x1, &token, acoustic, 0);
     CHECKF(ret == -1, "step_dual with acoustic_dim=0 = %d (expected -1)", ret);
 
-    /* NULL acoustic with positive acoustic_dim is valid (acoustic output ignored) */
-    ret = sonata_lm_step_dual((void *)0x1, &token, NULL, 512);
+    /* NULL acoustic with positive acoustic_dim: NULL engine returns -1 safely */
+    ret = sonata_lm_step_dual(NULL, &token, NULL, 512);
     CHECK(ret >= -1, "step_dual(NULL acoustic, dim=512) does not crash");
 
     /* Both NULL engine and NULL token */

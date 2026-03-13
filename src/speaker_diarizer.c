@@ -98,9 +98,12 @@ SpeakerDiarizer *diarizer_create(const char *encoder_path, float threshold, int 
     }
 
     d->threshold = (threshold > 0.0f) ? threshold : DEFAULT_THRESHOLD;
-    d->max_speakers = (max_speakers > 0 && max_speakers <= 64) ? max_speakers : DEFAULT_MAX_SPEAKERS;
+    /* max_speakers=0 means "no new speakers allowed"; negative → use default */
+    d->max_speakers = (max_speakers >= 0 && max_speakers <= 64) ? max_speakers : DEFAULT_MAX_SPEAKERS;
     d->n_speakers = 0;
-    d->profiles = (SpeakerProfile *)calloc((size_t)d->max_speakers, sizeof(SpeakerProfile));
+    /* calloc(0,...) is implementation-defined; allocate at least 1 element */
+    size_t alloc_count = (size_t)(d->max_speakers > 0 ? d->max_speakers : 1);
+    d->profiles = (SpeakerProfile *)calloc(alloc_count, sizeof(SpeakerProfile));
     if (!d->profiles) {
         if (d->encoder)
             speaker_encoder_destroy(d->encoder);
@@ -167,10 +170,7 @@ int diarizer_identify_embedding(SpeakerDiarizer *d, const float *embedding, int 
         return register_new_speaker(d, embedding, dim);
     }
 
-    if (best_id >= 0) {
-        update_centroid(&d->profiles[best_id], embedding, dim);
-        return best_id;
-    }
+    /* At capacity and below threshold: unknown speaker, return -1. */
     return -1;
 }
 
@@ -204,7 +204,7 @@ const char *diarizer_get_label(const SpeakerDiarizer *d, int speaker_id) {
         return NULL;
     if (speaker_id < 0 || speaker_id >= d->n_speakers)
         return NULL;
-    return d->profiles[speaker_id].label[0] ? d->profiles[speaker_id].label : NULL;
+    return d->profiles[speaker_id].label;
 }
 
 void diarizer_reset(SpeakerDiarizer *d) {

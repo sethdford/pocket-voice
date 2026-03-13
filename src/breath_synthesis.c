@@ -128,6 +128,8 @@ static inline float biquad_process(BiquadFilter *f, float x)
 
 BreathSynth *breath_create(int sample_rate)
 {
+    if (sample_rate <= 0) return NULL;
+
     BreathSynth *bs = calloc(1, sizeof(BreathSynth));
     if (!bs) return NULL;
 

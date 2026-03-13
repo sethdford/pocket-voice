@@ -206,11 +206,14 @@ MultiScaleProsody prosody_analyze_text(const char *text) {
         if (!isspace((unsigned char)text[i])) { last = text[i]; break; }
     }
 
+    /* Check for '!' anywhere in text (not just last char) for multi-sentence */
+    int has_excl = (strchr(text, '!') != NULL);
+
     if (last == '?') {
         msp.contour = PROSODY_CONTOUR_INTERROGATIVE;
         msp.utterance.pitch = 1.08f;
         msp.utterance.rate = 0.95f;
-    } else if (last == '!') {
+    } else if (last == '!' || has_excl) {
         msp.contour = PROSODY_CONTOUR_EXCLAMATORY;
         msp.utterance.pitch = 1.06f;
         msp.utterance.energy = 1.5f;
@@ -351,9 +354,13 @@ static const struct {
     /* Fearful / Anxious */
     {"scary",        EMOTION_FEARFUL,   0.6f},
     {"afraid",       EMOTION_FEARFUL,   0.6f},
+    {"scared",       EMOTION_FEARFUL,   0.7f},
+    {"terrified",    EMOTION_FEARFUL,   0.8f},
     {"worried",      EMOTION_FEARFUL,   0.5f},
     {"terrifying",   EMOTION_FEARFUL,   0.7f},
     {"frightening",  EMOTION_FEARFUL,   0.6f},
+    {"frightened",   EMOTION_FEARFUL,   0.7f},
+    {"fearful",      EMOTION_FEARFUL,   0.8f},
     {"alarming",     EMOTION_FEARFUL,   0.5f},
     {"nervous",      EMOTION_FEARFUL,   0.5f},
     {"panicked",     EMOTION_FEARFUL,   0.7f},

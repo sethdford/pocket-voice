@@ -1237,8 +1237,11 @@ impl RnnDrafter {
             let mut branch_states = layer_states.clone();
 
             for _depth in 1..d {
-                let prev_tok = *beam.last().unwrap();
-                let tok_t = Tensor::from_vec(vec![prev_tok], (1,), device)?;
+                // P1-2: Replace unwrap with proper error handling
+                let prev_tok = beam.last().ok_or_else(|| {
+                    candle_core::Error::Msg("beam is empty".to_string())
+                })?;
+                let tok_t = Tensor::from_vec(vec![*prev_tok], (1,), device)?;
                 let emb = self.token_emb.forward(&tok_t)?;
 
                 let mut bx = emb;
@@ -1369,19 +1372,37 @@ impl LmEngine {
             } else {
                 2560
             };
-            // P2: Config DoS protection — clamp max_seq_len to reasonable range
+            // P0-5: Config DoS protection — clamp all config values to reasonable ranges
             let max_seq_len = raw.get("max_seq_len").and_then(|v| v.as_u64()).unwrap_or(4096) as usize;
             let max_seq_len = max_seq_len.min(32768).max(128); // Clamp to [128, 32768]
 
+            let n_layers = raw.get("n_layers").and_then(|v| v.as_u64()).unwrap_or(16) as usize;
+            let n_layers = n_layers.min(48).max(1); // Clamp to [1, 48]
+
+            let n_heads = raw.get("n_heads").and_then(|v| v.as_u64()).unwrap_or(16) as usize;
+            let n_heads = n_heads.min(64).max(1); // Clamp to [1, 64]
+
+            let n_kv_heads = raw.get("n_kv_heads").and_then(|v| v.as_u64()).unwrap_or(4) as usize;
+            let n_kv_heads = n_kv_heads.min(64).max(1); // Clamp to [1, 64]
+
+            let d_model = d.min(4096).max(64); // Clamp d_model to [64, 4096]
+            let d_ff = d_ff.min(16384).max(256); // Clamp d_ff to [256, 16384]
+
+            let text_vocab_size = raw.get("text_vocab_size").and_then(|v| v.as_u64()).unwrap_or(32000) as usize;
+            let text_vocab_size = text_vocab_size.min(262144).max(256); // Clamp to [256, 256K]
+
+            let semantic_vocab_size = raw.get("semantic_vocab_size").and_then(|v| v.as_u64()).unwrap_or(4096) as usize;
+            let semantic_vocab_size = semantic_vocab_size.min(65536).max(256); // Clamp to [256, 64K]
+
             LmConfig {
-                d_model: d,
-                n_layers: raw.get("n_layers").and_then(|v| v.as_u64()).unwrap_or(16) as usize,
-                n_heads: raw.get("n_heads").and_then(|v| v.as_u64()).unwrap_or(16) as usize,
-                n_kv_heads: raw.get("n_kv_heads").and_then(|v| v.as_u64()).unwrap_or(4) as usize,
+                d_model,
+                n_layers,
+                n_heads,
+                n_kv_heads,
                 d_ff,
                 max_seq_len,
-                text_vocab_size: raw.get("text_vocab_size").and_then(|v| v.as_u64()).unwrap_or(32000) as usize,
-                semantic_vocab_size: raw.get("semantic_vocab_size").and_then(|v| v.as_u64()).unwrap_or(4096) as usize,
+                text_vocab_size,
+                semantic_vocab_size,
                 n_special_tokens: raw.get("n_special_tokens").and_then(|v| v.as_u64()).unwrap_or(4) as usize,
                 rope_theta: raw.get("rope_theta").and_then(|v| v.as_f64()).unwrap_or(10000.0),
                 norm_eps: raw.get("norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-5),
@@ -1645,6 +1666,13 @@ impl LmEngine {
             }
         } else {
             self.consecutive_pad = 0;
+        }
+
+        // P0-4: Validate semantic token is within valid range
+        let max_semantic_token = (self.model.cfg.semantic_vocab_size + self.model.cfg.n_special_tokens) as u32;
+        if next >= max_semantic_token {
+            eprintln!("[sonata_lm] semantic token overflow: {} >= {}", next, max_semantic_token);
+            return Ok(None);
         }
 
         self.recent_tokens.push_back(next);
@@ -2428,7 +2456,8 @@ pub extern "C" fn sonata_lm_destroy(engine: *mut c_void) {
 pub extern "C" fn sonata_lm_set_text(
     engine: *mut c_void, text_ids: *const u32, n: c_int,
 ) -> c_int {
-    const MAX_TEXT_LEN: c_int = 8192; // P1: Reduced to 8K tokens max
+    const MAX_TEXT_LEN: c_int = 8192; // P0-1: Unbounded slice protection
+    // P0-1: Validate n to prevent unbounded slice creation via from_raw_parts
     if engine.is_null() || text_ids.is_null() || n <= 0 || n > MAX_TEXT_LEN { return -1; }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let eng = unsafe { &mut *(engine as *mut LmEngine) };
@@ -2451,7 +2480,8 @@ pub extern "C" fn sonata_lm_set_text(
 pub extern "C" fn sonata_lm_append_text(
     engine: *mut c_void, text_ids: *const u32, n: c_int,
 ) -> c_int {
-    const MAX_TEXT_LEN: c_int = 8192; // P1: Reduced to 8K tokens max
+    const MAX_TEXT_LEN: c_int = 8192; // P0-1: Unbounded slice protection
+    // P0-1: Validate n to prevent unbounded slice creation via from_raw_parts
     if engine.is_null() || text_ids.is_null() || n <= 0 || n > MAX_TEXT_LEN { return -1; }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let eng = unsafe { &mut *(engine as *mut LmEngine) };
@@ -2650,7 +2680,11 @@ pub extern "C" fn sonata_lm_set_prosody(
         for i in 0..n as usize {
             let mut frame = [0.0f32; PROSODY_DIM];
             for d in 0..PROSODY_DIM {
-                frame[d] = unsafe { *features.add(i * PROSODY_DIM + d) };
+                // P0-2: Use checked arithmetic to prevent integer overflow in pointer indexing
+                let offset = i.checked_mul(PROSODY_DIM)
+                    .and_then(|idx| idx.checked_add(d))
+                    .unwrap_or(usize::MAX); // Prevent arithmetic overflow
+                frame[d] = unsafe { *features.add(offset) };
             }
             pf.push(frame);
         }
@@ -3051,6 +3085,13 @@ pub extern "C" fn sonata_lm_step_dual(
 
         // Sample token
         let next_token = LmEngine::sample_top_k_top_p(&logits_vec, eng.top_k, eng.top_p, &mut eng.sampling_buf);
+
+        // P0-4: Validate semantic token is within valid range
+        let max_semantic_token = (eng.model.cfg.semantic_vocab_size + eng.model.cfg.n_special_tokens) as u32;
+        if next_token >= max_semantic_token {
+            eprintln!("[sonata_lm] semantic token overflow in FFI: {} >= {}", next_token, max_semantic_token);
+            return -1;
+        }
 
         // Check for end-of-sequence or too many pad tokens
         if next_token == 2 {

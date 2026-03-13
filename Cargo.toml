@@ -20,6 +20,7 @@ members = [
 
 [workspace.dependencies]
 candle-core = { version = "0.9", features = [] }
+candle = { version = "0.9", package = "candle-core", features = [] }
 candle-nn = { version = "0.9", features = [] }
 candle-transformers = { version = "0.9", features = [] }
 safetensors = "0.4"

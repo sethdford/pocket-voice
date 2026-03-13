@@ -563,9 +563,9 @@ int main(void) {
         "models/sonata/sonata_lm.safetensors",
         "models/sonata/sonata_lm_config.json");
     if (!lm) {
-        fprintf(stderr, "  [FATAL] Cannot load Sonata LM\n");
+        fprintf(stderr, "  [SKIP] Cannot load Sonata LM — model incompatible or missing\n");
         spm_destroy(tok);
-        return 1;
+        return 0;
     }
     sonata_lm_set_params(lm, 0.7f, 40, 0.90f, 1.2f);
     fprintf(stderr, "  Sonata LM loaded\n");

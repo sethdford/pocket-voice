@@ -411,9 +411,9 @@ SONATA_FLOW_DYLIB := src/sonata_flow/target/release/libsonata_flow.dylib
 $(SONATA_FLOW_DYLIB): src/sonata_flow/src/lib.rs src/sonata_flow/Cargo.toml src/sonata_flow/build.rs
 	cd src/sonata_flow && RUSTFLAGS="-C target-cpu=native" cargo build --release
 
-SONATA_STORM_DYLIB := src/sonata_storm/target/release/libsonata_storm.dylib
+SONATA_STORM_DYLIB := target/release/libsonata_storm.dylib
 $(SONATA_STORM_DYLIB): src/sonata_storm/src/lib.rs src/sonata_storm/Cargo.toml src/sonata_storm/build.rs
-	cd src/sonata_storm && RUSTFLAGS="-C target-cpu=native" cargo build --release
+	RUSTFLAGS="-C target-cpu=native" cargo build --release -p sonata_storm
 
 SONATA_SPEAKER_DYLIB := src/sonata_speaker/target/release/libsonata_speaker.dylib
 $(SONATA_SPEAKER_DYLIB): src/sonata_speaker/src/lib.rs src/sonata_speaker/Cargo.toml src/sonata_speaker/build.rs
@@ -449,7 +449,7 @@ sonata: src/pocket_voice_pipeline.c libs $(STT_DYLIB) $(LLM_DYLIB) $(SONATA_LM_D
 	  -Wl,-rpath,@executable_path/src/llm/target/release \
 	  -Wl,-rpath,@executable_path/src/sonata_lm/target/release \
 	  -Wl,-rpath,@executable_path/src/sonata_flow/target/release \
-	  -Wl,-rpath,@executable_path/src/sonata_storm/target/release \
+	  -Wl,-rpath,@executable_path/target/release \
 	  -Wl,-rpath,$(HOMEBREW_PREFIX)/lib \
 	  $(ORT_RPATH) \
 	  -o $@ src/pocket_voice_pipeline.c
@@ -872,8 +872,8 @@ bench-speculative: tools/bench_speculative.c $(SONATA_LM_DYLIB) | $(BUILD)
 
 test-sonata-storm: tests/test_sonata_storm.c $(SONATA_STORM_DYLIB) | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc \
-	  -Lsrc/sonata_storm/target/release \
-	  -Wl,-rpath,$(CURDIR)/src/sonata_storm/target/release \
+	  -Ltarget/release \
+	  -Wl,-rpath,$(CURDIR)/target/release \
 	  -lsonata_storm -lm \
 	  -o $(BUILD)/test-sonata-storm tests/test_sonata_storm.c
 	./$(BUILD)/test-sonata-storm
@@ -927,6 +927,21 @@ test-sonata-lm-dual-head: tests/test_sonata_lm_dual_head.c $(SONATA_LM_DYLIB) | 
 	  -lsonata_lm -lm \
 	  -o $(BUILD)/test-sonata-lm-dual-head tests/test_sonata_lm_dual_head.c
 	./$(BUILD)/test-sonata-lm-dual-head
+
+test-speaker-encoder-unit: tests/test_speaker_encoder_unit.c $(BUILD)/libspeaker_encoder.dylib | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc \
+	  -L$(BUILD) -lspeaker_encoder \
+	  -Wl,-rpath,$(CURDIR)/$(BUILD) \
+	  -o $(BUILD)/test-speaker-encoder-unit tests/test_speaker_encoder_unit.c -lm
+	./$(BUILD)/test-speaker-encoder-unit
+
+test-sonata-lm-prosody-edge: tests/test_sonata_lm_prosody_edge.c $(SONATA_LM_DYLIB) | $(BUILD)
+	$(CC) $(CFLAGS) -Isrc \
+	  -Lsrc/sonata_lm/target/release \
+	  -Wl,-rpath,$(CURDIR)/src/sonata_lm/target/release \
+	  -lsonata_lm -lm \
+	  -o $(BUILD)/test-sonata-lm-prosody-edge tests/test_sonata_lm_prosody_edge.c
+	./$(BUILD)/test-sonata-lm-prosody-edge
 
 test-pipeline-threading: tests/test_pipeline_threading.c $(BUILD)/libvm_ring.dylib | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc \
@@ -1204,18 +1219,19 @@ test-speaker-encoder-integration: tests/test_speaker_encoder.c $(BUILD)/libmel_s
 	  -o $(BUILD)/test-speaker-encoder-integration tests/test_speaker_encoder.c -lm
 	./$(BUILD)/test-speaker-encoder-integration
 
-test-speaker-encoder: tests/test_speaker_encoder.c $(BUILD)/libspeaker_encoder.dylib $(SONATA_SPEAKER_DYLIB) | $(BUILD)
+test-speaker-encoder: tests/test_speaker_encoder.c $(BUILD)/libspeaker_encoder.dylib $(BUILD)/libmel_spectrogram.dylib $(SONATA_SPEAKER_DYLIB) | $(BUILD)
 	$(CC) $(CFLAGS) -Isrc \
-	  -L$(BUILD) -lspeaker_encoder \
-	  -Wl,-rpath,$(CURDIR)/$(BUILD):$(CURDIR)/src/sonata_speaker/target/release \
+	  -L$(BUILD) -lspeaker_encoder -lmel_spectrogram \
+	  -Wl,-rpath,$(CURDIR)/$(BUILD) \
+	  -Wl,-rpath,$(CURDIR)/src/sonata_speaker/target/release \
 	  -o $(BUILD)/test-speaker-encoder tests/test_speaker_encoder.c
 	./$(BUILD)/test-speaker-encoder
 
-.PHONY: test test-eou test-semantic-eou test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-roundtrip test-llm-prosody test-websocket test-optimizations test-sonata test-sonata-quality test-sonata-stt test-sonata-v3 test-beam-search bench-sonata bench-e2e-latency bench-speculative bench-quality bench-live bench-industry test-apple-perf test-quality-improvements test-real-models test-native-vad bench-vad test-speech-detector test-fused-eou-parallel test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-sonata-storm test-audio-emotion test-audio-mixer test-sonata-flow-ffi test-flow-quality-modes test-sonata-flow-distilled test-sonata-lm-ffi test-sonata-lm-dual-head test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-neural-backchannel test-intent-router test-response-cache test-speculative-gen test-streaming-tts test-streaming-llm test-full-duplex test-sonata-refiner test-tdt-decoder test-web-remote test-opus-codec test-audio-converter test-spatial-audio test-metal-loader test-metal-dispatch test-bnns-convnext test-coverage-gaps test-correctness-audit test-integration-audit test-security-audit test-assumptions bench-audit bench test-research-stt test-research-eou test-research-istft test-research-metal test-audio-watermark test-deep-filter test-codec-12hz test-gru-drafter test-speaker-encoder test-voice-cloning-e2e test-flow-streaming test-flow-distilled-loading test-speaker-encoder-integration eval eval-python eval-full eval-generate
+.PHONY: test test-eou test-semantic-eou test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-roundtrip test-llm-prosody test-websocket test-optimizations test-sonata test-sonata-quality test-sonata-stt test-sonata-v3 test-beam-search bench-sonata bench-e2e-latency bench-speculative bench-quality bench-live bench-industry test-apple-perf test-quality-improvements test-real-models test-native-vad bench-vad test-speech-detector test-fused-eou-parallel test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-sonata-storm test-audio-emotion test-audio-mixer test-sonata-flow-ffi test-flow-quality-modes test-sonata-flow-distilled test-sonata-lm-ffi test-sonata-lm-dual-head test-speaker-encoder-unit test-sonata-lm-prosody-edge test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-neural-backchannel test-intent-router test-response-cache test-speculative-gen test-streaming-tts test-streaming-llm test-full-duplex test-sonata-refiner test-tdt-decoder test-web-remote test-opus-codec test-audio-converter test-spatial-audio test-metal-loader test-metal-dispatch test-bnns-convnext test-coverage-gaps test-correctness-audit test-integration-audit test-security-audit test-assumptions bench-audit bench test-research-stt test-research-eou test-research-istft test-research-metal test-audio-watermark test-deep-filter test-codec-12hz test-gru-drafter test-speaker-encoder test-voice-cloning-e2e test-flow-streaming test-flow-distilled-loading test-speaker-encoder-integration eval eval-python eval-full eval-generate
 
 bench: libs sonata
 	@bash scripts/benchmark.sh --all
-test: bench-quality test-quality test-eou test-semantic-eou test-roundtrip test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-llm-prosody test-optimizations test-beam-search test-sonata test-sonata-v3 test-sonata-quality test-sonata-stt test-real-models test-websocket test-native-vad test-speech-detector test-fused-eou-parallel test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-quality-improvements test-sonata-storm test-audio-emotion test-audio-mixer test-sonata-flow-ffi test-flow-quality-modes test-sonata-flow-distilled test-sonata-lm-ffi test-sonata-lm-dual-head test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-neural-backchannel test-intent-router test-response-cache test-speculative-gen test-streaming-tts test-streaming-llm test-full-duplex test-sonata-refiner test-tdt-decoder test-web-remote test-opus-codec test-audio-converter test-spatial-audio test-metal-loader test-metal-dispatch test-bnns-convnext test-coverage-gaps test-integration-audit test-correctness-audit test-security-audit test-assumptions test-research-stt test-research-eou test-research-istft test-research-metal test-audio-watermark test-deep-filter test-speaker-encoder test-voice-cloning-e2e test-flow-streaming test-flow-distilled-loading test-speaker-encoder-integration
+test: bench-quality test-quality test-eou test-semantic-eou test-roundtrip test-pipeline test-new-modules test-new-engines test-bugfixes test-conformer test-llm-prosody test-optimizations test-beam-search test-sonata test-sonata-v3 test-sonata-quality test-sonata-stt test-real-models test-websocket test-native-vad test-speech-detector test-fused-eou-parallel test-prosody-predict test-prosody-log test-emphasis test-prosody-integration test-voice-onboard test-conversation-memory test-diarizer test-vdsp-prosody test-http-api test-quality-improvements test-sonata-storm test-audio-emotion test-audio-mixer test-sonata-flow-ffi test-flow-quality-modes test-sonata-flow-distilled test-sonata-lm-ffi test-sonata-lm-dual-head test-speaker-encoder-unit test-sonata-lm-prosody-edge test-pipeline-threading test-phase2-regressions test-phonemizer-v3 test-backchannel test-neural-backchannel test-intent-router test-response-cache test-speculative-gen test-streaming-tts test-streaming-llm test-full-duplex test-sonata-refiner test-tdt-decoder test-web-remote test-opus-codec test-audio-converter test-spatial-audio test-metal-loader test-metal-dispatch test-bnns-convnext test-coverage-gaps test-integration-audit test-correctness-audit test-security-audit test-assumptions test-research-stt test-research-eou test-research-istft test-research-metal test-audio-watermark test-deep-filter test-speaker-encoder test-voice-cloning-e2e test-flow-streaming test-flow-distilled-loading test-speaker-encoder-integration
 	@echo ""
 	@echo "═══ Quality Benchmark Self-Tests ═══"
 	./$(BUILD)/bench-quality

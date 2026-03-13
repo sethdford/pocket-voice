@@ -517,6 +517,14 @@ static int parse_request(int fd, HttpRequest *req) {
             if (n <= 0) { free(req->body); req->body = NULL; return -1; }
             body_received += (int)n;
         }
+        /* Verify we received exactly the expected number of bytes */
+        if (body_received != req->content_length) {
+            fprintf(stderr, "[http] Body size mismatch: expected %d, received %d\n",
+                    req->content_length, body_received);
+            free(req->body);
+            req->body = NULL;
+            return -1;
+        }
         req->body[req->content_length] = '\0';
         req->body_len = req->content_length;
     }
@@ -799,6 +807,33 @@ static int is_valid_sample_rate(int rate) {
     return 0;
 }
 
+/* Validate UTF-8 encoding in text input. Returns 1 if valid, 0 if invalid. */
+static int is_valid_utf8(const unsigned char *data, int len) {
+    for (int i = 0; i < len; i++) {
+        unsigned char c = data[i];
+        if (c < 0x80) {
+            /* ASCII, single byte */
+            continue;
+        } else if ((c & 0xE0) == 0xC0) {
+            /* 2-byte sequence: 110xxxxx 10xxxxxx */
+            if (i + 1 >= len || (data[i + 1] & 0xC0) != 0x80) return 0;
+            i++;
+        } else if ((c & 0xF0) == 0xE0) {
+            /* 3-byte sequence: 1110xxxx 10xxxxxx 10xxxxxx */
+            if (i + 2 >= len || (data[i + 1] & 0xC0) != 0x80 || (data[i + 2] & 0xC0) != 0x80) return 0;
+            i += 2;
+        } else if ((c & 0xF8) == 0xF0) {
+            /* 4-byte sequence: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx */
+            if (i + 3 >= len || (data[i + 1] & 0xC0) != 0x80 || (data[i + 2] & 0xC0) != 0x80 || (data[i + 3] & 0xC0) != 0x80) return 0;
+            i += 3;
+        } else {
+            /* Invalid UTF-8 sequence */
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static TtsRequest parse_tts_request(const char *body, int body_len) {
     TtsRequest req;
     memset(&req, 0, sizeof(req));
@@ -810,10 +845,21 @@ static TtsRequest parse_tts_request(const char *body, int body_len) {
 
     if (!body || body_len == 0) return req;
 
+    /* Validate UTF-8 encoding in the entire request body */
+    if (!is_valid_utf8((const unsigned char *)body, body_len)) {
+        fprintf(stderr, "[http] Invalid UTF-8 in request body\n");
+        return req;
+    }
+
     const char *trimmed = body;
     while (*trimmed == ' ' || *trimmed == '\t' || *trimmed == '\n' || *trimmed == '\r')
         trimmed++;
     if (*trimmed != '{') {
+        /* Plain text input: validate length */
+        if (body_len > MAX_TEXT_SIZE) {
+            fprintf(stderr, "[http] Input text exceeds maximum size: %d > %d bytes\n", body_len, MAX_TEXT_SIZE);
+            return req;
+        }
         req.text = strndup(body, (size_t)body_len);
         return req;
     }
@@ -825,13 +871,27 @@ static TtsRequest parse_tts_request(const char *body, int body_len) {
     }
 
     cJSON *text = cJSON_GetObjectItemCaseSensitive(root, "text");
-    if (cJSON_IsString(text) && text->valuestring)
+    if (cJSON_IsString(text) && text->valuestring) {
+        int text_len = (int)strlen(text->valuestring);
+        if (text_len > MAX_TEXT_SIZE) {
+            fprintf(stderr, "[http] Text field exceeds maximum size: %d > %d bytes\n", text_len, MAX_TEXT_SIZE);
+            cJSON_Delete(root);
+            return req;
+        }
         req.text = strdup(text->valuestring);
+    }
 
     if (!req.text) {
         cJSON *input = cJSON_GetObjectItemCaseSensitive(root, "input");
-        if (cJSON_IsString(input) && input->valuestring)
+        if (cJSON_IsString(input) && input->valuestring) {
+            int input_len = (int)strlen(input->valuestring);
+            if (input_len > MAX_TEXT_SIZE) {
+                fprintf(stderr, "[http] Input field exceeds maximum size: %d > %d bytes\n", input_len, MAX_TEXT_SIZE);
+                cJSON_Delete(root);
+                return req;
+            }
             req.text = strdup(input->valuestring);
+        }
     }
 
     cJSON *voice = cJSON_GetObjectItemCaseSensitive(root, "voice");
